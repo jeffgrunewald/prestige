@@ -122,15 +122,6 @@ mod chrono_impls {
     impl_arrow_serialize!(NaiveTime, arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond));
 }
 
-impl<T: ArrowSerialize, const N: usize> ArrowSerialize for [T; N] {
-    fn arrow_data_type() -> arrow::datatypes::DataType {
-        arrow::datatypes::DataType::FixedSizeList(
-            arrow::datatypes::FieldRef::new(arrow::datatypes::Field::new("item", T::arrow_data_type(), false)),
-            N as i32,
-        )
-    }
-}
-
 impl<T: ArrowSerialize> ArrowSerialize for Vec<T> {
     fn arrow_data_type() -> arrow::datatypes::DataType {
         arrow::datatypes::DataType::List(
@@ -139,32 +130,30 @@ impl<T: ArrowSerialize> ArrowSerialize for Vec<T> {
     }
 }
 
-
-impl<T: ParquetSerialize, const N: usize> ParquetSerialize for [T; N] {
-    fn parquet_schema_element() -> parquet::schema::types::Type {
-        use parquet::schema::types::Type;
-        // For fixed-size arrays, we use a simplified approach
-        // This is a basic implementation - more complex logic needed for true generic support
-        Type::primitive_type_builder("field", parquet::basic::Type::FIXED_LEN_BYTE_ARRAY)
-            .with_length(N as i32)
-            .with_repetition(parquet::basic::Repetition::REQUIRED)
-            .build()
-            .expect("Failed to build parquet schema element")
-    }
-}
-
-
 impl<T: ParquetSerialize> ParquetSerialize for Vec<T> {
     fn parquet_schema_element() -> parquet::schema::types::Type {
         use parquet::schema::types::Type;
+        use parquet::basic::{Repetition, LogicalType};
         use std::sync::Arc;
-        
-        let inner_element = Arc::new(T::parquet_schema_element());
-        Type::group_type_builder("field")
-            .with_repetition(parquet::basic::Repetition::REPEATED)
-            .with_fields(vec![inner_element])
+
+        // Get the inner element type and rebuild it with name "element" and OPTIONAL repetition
+        let inner_base = T::parquet_schema_element();
+        let element = Arc::new(crate::rebuild_type_with_optional(inner_base, "element"));
+
+        // Build the repeated wrapper group named "list"
+        let list_group = Type::group_type_builder("list")
+            .with_repetition(Repetition::REPEATED)
+            .with_fields(vec![element])
             .build()
-            .expect("Failed to build parquet group schema element")
+            .expect("Failed to build list wrapper group");
+
+        // Build the outer group with LIST logical type annotation
+        Type::group_type_builder("field")
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::List))
+            .with_fields(vec![Arc::new(list_group)])
+            .build()
+            .expect("Failed to build parquet LIST schema element")
     }
 }
 
