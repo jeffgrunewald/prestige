@@ -1,0 +1,21 @@
+[package]
+name = "prestige-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Proc macro for deriving Prestige parquet trait implementations"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+arrow = { version = "55", features = ["ipc"] }
+chrono = { workspace = true, optional = true }
+parquet = "55"
+quote = "1"
+proc-macro2 = "1"
+serde_arrow.workspace = true
+syn = "2"
+
+[features]
+chrono = ["dep:chrono"]
