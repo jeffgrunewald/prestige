@@ -122,6 +122,40 @@ mod chrono_impls {
     impl_arrow_serialize!(NaiveTime, arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond));
 }
 
+#[cfg(feature = "decimal")]
+mod decimal_impls {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    impl ParquetSerialize for Decimal {
+        fn parquet_schema_element() -> parquet::schema::types::Type {
+            use parquet::schema::types::Type;
+            use parquet::basic::{LogicalType, Type as PhysicalType};
+
+            // rust_decimal::Decimal is a 128-bit decimal with precision up to 28
+            // We use 16 bytes (128 bits) to store the value
+            // Precision: 28 (max digits), Scale: 10 (decimal places)
+            Type::primitive_type_builder("field", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+                .with_logical_type(Some(LogicalType::Decimal {
+                    scale: 10,
+                    precision: 28,
+                }))
+                .with_repetition(parquet::basic::Repetition::REQUIRED)
+                .with_length(16) // 128 bits = 16 bytes
+                .build()
+                .expect("Failed to build parquet schema element")
+        }
+    }
+
+    impl ArrowSerialize for Decimal {
+        fn arrow_data_type() -> arrow::datatypes::DataType {
+            // Decimal128 with precision 28 and scale 10
+            // This matches the Parquet representation
+            arrow::datatypes::DataType::Decimal128(28, 10)
+        }
+    }
+}
+
 impl<T: ArrowSerialize> ArrowSerialize for Vec<T> {
     fn arrow_data_type() -> arrow::datatypes::DataType {
         arrow::datatypes::DataType::List(

@@ -17,6 +17,7 @@ futures.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
 parquet = "55"
+rust_decimal = { workspace = true, optional = true }
 serde.workspace = true
 serde_arrow.workspace = true
 serde_json.workspace = true
@@ -29,4 +30,5 @@ tracing.workspace = true
 
 [features]
 chrono = ["dep:chrono"]
+decimal = ["dep:rust_decimal"]
 sqlx = ["dep:sqlx"]
