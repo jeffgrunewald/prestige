@@ -87,7 +87,25 @@ impl_arrow_serialize!(bool, arrow::datatypes::DataType::Boolean);
 impl_parquet_serialize!(String, parquet::basic::Type::BYTE_ARRAY, Some(parquet::basic::LogicalType::String));
 impl_arrow_serialize!(String, arrow::datatypes::DataType::Utf8);
 
-// We'll handle Vec<u8> specially in the generic Vec<T> implementation
+// Fixed-size byte array support - enables use as HashMap keys and in collections
+// Special handling for [u8; N] exists in macros for struct fields, but we need
+// trait implementations for use in generic contexts like HashMap<[u8; N], V>
+impl<const N: usize> ParquetSerialize for [u8; N] {
+    fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::schema::types::Type;
+        Type::primitive_type_builder("field", parquet::basic::Type::FIXED_LEN_BYTE_ARRAY)
+            .with_repetition(parquet::basic::Repetition::REQUIRED)
+            .with_length(N as i32)
+            .build()
+            .expect("Failed to build parquet schema element")
+    }
+}
+
+impl<const N: usize> ArrowSerialize for [u8; N] {
+    fn arrow_data_type() -> arrow::datatypes::DataType {
+        arrow::datatypes::DataType::FixedSizeBinary(N as i32)
+    }
+}
 
 #[cfg(feature = "chrono")]
 mod chrono_impls {
@@ -188,6 +206,106 @@ impl<T: ParquetSerialize> ParquetSerialize for Vec<T> {
             .with_fields(vec![Arc::new(list_group)])
             .build()
             .expect("Failed to build parquet LIST schema element")
+    }
+}
+
+// HashMap support - uses Parquet MAP logical type
+impl<K: ParquetSerialize, V: ParquetSerialize> ParquetSerialize for std::collections::HashMap<K, V> {
+    fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::schema::types::Type;
+        use parquet::basic::{Repetition, LogicalType};
+        use std::sync::Arc;
+
+        // Build the key field (required/non-nullable)
+        let key_base = K::parquet_schema_element();
+        let key_field = Arc::new(crate::rebuild_type_as_required(key_base, "key"));
+
+        // Build the value field (optional/nullable)
+        let value_base = V::parquet_schema_element();
+        let value_field = Arc::new(crate::rebuild_type_with_optional(value_base, "value"));
+
+        // Build the key_value group (repeated)
+        let key_value_group = Type::group_type_builder("key_value")
+            .with_repetition(Repetition::REPEATED)
+            .with_fields(vec![key_field, value_field])
+            .build()
+            .expect("Failed to build key_value group");
+
+        // Build the outer group with MAP logical type
+        Type::group_type_builder("field")
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Map))
+            .with_fields(vec![Arc::new(key_value_group)])
+            .build()
+            .expect("Failed to build MAP schema element")
+    }
+}
+
+impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::HashMap<K, V> {
+    fn arrow_data_type() -> arrow::datatypes::DataType {
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        // Map = List<Struct<key: K, value: V>>
+        let key_field = Field::new("key", K::arrow_data_type(), false);  // Non-nullable
+        let value_field = Field::new("value", V::arrow_data_type(), true); // Nullable
+
+        let entries_struct = DataType::Struct(Fields::from(vec![key_field, value_field]));
+        let entries_field = Field::new("entries", entries_struct, false);
+
+        DataType::Map(
+            std::sync::Arc::new(entries_field),
+            false  // keys_sorted = false for HashMap
+        )
+    }
+}
+
+// BTreeMap support - similar to HashMap but with sorted keys hint
+impl<K: ParquetSerialize, V: ParquetSerialize> ParquetSerialize for std::collections::BTreeMap<K, V> {
+    fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::schema::types::Type;
+        use parquet::basic::{Repetition, LogicalType};
+        use std::sync::Arc;
+
+        // Build the key field (required/non-nullable)
+        let key_base = K::parquet_schema_element();
+        let key_field = Arc::new(crate::rebuild_type_as_required(key_base, "key"));
+
+        // Build the value field (optional/nullable)
+        let value_base = V::parquet_schema_element();
+        let value_field = Arc::new(crate::rebuild_type_with_optional(value_base, "value"));
+
+        // Build the key_value group (repeated)
+        let key_value_group = Type::group_type_builder("key_value")
+            .with_repetition(Repetition::REPEATED)
+            .with_fields(vec![key_field, value_field])
+            .build()
+            .expect("Failed to build key_value group");
+
+        // Build the outer group with MAP logical type
+        Type::group_type_builder("field")
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Map))
+            .with_fields(vec![Arc::new(key_value_group)])
+            .build()
+            .expect("Failed to build MAP schema element")
+    }
+}
+
+impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::BTreeMap<K, V> {
+    fn arrow_data_type() -> arrow::datatypes::DataType {
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        // Map = List<Struct<key: K, value: V>>
+        let key_field = Field::new("key", K::arrow_data_type(), false);  // Non-nullable
+        let value_field = Field::new("value", V::arrow_data_type(), true); // Nullable
+
+        let entries_struct = DataType::Struct(Fields::from(vec![key_field, value_field]));
+        let entries_field = Field::new("entries", entries_struct, false);
+
+        DataType::Map(
+            std::sync::Arc::new(entries_field),
+            true  // keys_sorted = true for BTreeMap
+        )
     }
 }
 
