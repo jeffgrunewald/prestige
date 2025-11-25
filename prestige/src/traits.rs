@@ -6,6 +6,13 @@ pub trait ArrowSerialize {
     fn arrow_data_type() -> arrow::datatypes::DataType;
 }
 
+/// Trait for types that can provide a complete Arrow schema
+///
+/// This is typically derived or implemented for structs that will be written to parquet.
+pub trait ArrowSchema {
+    fn arrow_schema() -> arrow::datatypes::SchemaRef;
+}
+
 // Newtype wrapper for Vec<u8> to handle it as binary data
 #[derive(Clone, Debug, PartialEq)]
 pub struct BinaryData(pub Vec<u8>);
