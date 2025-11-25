@@ -20,7 +20,7 @@ derive_builder.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
-parquet = "55"
+parquet = { version = "55", features = ["async"] }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }

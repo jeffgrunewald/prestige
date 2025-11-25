@@ -179,6 +179,9 @@ impl<T> ParquetSinkBuilder<T> {
     {
         let (tx, rx) = message_channel(50);
 
+        // Seed the metric with an initial value
+        metrics::counter!(self.metric.clone(), vec![OK_LABEL]).increment(1);
+
         Ok((
             ParquetSinkClient::new(tx, self.metric.clone()),
             ParquetSink {
@@ -1006,7 +1009,7 @@ mod tests {
         let record = create_test_records(1)[0].clone();
 
         // Should be able to send a record
-        let result = client.write(record).await;
+        let result = client.write(record, &[]).await;
         assert!(result.is_ok());
     }
 
@@ -1029,7 +1032,7 @@ mod tests {
         drop(sink);
 
         let record = create_test_records(1)[0].clone();
-        let result = client.write(record).await;
+        let result = client.write(record, &[]).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), crate::Error::Channel(_)));
