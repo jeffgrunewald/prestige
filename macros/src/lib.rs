@@ -125,7 +125,10 @@ fn generate_arrow_group_impl(name: &syn::Ident, fields: &syn::punctuated::Punctu
 /// Generate the ArrowReader implementation
 fn generate_arrow_reader_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
     quote! {
-        impl #name {
+        impl #name
+        where
+            Self: for<'de> serde::Deserialize<'de>,
+        {
             pub fn from_arrow_records(
                 arrays: &[std::sync::Arc<dyn arrow::array::Array>],
                 schema: &arrow::datatypes::Schema,
@@ -162,7 +165,10 @@ fn generate_arrow_reader_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
 /// Generate the ArrowWriter implementation
 fn generate_arrow_writer_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
     quote! {
-        impl #name {
+        impl #name
+        where
+            Self: serde::Serialize,
+        {
             pub fn to_arrow_arrays(
                 records: &[Self],
             ) -> Result<(Vec<std::sync::Arc<dyn arrow::array::Array>>, arrow::datatypes::Schema), serde_arrow::Error> {
@@ -258,6 +264,17 @@ pub fn derive_arrow_writer(input: TokenStream) -> TokenStream {
 /// - `ArrowReader` - for reading from Arrow/Parquet
 /// - `ArrowWriter` - for writing to Arrow/Parquet
 /// - Implements `ArrowSchema` trait (wrapping the generated arrow_schema method)
+///
+/// # Requirements
+///
+/// The type **must** implement `serde::Serialize` and `serde::Deserialize` because
+/// the generated code uses `serde_arrow` for converting between Rust types and Arrow arrays.
+/// These traits should be derived before `PrestigeSchema`:
+///
+/// ```rust,ignore
+/// #[derive(Serialize, Deserialize, PrestigeSchema)]  // Correct order
+/// struct MyData { ... }
+/// ```
 ///
 /// # Example
 ///
