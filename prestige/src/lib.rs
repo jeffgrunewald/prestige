@@ -1,17 +1,20 @@
 mod error;
 pub mod file_meta;
+pub mod file_poller;
 pub mod file_sink;
 pub mod file_source;
-// pub mod file_store;
 pub mod file_upload;
 mod settings;
 pub mod traits;
 
 pub use error::{AwsError, ChannelError, Error, FileMetaError, Result};
 pub use file_meta::FileMeta;
+pub use file_poller::{
+    FilePollerConfig, FilePollerConfigBuilder, FilePollerServer, FilePollerState,
+    FilePollerStateRecorder, FileStream, FileStreamReceiver, LookbackBehavior,
+};
 pub use file_sink::{ParquetSink, ParquetSinkBuilder, ParquetSinkClient};
 pub use file_source::RecordBatchStream;
-// pub use file_store::FileStore;
 pub use file_upload::{FileUpload, FileUploadServer};
 pub use settings::Settings;
 pub use traits::{ArrowSchema, ArrowSerialize, ParquetSerialize};

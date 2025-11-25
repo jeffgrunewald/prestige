@@ -42,4 +42,5 @@ tempfile.workspace = true
 default = ["chrono"]
 chrono = ["dep:chrono"]
 decimal = ["dep:rust_decimal"]
+sqlx-postgres = ["sqlx/postgres"]
 sqlx = ["dep:sqlx"]
