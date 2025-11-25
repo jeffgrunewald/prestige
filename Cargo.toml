@@ -15,6 +15,7 @@ categories = ["asynchronous", "encoding", "filesystem"]
 edition = "2024"
 
 [workspace.dependencies]
+anyhow = "1"
 async-trait = "0"
 aws-config = "1"
 aws-sdk-s3 = "1"
@@ -43,3 +44,4 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 tokio-stream = "0"
 tracing = "0"
+tempfile = "3"

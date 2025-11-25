@@ -6,6 +6,7 @@ license.workspace = true
 description = "Prestige file reading and writing utilities and tools"
 
 [dependencies]
+anyhow.workspace = true
 arrow = { version = "55", features = ["ipc"] }
 async-trait.workspace = true
 aws-config.workspace = true
@@ -33,6 +34,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
 default = ["chrono"]
