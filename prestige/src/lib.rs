@@ -19,6 +19,9 @@ pub use file_upload::{FileUpload, FileUploadServer};
 pub use settings::Settings;
 pub use traits::{ArrowSchema, ArrowSerialize, ParquetSerialize};
 
+// Re-export derive macros from prestige-macros
+pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter, PrestigeSchema};
+
 /// Helper function to rebuild a parquet Type with OPTIONAL repetition and a new field name
 /// This is used by the derive macros to properly handle Option<T> fields
 pub fn rebuild_type_with_optional(base_type: parquet::schema::types::Type, field_name: &str) -> parquet::schema::types::Type {

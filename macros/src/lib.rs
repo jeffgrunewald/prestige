@@ -46,122 +46,28 @@ fn extract_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-
-#[proc_macro_derive(ParquetSchema)]
-pub fn derive_parquet_schema(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let fields = match input.data {
+/// Helper function to extract named fields from a DeriveInput
+fn extract_named_fields(input: &DeriveInput) -> Result<&syn::punctuated::Punctuated<syn::Field, syn::token::Comma>, Error> {
+    match input.data {
         Data::Struct(ref data) => {
             match data.fields {
-                Fields::Named(ref fields) => &fields.named,
-                _ => return syn::Error::new(input.span(), "ParquetSchema can only be derived for structs with named fields")
-                    .to_compile_error().into(),
+                Fields::Named(ref fields) => Ok(&fields.named),
+                _ => Err(Error::new(input.span(), "Can only be derived for structs with named fields")),
             }
         },
-        _ => return syn::Error::new(input.span(), "ParquetSchema can only be derived for structs")
-            .to_compile_error().into(),
-    };
-
-    let schema = fields.iter().map(|field| {
-        let field_name = &field.ident;
-        let field_type = &field.ty;
-
-        // Check if this is an Option<T> type
-        if let Some(inner_type) = extract_option_inner_type(field_type) {
-            // For Option<T>, we need to build a schema with OPTIONAL repetition
-            // Special handling for Option<[u8; N]>
-            if let Some(array_size) = extract_fixed_byte_array_size(inner_type) {
-                quote! {
-                    parquet::schema::types::Type::primitive_type_builder(stringify!(#field_name), parquet::basic::Type::FIXED_LEN_BYTE_ARRAY)
-                        .with_repetition(parquet::basic::Repetition::OPTIONAL)
-                        .with_type_length(#array_size)
-                        .build()
-                        .expect("Failed to build parquet schema")
-                }
-            } else {
-                // Get the base schema from the inner type and rebuild it with OPTIONAL repetition
-                // We use a helper that rebuilds the Type with the correct field name and repetition
-                quote! {
-                    {
-                        let base = <#inner_type as ::prestige::ParquetSerialize>::parquet_schema_element();
-                        ::prestige::rebuild_type_with_optional(base, stringify!(#field_name))
-                    }
-                }
-            }
-        }
-        // Check if this is a fixed-size byte array that needs special handling
-        else if let Some(array_size) = extract_fixed_byte_array_size(field_type) {
-            quote! {
-                parquet::schema::types::Type::primitive_type_builder(stringify!(#field_name), parquet::basic::Type::FIXED_LEN_BYTE_ARRAY)
-                    .with_repetition(parquet::basic::Repetition::REQUIRED)
-                    .with_type_length(#array_size)
-                    .build()
-                    .expect("Failed to build parquet schema")
-            }
-        } else {
-            quote! {
-                <#field_type as ::prestige::ParquetSerialize>::parquet_schema_element()
-            }
-        }
-    });
-
-    // Add trait bounds for all field types
-    // For Option<T>, we need bounds on T, not Option<T>
-    let field_bounds = fields.iter().map(|field| {
-        let field_type = &field.ty;
-        if let Some(inner_type) = extract_option_inner_type(field_type) {
-            quote! { #inner_type: ::prestige::ParquetSerialize }
-        } else {
-            quote! { #field_type: ::prestige::ParquetSerialize }
-        }
-    });
-
-    let expanded = quote! {
-        impl #name 
-        where
-            #(#field_bounds),*
-        {
-            pub fn parquet_schema() -> parquet::schema::types::Type {
-                let mut fields = vec![#(#schema),*];
-
-                parquet::schema::types::Type::group_type_builder(stringify!(#name))
-                    .with_fields(&mut fields)
-                    .with_repetition(parquet::basic::Repetition::REQUIRED)
-                    .build()
-                    .expect("Failed to build parquet schema")
-            }
-        }
-    };
-
-    TokenStream::from(expanded)
+        _ => Err(Error::new(input.span(), "Can only be derived for structs")),
+    }
 }
 
-#[proc_macro_derive(ArrowGroup)]
-pub fn derive_arrow_group(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let fields = match input.data {
-        Data::Struct(ref data) => {
-            match data.fields {
-                Fields::Named(ref fields) => &fields.named,
-                _ => return Error::new(input.span(), "ArrowGroup can only be derived for structs with named fields")
-                    .to_compile_error().into(),
-            }
-        },
-        _ => return Error::new(input.span(), "ArrowGroup can only be derived for structs")
-            .to_compile_error().into(),
-    };
-
-    let field_schemas = fields.iter().map(|field| {
+/// Generate Arrow field schemas for all fields in a struct
+fn generate_arrow_field_schemas(
+    fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+) -> Vec<proc_macro2::TokenStream> {
+    fields.iter().map(|field| {
         let field_name = field.ident.as_ref().unwrap().to_string();
         let field_type = &field.ty;
 
-        // Check if this is an Option<T> type
         if let Some(inner_type) = extract_option_inner_type(field_type) {
-            // For Option<T>, set nullable=true and use the inner type
             if let Some(array_size) = extract_fixed_byte_array_size(inner_type) {
                 quote! {
                     arrow::datatypes::Field::new(#field_name, arrow::datatypes::DataType::FixedSizeBinary(#array_size), true)
@@ -171,9 +77,7 @@ pub fn derive_arrow_group(input: TokenStream) -> TokenStream {
                     arrow::datatypes::Field::new(#field_name, <#inner_type as ::prestige::ArrowSerialize>::arrow_data_type(), true)
                 }
             }
-        }
-        // Check if this is a fixed-size byte array that needs special handling
-        else if let Some(array_size) = extract_fixed_byte_array_size(field_type) {
+        } else if let Some(array_size) = extract_fixed_byte_array_size(field_type) {
             quote! {
                 arrow::datatypes::Field::new(#field_name, arrow::datatypes::DataType::FixedSizeBinary(#array_size), false)
             }
@@ -182,90 +86,82 @@ pub fn derive_arrow_group(input: TokenStream) -> TokenStream {
                 arrow::datatypes::Field::new(#field_name, <#field_type as ::prestige::ArrowSerialize>::arrow_data_type(), false)
             }
         }
-    });
+    }).collect()
+}
 
-    // Add trait bounds for all field types
-    // For Option<T>, we need bounds on T, not Option<T>
-    let field_bounds = fields.iter().map(|field| {
+/// Generate trait bounds for Arrow serialization
+fn generate_arrow_field_bounds(
+    fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+) -> Vec<proc_macro2::TokenStream> {
+    fields.iter().map(|field| {
         let field_type = &field.ty;
         if let Some(inner_type) = extract_option_inner_type(field_type) {
             quote! { #inner_type: ::prestige::ArrowSerialize }
         } else {
             quote! { #field_type: ::prestige::ArrowSerialize }
         }
-    });
+    }).collect()
+}
 
-    let expanded = quote! {
-        impl #name 
+/// Generate the ArrowGroup implementation
+fn generate_arrow_group_impl(name: &syn::Ident, fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>) -> proc_macro2::TokenStream {
+    let arrow_field_schemas = generate_arrow_field_schemas(fields);
+    let arrow_field_bounds = generate_arrow_field_bounds(fields);
+
+    quote! {
+        impl #name
         where
-            #(#field_bounds),*
+            #(#arrow_field_bounds),*
         {
             pub fn arrow_schema() -> arrow::datatypes::Schema {
                 arrow::datatypes::Schema::new(vec![
-                    #(#field_schemas),*
+                    #(#arrow_field_schemas),*
                 ])
             }
         }
-    };
-
-    TokenStream::from(expanded)
+    }
 }
 
-#[proc_macro_derive(ArrowReader)]
-pub fn derive_arrow_reader(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let expanded = quote! {
+/// Generate the ArrowReader implementation
+fn generate_arrow_reader_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
+    quote! {
         impl #name {
             pub fn from_arrow_records(
                 arrays: &[std::sync::Arc<dyn arrow::array::Array>],
                 schema: &arrow::datatypes::Schema,
             ) -> Result<Vec<Self>, serde_arrow::Error> {
-                let mut deserializer = serde_arrow::Deserializer::new(arrays, schema)?;
-                let mut records = Vec::new();
-                
-                while let Some(record) = deserializer.next::<Self>()? {
-                    records.push(record);
-                }
-                
-                Ok(records)
+                serde_arrow::from_arrow(schema.fields(), arrays)
             }
 
             pub fn from_arrow_reader<R: std::io::Read + std::io::Seek>(
                 reader: R,
             ) -> Result<Vec<Self>, Box<dyn std::error::Error>> {
                 use arrow::ipc::reader::FileReader;
-                
+
                 let arrow_reader = FileReader::try_new(reader, None)?;
                 let schema = arrow_reader.schema();
                 let mut records = Vec::new();
-                
+
                 for batch_result in arrow_reader {
                     let batch = batch_result?;
-                    let arrays: Vec<std::sync::Arc<dyn arrow::array::Array>> = 
+                    let arrays: Vec<std::sync::Arc<dyn arrow::array::Array>> =
                         (0..batch.num_columns())
                             .map(|i| batch.column(i).clone())
                             .collect();
-                    
+
                     let batch_records = Self::from_arrow_records(&arrays, &schema)?;
                     records.extend(batch_records);
                 }
-                
+
                 Ok(records)
             }
         }
-    };
-
-    TokenStream::from(expanded)
+    }
 }
 
-#[proc_macro_derive(ArrowWriter)]
-pub fn derive_arrow_writer(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let expanded = quote! {
+/// Generate the ArrowWriter implementation
+fn generate_arrow_writer_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
+    quote! {
         impl #name {
             pub fn to_arrow_arrays(
                 records: &[Self],
@@ -275,14 +171,7 @@ pub fn derive_arrow_writer(input: TokenStream) -> TokenStream {
                 }
 
                 let arrow_schema = Self::arrow_schema();
-                let serde_schema = serde_arrow::schema::Schema::from(&arrow_schema);
-                
-                let mut serializer = serde_arrow::Serializer::new();
-                for record in records {
-                    serializer.push(record)?;
-                }
-                
-                let arrays = serializer.to_arrays(&serde_schema)?;
+                let arrays = serde_arrow::to_arrow(arrow_schema.fields(), records)?;
                 Ok((arrays, arrow_schema))
             }
 
@@ -291,17 +180,17 @@ pub fn derive_arrow_writer(input: TokenStream) -> TokenStream {
                 writer: W,
             ) -> Result<(), Box<dyn std::error::Error>> {
                 use arrow::ipc::writer::FileWriter;
-                
+
                 let (arrays, schema) = Self::to_arrow_arrays(records)?;
                 let batch = arrow::record_batch::RecordBatch::try_new(
                     std::sync::Arc::new(schema.clone()),
                     arrays,
                 )?;
-                
+
                 let mut arrow_writer = FileWriter::try_new(writer, &schema)?;
                 arrow_writer.write(&batch)?;
                 arrow_writer.finish()?;
-                
+
                 Ok(())
             }
 
@@ -310,20 +199,111 @@ pub fn derive_arrow_writer(input: TokenStream) -> TokenStream {
                 writer: W,
             ) -> Result<(), Box<dyn std::error::Error>> {
                 use arrow::ipc::writer::StreamWriter;
-                
+
                 let (arrays, schema) = Self::to_arrow_arrays(records)?;
                 let batch = arrow::record_batch::RecordBatch::try_new(
                     std::sync::Arc::new(schema.clone()),
                     arrays,
                 )?;
-                
+
                 let mut arrow_writer = StreamWriter::try_new(writer, &schema)?;
                 arrow_writer.write(&batch)?;
                 arrow_writer.finish()?;
-                
+
                 Ok(())
             }
         }
+    }
+}
+
+#[proc_macro_derive(ArrowGroup)]
+pub fn derive_arrow_group(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let fields = match extract_named_fields(&input) {
+        Ok(fields) => fields,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    let expanded = generate_arrow_group_impl(name, fields);
+    TokenStream::from(expanded)
+}
+
+#[proc_macro_derive(ArrowReader)]
+pub fn derive_arrow_reader(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let expanded = generate_arrow_reader_impl(name);
+    TokenStream::from(expanded)
+}
+
+#[proc_macro_derive(ArrowWriter)]
+pub fn derive_arrow_writer(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let expanded = generate_arrow_writer_impl(name);
+    TokenStream::from(expanded)
+}
+
+/// Comprehensive derive macro that implements all Prestige traits and schemas
+///
+/// This macro is a convenience wrapper that applies all the necessary derive macros
+/// and trait implementations for working with Prestige parquet files.
+///
+/// It automatically derives:
+/// - `ArrowGroup` - for Arrow schema generation
+/// - `ArrowReader` - for reading from Arrow/Parquet
+/// - `ArrowWriter` - for writing to Arrow/Parquet
+/// - Implements `ArrowSchema` trait (wrapping the generated arrow_schema method)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use prestige::PrestigeSchema;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize, PrestigeSchema)]
+/// struct SensorData {
+///     timestamp: u64,
+///     sensor_id: String,
+///     temperature: f32,
+///     device_mac: [u8; 6],
+/// }
+/// ```
+#[proc_macro_derive(PrestigeSchema)]
+pub fn derive_prestige_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let fields = match extract_named_fields(&input) {
+        Ok(fields) => fields,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
+    // Generate all implementations using helper functions
+    let arrow_group = generate_arrow_group_impl(name, fields);
+    let arrow_reader = generate_arrow_reader_impl(name);
+    let arrow_writer = generate_arrow_writer_impl(name);
+
+    let expanded = quote! {
+        // ArrowGroup implementation - generates arrow_schema() method
+        #arrow_group
+
+        // ArrowSchema trait implementation
+        impl ::prestige::ArrowSchema for #name {
+            fn arrow_schema() -> arrow::datatypes::SchemaRef {
+                std::sync::Arc::new(Self::arrow_schema())
+            }
+        }
+
+        // ArrowReader implementation
+        #arrow_reader
+
+        // ArrowWriter implementation
+        #arrow_writer
     };
 
     TokenStream::from(expanded)
