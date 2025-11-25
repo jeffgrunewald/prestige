@@ -1,0 +1,28 @@
+services:
+
+  localstack:
+    image: localstack/localstack:latest
+    environment:
+      SERVICES: s3
+      EAGER_SERVICE_LOADING: 1
+    ports: 
+      - 4566:4566
+    volumes:
+      - bucket-data:/etc/localstack/init/ready.d
+
+  postgres:
+    image: postgres:latest
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /data
+    ports:
+      - 5432:5432
+    entrypoint:
+    volumes:
+      - db-data:/data
+
+volumes:
+  db-data:
+  bucket-data:
