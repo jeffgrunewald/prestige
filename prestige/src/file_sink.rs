@@ -2,6 +2,7 @@ use crate::{FileMeta, Result, error::ChannelError, file_upload::FileUpload};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use chrono::{DateTime, Utc};
+use metrics::Label;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -13,7 +14,10 @@ use std::{
 use super_visor::{ManagedProc, ShutdownSignal};
 use tokio::{
     fs,
-    sync::{mpsc, oneshot},
+    sync::{
+        mpsc::{self, error::SendTimeoutError},
+        oneshot,
+    },
     time,
 };
 
@@ -28,6 +32,11 @@ pub const DEFAULT_BATCH_SIZE: usize = 1_000; // Records to accumulate before wri
 pub const SINK_CHECK_MILLIS: u64 = 60_000; // 1 minute
 #[cfg(test)]
 pub const SINK_CHECK_MILLIS: u64 = 50; // Fast for tests
+
+// Metrics constants
+const OK_LABEL: Label = Label::from_static_parts("status", "ok");
+const ERROR_LABEL: Label = Label::from_static_parts("status", "error");
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type FileManifest = Vec<String>;
 
@@ -200,8 +209,6 @@ pub struct ParquetSinkClient<T> {
     pub metric: String,
 }
 
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
-
 impl<T> ParquetSinkClient<T> {
     pub fn new(sender: MessageSender<T>, metric: impl Into<String>) -> Self {
         Self {
@@ -210,16 +217,53 @@ impl<T> ParquetSinkClient<T> {
         }
     }
 
-    /// Write a single record to the sink
-    pub async fn write(&self, item: impl Into<T>) -> Result<oneshot::Receiver<Result>> {
+    /// Write a single record to the sink with optional labels for metrics
+    pub async fn write(
+        &self,
+        item: impl Into<T>,
+        labels: impl IntoIterator<Item = &(&'static str, &'static str)>,
+    ) -> Result<oneshot::Receiver<Result>> {
         let (on_write_tx, on_write_rx) = oneshot::channel();
+        let labels = labels.into_iter().map(Label::from);
 
-        self.sender
+        match self
+            .sender
             .send_timeout(Message::Data(on_write_tx, item.into()), SEND_TIMEOUT)
             .await
-            .map_err(|_| ChannelError::sink_timeout(&self.metric))?;
-
-        Ok(on_write_rx)
+        {
+            Ok(_) => {
+                metrics::counter!(
+                    self.metric.clone(),
+                    labels
+                        .chain(std::iter::once(OK_LABEL))
+                        .collect::<Vec<Label>>()
+                )
+                .increment(1);
+                tracing::debug!("parquet_sink write succeeded for {:?}", self.metric);
+                Ok(on_write_rx)
+            }
+            Err(SendTimeoutError::Closed(_)) => {
+                metrics::counter!(
+                    self.metric.clone(),
+                    labels
+                        .chain(std::iter::once(ERROR_LABEL))
+                        .collect::<Vec<Label>>()
+                )
+                .increment(1);
+                tracing::error!(
+                    "parquet_sink write failed for {:?} channel closed",
+                    self.metric
+                );
+                Err(ChannelError::sink_closed(&self.metric))
+            }
+            Err(SendTimeoutError::Timeout(_)) => {
+                tracing::error!(
+                    "parquet_sink write failed for {:?} due to send timeout",
+                    self.metric
+                );
+                Err(ChannelError::sink_timeout(&self.metric))
+            }
+        }
     }
 
     /// Write multiple records in batch
@@ -229,7 +273,7 @@ impl<T> ParquetSinkClient<T> {
     ) -> Result<Vec<oneshot::Receiver<Result>>> {
         let mut receivers = Vec::new();
         for item in items {
-            receivers.push(self.write(item).await?);
+            receivers.push(self.write(item, &[]).await?);
         }
         Ok(receivers)
     }
@@ -309,7 +353,7 @@ where
         fs::create_dir_all(&self.target_path).await?;
         fs::create_dir_all(&self.tmp_path).await?;
 
-        // TODO: Handle crash recovery - process incomplete tmp files
+        self.recover_from_crash().await?;
         Ok(())
     }
 
@@ -318,7 +362,119 @@ where
         fs::create_dir_all(&self.target_path).await?;
         fs::create_dir_all(&self.tmp_path).await?;
 
-        // TODO: Handle crash recovery - process incomplete tmp files
+        self.recover_from_crash().await?;
+        Ok(())
+    }
+
+    /// Handle crash recovery on startup
+    ///
+    /// This processes files left behind from a previous crash:
+    /// 1. Re-upload any completed files in target_path
+    /// 2. Handle incomplete files in tmp_path:
+    ///    - If auto_commit: move to target and upload
+    ///    - If not auto_commit: delete (incomplete data)
+    async fn recover_from_crash(&mut self) -> Result {
+        // Re-upload any existing completed files in target directory
+        let mut target_dir = fs::read_dir(&self.target_path).await?;
+        loop {
+            match target_dir.next_entry().await {
+                Ok(Some(entry)) => {
+                    let file_name = entry.file_name();
+                    let file_name_str = file_name.to_string_lossy();
+
+                    // Only process files matching our prefix
+                    if file_name_str.starts_with(&self.prefix)
+                        && file_name_str.ends_with(".parquet")
+                    {
+                        tracing::info!(
+                            "crash recovery: re-uploading completed file {}",
+                            file_name_str
+                        );
+                        if let Err(err) = self.file_upload.upload_file(&entry.path()).await {
+                            tracing::warn!(
+                                "failed to upload recovered file {}: {}",
+                                file_name_str,
+                                err
+                            );
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!("error reading target directory during recovery: {}", err);
+                    continue;
+                }
+            }
+        }
+
+        // Handle incomplete files in tmp directory
+        let mut tmp_dir = fs::read_dir(&self.tmp_path).await?;
+        loop {
+            match tmp_dir.next_entry().await {
+                Ok(Some(entry)) => {
+                    let file_name = entry.file_name();
+                    let file_name_str = file_name.to_string_lossy();
+
+                    // Only process files matching our prefix
+                    if file_name_str.starts_with(&self.prefix)
+                        && file_name_str.ends_with(".parquet")
+                    {
+                        let entry_path = entry.path();
+
+                        if self.auto_commit {
+                            // Move incomplete file to target and upload
+                            tracing::info!(
+                                "crash recovery: recovering incomplete file {}",
+                                file_name_str
+                            );
+                            if let Err(err) = self.deposit_file(&entry_path).await {
+                                tracing::warn!(
+                                    "failed to deposit recovered file {}: {}",
+                                    file_name_str,
+                                    err
+                                );
+                            }
+                        } else {
+                            // Delete incomplete file
+                            tracing::info!(
+                                "crash recovery: deleting incomplete file {}",
+                                file_name_str
+                            );
+                            if let Err(err) = fs::remove_file(&entry_path).await {
+                                tracing::warn!(
+                                    "failed to remove incomplete file {}: {}",
+                                    file_name_str,
+                                    err
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!("error reading tmp directory during recovery: {}", err);
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Move a file from tmp to target and queue for upload
+    async fn deposit_file(&mut self, file_path: &Path) -> Result {
+        if !file_path.exists() {
+            return Ok(());
+        }
+
+        let file_name = file_path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "expected file name")
+        })?;
+
+        let target_path = self.target_path.join(file_name);
+        fs::rename(file_path, &target_path).await?;
+        self.file_upload.upload_file(&target_path).await?;
+
         Ok(())
     }
 
@@ -589,6 +745,7 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
 
@@ -926,5 +1083,125 @@ mod tests {
         }
 
         assert_eq!(total_rows, 10);
+    }
+
+    #[tokio::test]
+    async fn test_crash_recovery_reuploads_completed_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let (file_upload, _server) = create_test_file_upload().await;
+
+        // Create a completed parquet file in target directory (simulating previous run)
+        let target_file = temp_dir.path().join("test.1234567890.parquet");
+        std::fs::write(&target_file, b"fake parquet data").unwrap();
+
+        let (_, mut sink) = ParquetSinkBuilder::<TestRecord>::new(
+            "test",
+            temp_dir.path(),
+            file_upload,
+            "test_metric",
+        )
+        .create()
+        .await
+        .unwrap();
+
+        // Init should trigger crash recovery and attempt to re-upload the file
+        sink.init().await.unwrap();
+
+        // File should still exist in target directory
+        assert!(target_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_crash_recovery_deletes_incomplete_files_when_no_auto_commit() {
+        let temp_dir = TempDir::new().unwrap();
+        let (file_upload, _server) = create_test_file_upload().await;
+
+        // Create an incomplete parquet file in tmp directory
+        let tmp_dir = temp_dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let incomplete_file = tmp_dir.join("test.1234567890.parquet");
+        std::fs::write(&incomplete_file, b"incomplete data").unwrap();
+
+        let (_, mut sink) = ParquetSinkBuilder::<TestRecord>::new(
+            "test",
+            temp_dir.path(),
+            file_upload,
+            "test_metric",
+        )
+        .auto_commit(false) // No auto-commit means delete incomplete files
+        .create()
+        .await
+        .unwrap();
+
+        // Init should trigger crash recovery and delete the incomplete file
+        sink.init().await.unwrap();
+
+        // Incomplete file should be deleted
+        assert!(!incomplete_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_crash_recovery_moves_incomplete_files_when_auto_commit() {
+        let temp_dir = TempDir::new().unwrap();
+        let (file_upload, _server) = create_test_file_upload().await;
+
+        // Create an incomplete parquet file in tmp directory
+        let tmp_dir = temp_dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let incomplete_file = tmp_dir.join("test.1234567890.parquet");
+        std::fs::write(&incomplete_file, b"incomplete data").unwrap();
+
+        let (_, mut sink) = ParquetSinkBuilder::<TestRecord>::new(
+            "test",
+            temp_dir.path(),
+            file_upload,
+            "test_metric",
+        )
+        .auto_commit(true) // Auto-commit means recover and upload incomplete files
+        .create()
+        .await
+        .unwrap();
+
+        // Init should trigger crash recovery and move the file to target
+        sink.init().await.unwrap();
+
+        // Original file should be gone from tmp
+        assert!(!incomplete_file.exists());
+
+        // File should be in target directory
+        let target_file = temp_dir.path().join("test.1234567890.parquet");
+        assert!(target_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_crash_recovery_ignores_non_matching_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let (file_upload, _server) = create_test_file_upload().await;
+
+        // Create files that don't match our prefix
+        let tmp_dir = temp_dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let other_file = tmp_dir.join("other.1234567890.parquet");
+        let txt_file = tmp_dir.join("test.1234567890.txt");
+        std::fs::write(&other_file, b"other data").unwrap();
+        std::fs::write(&txt_file, b"text data").unwrap();
+
+        let (_, mut sink) = ParquetSinkBuilder::<TestRecord>::new(
+            "test",
+            temp_dir.path(),
+            file_upload,
+            "test_metric",
+        )
+        .auto_commit(false)
+        .create()
+        .await
+        .unwrap();
+
+        // Init should not delete non-matching files
+        sink.init().await.unwrap();
+
+        // Both files should still exist
+        assert!(other_file.exists());
+        assert!(txt_file.exists());
     }
 }
