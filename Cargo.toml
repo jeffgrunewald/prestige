@@ -15,15 +15,20 @@ categories = ["asynchronous", "encoding", "filesystem"]
 edition = "2024"
 
 [workspace.dependencies]
+async-trait = "0"
 aws-config = "1"
 aws-sdk-s3 = "1"
+aws-smithy-types-convert = { version = "0", features = ["convert-streams"] }
 blake3 = "1"
 bytes = "1"
 chrono = { version = "0", features = ["serde"] }
 config = { version = "0", default-features = false, features = ["toml"] }
+derive_builder = "0.20"
 futures = "0"
 futures-util = "0"
 metrics = "0"
+regex = "1"
+retainer = "0.3"
 rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_arrow = { version = "0.13", features = ["arrow-55"] }
@@ -36,4 +41,5 @@ tokio = { version = "1", default-features = false, features = [
   "fs",
   "macros",
 ] }
+tokio-stream = "0"
 tracing = "0"

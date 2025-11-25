@@ -7,16 +7,21 @@ description = "Prestige file reading and writing utilities and tools"
 
 [dependencies]
 arrow = { version = "55", features = ["ipc"] }
+async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
+aws-smithy-types-convert.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 chrono = { workspace = true, optional = true }
 config.workspace = true
+derive_builder.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
 parquet = "55"
+regex.workspace = true
+retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
 serde.workspace = true
 serde_arrow.workspace = true
@@ -26,9 +31,11 @@ sqlx = { workspace = true, optional = true }
 super-visor.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 
 [features]
+default = ["chrono"]
 chrono = ["dep:chrono"]
 decimal = ["dep:rust_decimal"]
 sqlx = ["dep:sqlx"]
