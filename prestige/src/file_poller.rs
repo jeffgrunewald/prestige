@@ -495,6 +495,38 @@ mod tests {
     }
 }
 
+/// Generic implementation of FilePollerState for Arc<T>
+///
+/// This allows any type implementing FilePollerState to be wrapped in Arc
+/// while still implementing the trait. This is useful for sharing state
+/// across multiple tasks or threads.
+#[async_trait::async_trait]
+impl<T> FilePollerState for Arc<T>
+where
+    T: FilePollerState,
+{
+    async fn latest_timestamp(
+        &self,
+        process_name: &str,
+        file_type: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        (**self).latest_timestamp(process_name, file_type).await
+    }
+
+    async fn exists(&self, process_name: &str, file_meta: &FileMeta) -> Result<bool> {
+        (**self).exists(process_name, file_meta).await
+    }
+
+    async fn clean(
+        &self,
+        process_name: &str,
+        file_type: &str,
+        offset: DateTime<Utc>,
+    ) -> Result<u64> {
+        (**self).clean(process_name, file_type, offset).await
+    }
+}
+
 // PostgreSQL implementations for FilePollerState and FilePollerStateRecorder
 #[cfg(feature = "sqlx")]
 mod sqlx_impl {

@@ -2,6 +2,8 @@
 
 A high-performance Rust library for working with Parquet files and S3 storage, built on Apache Arrow. Prestige provides a complete toolkit for streaming data to/from Parquet format with automatic batching, file rotation, and S3 integration.
 
+Side note: the name "Prestige" is a reference to the "PrestoDB" query engine (since rebranded "Trino") for providing a relational SQL interface to columnar data files, including Parquet, in S3-compatible block storage.
+
 ## Features
 
 - **Type-safe Parquet I/O**: Derive macros for automatic schema generation and serialization
