@@ -284,6 +284,42 @@ impl<T: ParquetSerialize> ParquetSerialize for Vec<T> {
     }
 }
 
+// HashSet support - uses Parquet LIST logical type (same as Vec)
+impl<T: ParquetSerialize> ParquetSerialize for std::collections::HashSet<T> {
+    fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::basic::{LogicalType, Repetition};
+        use parquet::schema::types::Type;
+        use std::sync::Arc;
+
+        // Get the inner element type and rebuild it with name "element" and OPTIONAL repetition
+        let inner_base = T::parquet_schema_element();
+        let element = Arc::new(crate::rebuild_type_with_optional(inner_base, "element"));
+
+        // Build the repeated wrapper group named "list"
+        let list_group = Type::group_type_builder("list")
+            .with_repetition(Repetition::REPEATED)
+            .with_fields(vec![element])
+            .build()
+            .expect("Failed to build list wrapper group");
+
+        // Build the outer group with LIST logical type annotation
+        Type::group_type_builder("field")
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::List))
+            .with_fields(vec![Arc::new(list_group)])
+            .build()
+            .expect("Failed to build parquet LIST schema element")
+    }
+}
+
+impl<T: ArrowSerialize> ArrowSerialize for std::collections::HashSet<T> {
+    fn arrow_data_type() -> arrow::datatypes::DataType {
+        arrow::datatypes::DataType::List(arrow::datatypes::FieldRef::new(
+            arrow::datatypes::Field::new("item", T::arrow_data_type(), true),
+        ))
+    }
+}
+
 // HashMap support - uses Parquet MAP logical type
 impl<K: ParquetSerialize, V: ParquetSerialize> ParquetSerialize
     for std::collections::HashMap<K, V>
@@ -390,9 +426,117 @@ impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::
 
 impl<T: ParquetSerialize> ParquetSerialize for Option<T> {
     fn parquet_schema_element() -> parquet::schema::types::Type {
-        // For Option<T>, we modify the inner element to be optional
-        // We can't easily modify the repetition of an existing element, so we rebuild it
-        // This is a simplified approach - in practice we'd need more complex logic
-        T::parquet_schema_element()
+        // For Option<T>, we get the inner element's schema and rebuild it with OPTIONAL repetition
+        let inner_base = T::parquet_schema_element();
+        crate::rebuild_type_with_optional(inner_base, "field")
+    }
+}
+
+impl<T: ArrowSerialize> ArrowSerialize for Option<T> {
+    fn arrow_data_type() -> arrow::datatypes::DataType {
+        // Option<T> in Arrow is just the inner type - nullability is handled at the field level
+        T::arrow_data_type()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_vec_and_hashset_produce_identical_parquet_schemas() {
+        // Test with i32 as a representative scalar type
+        let vec_schema = Vec::<i32>::parquet_schema_element();
+        let hashset_schema = HashSet::<i32>::parquet_schema_element();
+
+        // Both should produce identical schemas since HashSet uses LIST, same as Vec
+        assert_eq!(
+            format!("{:?}", vec_schema),
+            format!("{:?}", hashset_schema),
+            "Vec<i32> and HashSet<i32> should produce identical Parquet schemas"
+        );
+
+        // Test with String as well
+        let vec_schema = Vec::<String>::parquet_schema_element();
+        let hashset_schema = HashSet::<String>::parquet_schema_element();
+
+        assert_eq!(
+            format!("{:?}", vec_schema),
+            format!("{:?}", hashset_schema),
+            "Vec<String> and HashSet<String> should produce identical Parquet schemas"
+        );
+    }
+
+    #[test]
+    fn test_vec_and_hashset_produce_identical_arrow_data_types() {
+        // Test with i32
+        let vec_type = Vec::<i32>::arrow_data_type();
+        let hashset_type = HashSet::<i32>::arrow_data_type();
+
+        assert_eq!(
+            vec_type, hashset_type,
+            "Vec<i32> and HashSet<i32> should produce identical Arrow data types"
+        );
+
+        // Test with String
+        let vec_type = Vec::<String>::arrow_data_type();
+        let hashset_type = HashSet::<String>::arrow_data_type();
+
+        assert_eq!(
+            vec_type, hashset_type,
+            "Vec<String> and HashSet<String> should produce identical Arrow data types"
+        );
+
+        // Test with u64
+        let vec_type = Vec::<u64>::arrow_data_type();
+        let hashset_type = HashSet::<u64>::arrow_data_type();
+
+        assert_eq!(
+            vec_type, hashset_type,
+            "Vec<u64> and HashSet<u64> should produce identical Arrow data types"
+        );
+    }
+
+    #[test]
+    fn test_hashset_schema_structure() {
+        // Verify the schema has the expected LIST structure
+        let schema = HashSet::<i32>::parquet_schema_element();
+
+        // Should be a group type with LIST logical type
+        assert!(schema.is_group());
+        assert_eq!(
+            schema.get_basic_info().logical_type(),
+            Some(parquet::basic::LogicalType::List)
+        );
+        assert_eq!(schema.name(), "field");
+
+        // Should have one child (the "list" group)
+        if let parquet::schema::types::Type::GroupType { fields, .. } = &schema {
+            assert_eq!(fields.len(), 1, "Should have one child field");
+            let list_group = &fields[0];
+            assert_eq!(list_group.name(), "list");
+            assert_eq!(
+                list_group.get_basic_info().repetition(),
+                parquet::basic::Repetition::REPEATED
+            );
+        } else {
+            panic!("Expected GroupType");
+        }
+    }
+
+    #[test]
+    fn test_hashset_arrow_type_is_list() {
+        let data_type = HashSet::<i32>::arrow_data_type();
+
+        // Should be a List type
+        match data_type {
+            arrow::datatypes::DataType::List(field) => {
+                assert_eq!(field.name(), "item");
+                assert_eq!(field.data_type(), &arrow::datatypes::DataType::Int32);
+                assert!(field.is_nullable(), "List items should be nullable");
+            }
+            _ => panic!("Expected List data type, got {:?}", data_type),
+        }
     }
 }
