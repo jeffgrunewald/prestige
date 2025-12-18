@@ -24,13 +24,22 @@ pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter, PrestigeSchema};
 
 /// Helper function to rebuild a parquet Type with OPTIONAL repetition and a new field name
 /// This is used by the derive macros to properly handle Option<T> fields
-pub fn rebuild_type_with_optional(base_type: parquet::schema::types::Type, field_name: &str) -> parquet::schema::types::Type {
-    use parquet::schema::types::{Type, TypePtr};
+pub fn rebuild_type_with_optional(
+    base_type: parquet::schema::types::Type,
+    field_name: &str,
+) -> parquet::schema::types::Type {
     use parquet::basic::Repetition;
+    use parquet::schema::types::{Type, TypePtr};
     use std::sync::Arc;
 
     match base_type {
-        Type::PrimitiveType { basic_info, physical_type, type_length, scale, precision } => {
+        Type::PrimitiveType {
+            basic_info,
+            physical_type,
+            type_length,
+            scale,
+            precision,
+        } => {
             let mut builder = Type::primitive_type_builder(field_name, physical_type)
                 .with_repetition(Repetition::OPTIONAL);
 
@@ -51,32 +60,41 @@ pub fn rebuild_type_with_optional(base_type: parquet::schema::types::Type, field
             }
 
             builder.build().expect("Failed to rebuild primitive type")
-        },
+        }
         Type::GroupType { basic_info, fields } => {
-            let mut builder = Type::group_type_builder(field_name)
-                .with_repetition(Repetition::OPTIONAL);
+            let mut builder =
+                Type::group_type_builder(field_name).with_repetition(Repetition::OPTIONAL);
 
             if let Some(logical_type) = basic_info.logical_type() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
-            let fields_vec: Vec<TypePtr> = fields.iter().map(|f| Arc::clone(f)).collect();
+            let fields_vec: Vec<TypePtr> = fields.iter().map(Arc::clone).collect();
             builder = builder.with_fields(fields_vec);
 
             builder.build().expect("Failed to rebuild group type")
-        },
+        }
     }
 }
 
 /// Helper function to rebuild a parquet Type with REQUIRED repetition and a new field name
 /// This is used for map keys which must be non-nullable
-pub fn rebuild_type_as_required(base_type: parquet::schema::types::Type, field_name: &str) -> parquet::schema::types::Type {
-    use parquet::schema::types::{Type, TypePtr};
+pub fn rebuild_type_as_required(
+    base_type: parquet::schema::types::Type,
+    field_name: &str,
+) -> parquet::schema::types::Type {
     use parquet::basic::Repetition;
+    use parquet::schema::types::{Type, TypePtr};
     use std::sync::Arc;
 
     match base_type {
-        Type::PrimitiveType { basic_info, physical_type, type_length, scale, precision } => {
+        Type::PrimitiveType {
+            basic_info,
+            physical_type,
+            type_length,
+            scale,
+            precision,
+        } => {
             let mut builder = Type::primitive_type_builder(field_name, physical_type)
                 .with_repetition(Repetition::REQUIRED);
 
@@ -97,20 +115,20 @@ pub fn rebuild_type_as_required(base_type: parquet::schema::types::Type, field_n
             }
 
             builder.build().expect("Failed to rebuild primitive type")
-        },
+        }
         Type::GroupType { basic_info, fields } => {
-            let mut builder = Type::group_type_builder(field_name)
-                .with_repetition(Repetition::REQUIRED);
+            let mut builder =
+                Type::group_type_builder(field_name).with_repetition(Repetition::REQUIRED);
 
             if let Some(logical_type) = basic_info.logical_type() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
-            let fields_vec: Vec<TypePtr> = fields.iter().map(|f| Arc::clone(f)).collect();
+            let fields_vec: Vec<TypePtr> = fields.iter().map(Arc::clone).collect();
             builder = builder.with_fields(fields_vec);
 
             builder.build().expect("Failed to rebuild group type")
-        },
+        }
     }
 }
 
@@ -118,9 +136,7 @@ pub fn rebuild_type_as_required(base_type: parquet::schema::types::Type, field_n
 use aws_config::BehaviorVersion;
 use aws_smithy_types_convert::stream::PaginationStreamExt;
 use chrono::{DateTime, Utc};
-use futures::{
-    future, stream, StreamExt, TryFutureExt, TryStreamExt,
-};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use std::{collections::HashMap, sync::OnceLock};
 use tokio::sync::Mutex;
 
@@ -221,7 +237,7 @@ where
         .send()
         .into_stream_03x()
         .map_ok(|page| stream::iter(page.contents.unwrap_or_default()).map(Ok))
-        .map_err(|e| AwsError::s3_error(e))
+        .map_err(AwsError::s3_error)
         .try_flatten()
         .try_filter_map(|file| {
             future::ready(FileMeta::try_from(&file).map(Some).map_err(Error::from))
@@ -259,11 +275,7 @@ pub async fn put_file(
     client
         .put_object()
         .bucket(bucket)
-        .key(
-            file.file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap(),
-        )
+        .key(file.file_name().map(|name| name.to_string_lossy()).unwrap())
         .body(byte_stream)
         .content_type("application/vnd.apache.parquet")
         .send()
@@ -307,5 +319,5 @@ pub async fn get_file(
         .collect()
         .await
         .map(|data| data.into_bytes())
-        .map_err(|e| Error::from(e))
+        .map_err(Error::from)
 }

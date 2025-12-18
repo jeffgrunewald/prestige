@@ -1,24 +1,26 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse_macro_input, DeriveInput, Data, Fields, Error,
-    Type, TypePath, TypeArray, Expr, ExprLit, Lit, GenericArgument, PathArguments, spanned::Spanned
+    Data, DeriveInput, Error, Expr, ExprLit, Fields, GenericArgument, Lit, PathArguments, Type,
+    TypeArray, TypePath, parse_macro_input, spanned::Spanned,
 };
 
 /// Helper function to extract the size from [u8; N] array types
 fn extract_fixed_byte_array_size(ty: &Type) -> Option<i32> {
     if let Type::Array(TypeArray { elem, len, .. }) = ty {
         // Check if element type is u8
-        if let Type::Path(TypePath { path, .. }) = elem.as_ref() {
-            if let Some(last_segment) = path.segments.last() {
-                if last_segment.ident == "u8" {
-                    // Extract the array length
-                    if let Expr::Lit(ExprLit { lit: Lit::Int(int_lit), .. }) = len {
-                        if let Ok(length) = int_lit.base10_parse::<i32>() {
-                            return Some(length);
-                        }
-                    }
-                }
+        if let Type::Path(TypePath { path, .. }) = elem.as_ref()
+            && let Some(last_segment) = path.segments.last()
+            && last_segment.ident == "u8"
+        {
+            // Extract the array length
+            if let Expr::Lit(ExprLit {
+                lit: Lit::Int(int_lit),
+                ..
+            }) = len
+                && let Ok(length) = int_lit.base10_parse::<i32>()
+            {
+                return Some(length);
             }
         }
     }
@@ -30,16 +32,15 @@ fn extract_fixed_byte_array_size(ty: &Type) -> Option<i32> {
 fn extract_option_inner_type(ty: &Type) -> Option<&Type> {
     if let Type::Path(TypePath { qself: None, path }) = ty {
         // Check if this is a single-segment path (no ::) or ends with Option
-        if let Some(last_segment) = path.segments.last() {
-            if last_segment.ident == "Option" {
-                // Extract the generic argument
-                if let PathArguments::AngleBracketed(ref args) = last_segment.arguments {
-                    if args.args.len() == 1 {
-                        if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
-                            return Some(inner_ty);
-                        }
-                    }
-                }
+        if let Some(last_segment) = path.segments.last()
+            && last_segment.ident == "Option"
+        {
+            // Extract the generic argument
+            if let PathArguments::AngleBracketed(ref args) = last_segment.arguments
+                && args.args.len() == 1
+                && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+            {
+                return Some(inner_ty);
             }
         }
     }
@@ -47,13 +48,16 @@ fn extract_option_inner_type(ty: &Type) -> Option<&Type> {
 }
 
 /// Helper function to extract named fields from a DeriveInput
-fn extract_named_fields(input: &DeriveInput) -> Result<&syn::punctuated::Punctuated<syn::Field, syn::token::Comma>, Error> {
+fn extract_named_fields(
+    input: &DeriveInput,
+) -> Result<&syn::punctuated::Punctuated<syn::Field, syn::token::Comma>, Error> {
     match input.data {
-        Data::Struct(ref data) => {
-            match data.fields {
-                Fields::Named(ref fields) => Ok(&fields.named),
-                _ => Err(Error::new(input.span(), "Can only be derived for structs with named fields")),
-            }
+        Data::Struct(ref data) => match data.fields {
+            Fields::Named(ref fields) => Ok(&fields.named),
+            _ => Err(Error::new(
+                input.span(),
+                "Can only be derived for structs with named fields",
+            )),
         },
         _ => Err(Error::new(input.span(), "Can only be derived for structs")),
     }
@@ -93,18 +97,24 @@ fn generate_arrow_field_schemas(
 fn generate_arrow_field_bounds(
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> Vec<proc_macro2::TokenStream> {
-    fields.iter().map(|field| {
-        let field_type = &field.ty;
-        if let Some(inner_type) = extract_option_inner_type(field_type) {
-            quote! { #inner_type: ::prestige::ArrowSerialize }
-        } else {
-            quote! { #field_type: ::prestige::ArrowSerialize }
-        }
-    }).collect()
+    fields
+        .iter()
+        .map(|field| {
+            let field_type = &field.ty;
+            if let Some(inner_type) = extract_option_inner_type(field_type) {
+                quote! { #inner_type: ::prestige::ArrowSerialize }
+            } else {
+                quote! { #field_type: ::prestige::ArrowSerialize }
+            }
+        })
+        .collect()
 }
 
 /// Generate the ArrowGroup implementation
-fn generate_arrow_group_impl(name: &syn::Ident, fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>) -> proc_macro2::TokenStream {
+fn generate_arrow_group_impl(
+    name: &syn::Ident,
+    fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+) -> proc_macro2::TokenStream {
     let arrow_field_schemas = generate_arrow_field_schemas(fields);
     let arrow_field_bounds = generate_arrow_field_bounds(fields);
 

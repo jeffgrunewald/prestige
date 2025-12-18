@@ -1,8 +1,6 @@
 use arrow::datatypes::DataType;
 use futures::StreamExt;
-use prestige::{
-    file_sink::ParquetSinkBuilder, file_source, FileUpload,
-};
+use prestige::{FileUpload, file_sink::ParquetSinkBuilder, file_source};
 use serde::{Deserialize, Serialize};
 use super_visor::{ManagedProc, ShutdownSignal};
 use tempfile::TempDir;
@@ -25,14 +23,7 @@ fn generate_sample_sensor_data(count: usize) -> Vec<SensorData> {
             timestamp: 1700000000 + (i as u64 * 60), // Increment by 1 minute
             sensor_id: format!("sensor-{:04}", i),
             temperature: 20.0 + (i as f32 * 0.5), // Temperature increases
-            device_mac: [
-                0xAA,
-                0xBB,
-                0xCC,
-                (i / 256) as u8,
-                (i % 256) as u8,
-                0xFF,
-            ],
+            device_mac: [0xAA, 0xBB, 0xCC, (i / 256) as u8, (i % 256) as u8, 0xFF],
         })
         .collect()
 }
@@ -64,9 +55,8 @@ async fn write_sensor_data_to_parquet(
     let cancel_token = CancellationToken::new();
     let shutdown_signal = ShutdownSignal::new(cancel_token.clone());
 
-    let sink_handle = tokio::task::spawn_local(async move {
-        Box::new(sink).run_proc(shutdown_signal).await
-    });
+    let sink_handle =
+        tokio::task::spawn_local(async move { Box::new(sink).run_proc(shutdown_signal).await });
 
     // Write data using the client
     for record in data {
@@ -86,10 +76,7 @@ async fn write_sensor_data_to_parquet(
     let _ = sink_handle.await;
 
     // Convert manifest strings to PathBufs
-    Ok(manifest
-        .into_iter()
-        .map(|s| std::path::PathBuf::from(s))
-        .collect())
+    Ok(manifest.into_iter().map(std::path::PathBuf::from).collect())
 }
 
 /// Helper function to read sensor data from parquet files
@@ -132,7 +119,11 @@ async fn test_roundtrip_sensor_data_small() {
                 .await
                 .unwrap();
 
-            assert_eq!(file_paths.len(), 1, "Should produce exactly one parquet file");
+            assert_eq!(
+                file_paths.len(),
+                1,
+                "Should produce exactly one parquet file"
+            );
 
             // Verify file exists
             assert!(
@@ -231,9 +222,10 @@ async fn test_roundtrip_sensor_data_with_rotation() {
             let cancel_token = CancellationToken::new();
             let shutdown_signal = ShutdownSignal::new(cancel_token.clone());
 
-            let sink_handle = tokio::task::spawn_local(async move {
-                Box::new(sink).run_proc(shutdown_signal).await
-            });
+            let sink_handle =
+                tokio::task::spawn_local(
+                    async move { Box::new(sink).run_proc(shutdown_signal).await },
+                );
 
             // Write all data
             for record in original_data.clone() {
@@ -309,9 +301,10 @@ async fn test_roundtrip_empty_dataset() {
             let cancel_token = CancellationToken::new();
             let shutdown_signal = ShutdownSignal::new(cancel_token.clone());
 
-            let sink_handle = tokio::task::spawn_local(async move {
-                Box::new(sink).run_proc(shutdown_signal).await
-            });
+            let sink_handle =
+                tokio::task::spawn_local(
+                    async move { Box::new(sink).run_proc(shutdown_signal).await },
+                );
 
             // Don't write any data, just commit
             let manifest_rx = client.commit().await.unwrap();
@@ -409,10 +402,11 @@ async fn test_roundtrip_parquet_file_format_verification() {
 
             // Verify we can read the parquet file with parquet library directly
             let file = std::fs::File::open(&file_paths[0]).unwrap();
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                .unwrap()
-                .build()
-                .unwrap();
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .unwrap()
+                    .build()
+                    .unwrap();
 
             let mut total_rows = 0;
             for batch_result in reader {

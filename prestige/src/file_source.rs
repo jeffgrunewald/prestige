@@ -1,8 +1,8 @@
-use crate::{Client, FileMetaStream, Result};
+use crate::{Client, Error, FileMetaStream, Result};
 use arrow::array::RecordBatch;
 use futures::{
-    stream::{self, BoxStream},
     StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
 };
 use metrics::Label;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -75,7 +75,8 @@ where
                         if let Some(ref m) = metric {
                             match result {
                                 Ok(batch) => {
-                                    metrics::counter!(m.clone(), vec![OK_LABEL]).increment(batch.num_rows() as u64);
+                                    metrics::counter!(m.clone(), vec![OK_LABEL])
+                                        .increment(batch.num_rows() as u64);
                                 }
                                 Err(_) => {
                                     metrics::counter!(m.clone(), vec![ERROR_LABEL]).increment(1);
@@ -83,7 +84,7 @@ where
                             }
                         }
                     })
-                    .map_err(crate::Error::from)
+                    .map_err(Error::from)
                     .boxed(),
                 Err(err) => {
                     if let Some(ref m) = metric {
@@ -120,6 +121,27 @@ pub async fn source_s3_file(
     // Download file from S3
     let bytes = crate::get_file(client, bucket, &key).await?;
 
+    // Validate file before parsing
+    // Parquet files require minimum 12 bytes (PAR1 header + footer + metadata len)
+    // In pratice, valid files are at least ~300 bytes
+    const MIN_PARQUET_SIZE: usize = 12;
+    if bytes.is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Empty parquet file: {key}"),
+        )));
+    }
+
+    if bytes.len() < MIN_PARQUET_SIZE {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Parquet file missing too small ({} bytes) minimum fixed-length values: {key}",
+                bytes.len()
+            ),
+        )));
+    }
+
     // Parse parquet from bytes
     let cursor = Cursor::new(bytes);
     let builder = ParquetRecordBatchStreamBuilder::new(cursor).await?;
@@ -134,7 +156,8 @@ pub async fn source_s3_file(
             if let Some(ref m) = metric {
                 match result {
                     Ok(batch) => {
-                        metrics::counter!(m.clone(), vec![OK_LABEL]).increment(batch.num_rows() as u64);
+                        metrics::counter!(m.clone(), vec![OK_LABEL])
+                            .increment(batch.num_rows() as u64);
                     }
                     Err(_) => {
                         metrics::counter!(m.clone(), vec![ERROR_LABEL]).increment(1);
@@ -142,7 +165,7 @@ pub async fn source_s3_file(
                 }
             }
         })
-        .map_err(crate::Error::from)
+        .map_err(Error::from)
         .boxed())
 }
 
@@ -282,7 +305,8 @@ mod tests {
                 Field::new("batch", DataType::Int64, false),
             ]));
 
-            let id_array = Int64Array::from(vec![i as i64 * 10, i as i64 * 10 + 1, i as i64 * 10 + 2]);
+            let id_array =
+                Int64Array::from(vec![i as i64 * 10, i as i64 * 10 + 1, i as i64 * 10 + 2]);
             let batch_array = Int64Array::from(vec![i as i64, i as i64, i as i64]);
 
             let batch = RecordBatch::try_new(
@@ -390,9 +414,21 @@ mod tests {
         assert_eq!(schema.field(2).name(), "value");
 
         // Verify first row data
-        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let value_col = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let name_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let value_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
 
         assert_eq!(id_col.value(0), 1);
         assert_eq!(name_col.value(0), "Alice");

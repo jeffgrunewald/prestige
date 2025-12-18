@@ -165,13 +165,10 @@ where
     State: FilePollerState,
 {
     /// Create the FilePoller server and receiver
-    pub async fn create(
-        self,
-    ) -> Result<(
-        FileStreamReceiver,
-        FilePollerServer<State>,
-    )> {
-        let config = self.build().map_err(|e| crate::Error::Config(config::ConfigError::Message(e.to_string())))?;
+    pub async fn create(self) -> Result<(FileStreamReceiver, FilePollerServer<State>)> {
+        let config = self
+            .build()
+            .map_err(|e| crate::Error::Config(config::ConfigError::Message(e.to_string())))?;
         let (sender, receiver) = tokio::sync::mpsc::channel(config.queue_size);
         let latest_file_timestamp = config
             .state
@@ -230,7 +227,8 @@ where
                 }
             }
             LookbackBehavior::Max(max_lookback) => {
-                let max_lookback_time = Utc::now() - chrono::Duration::from_std(max_lookback).unwrap();
+                let max_lookback_time =
+                    Utc::now() - chrono::Duration::from_std(max_lookback).unwrap();
                 let latest_with_offset = latest_file_timestamp
                     .map(|ts| ts - chrono::Duration::from_std(offset).unwrap());
 
@@ -384,114 +382,10 @@ where
         shutdown: super_visor::ShutdownSignal,
     ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
-            self.run(shutdown).await.map_err(|e| anyhow::anyhow!("{}", e))
+            self.run(shutdown)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use tokio::sync::Mutex;
-
-    // Mock state implementation for testing
-    #[derive(Clone)]
-    struct MockState {
-        latest: Arc<Mutex<HashMap<(String, String), DateTime<Utc>>>>,
-        processed: Arc<Mutex<HashMap<String, bool>>>,
-    }
-
-    impl MockState {
-        fn new() -> Self {
-            Self {
-                latest: Arc::new(Mutex::new(HashMap::new())),
-                processed: Arc::new(Mutex::new(HashMap::new())),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl FilePollerState for MockState {
-        async fn latest_timestamp(
-            &self,
-            process_name: &str,
-            file_type: &str,
-        ) -> Result<Option<DateTime<Utc>>> {
-            let latest = self.latest.lock().await;
-            Ok(latest.get(&(process_name.to_string(), file_type.to_string())).copied())
-        }
-
-        async fn exists(&self, _process_name: &str, file_meta: &FileMeta) -> Result<bool> {
-            let processed = self.processed.lock().await;
-            Ok(processed.get(&file_meta.key).copied().unwrap_or(false))
-        }
-
-        async fn clean(
-            &self,
-            _process_name: &str,
-            _file_type: &str,
-            _offset: DateTime<Utc>,
-        ) -> Result<u64> {
-            Ok(0)
-        }
-    }
-
-    #[test]
-    fn test_lookback_behavior_from_datetime() {
-        let ts = Utc::now();
-        let lookback: LookbackBehavior = ts.into();
-        match lookback {
-            LookbackBehavior::StartAfter(t) => assert_eq!(t, ts),
-            _ => panic!("Expected StartAfter variant"),
-        }
-    }
-
-    #[test]
-    fn test_lookback_behavior_from_duration() {
-        let duration = Duration::from_secs(3600);
-        let lookback: LookbackBehavior = duration.into();
-        match lookback {
-            LookbackBehavior::Max(d) => assert_eq!(d, duration),
-            _ => panic!("Expected Max variant"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_mock_state_latest_timestamp() {
-        let state = MockState::new();
-
-        // Should return None initially
-        let result = state.latest_timestamp("test", "prefix").await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_mock_state_exists() {
-        let state = MockState::new();
-        let file_meta = FileMeta::from(("test".to_string(), Utc::now()));
-
-        // Should return false for non-existent file
-        let exists = state.exists("test", &file_meta).await.unwrap();
-        assert!(!exists);
-    }
-
-    #[tokio::test]
-    async fn test_mock_state_clean() {
-        let state = MockState::new();
-        let offset = Utc::now() - chrono::Duration::hours(12);
-
-        let count = state.clean("test", "prefix", offset).await.unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_constants() {
-        assert_eq!(DEFAULT_POLL_DURATION_SECS, 30);
-        assert_eq!(DEFAULT_POLL_DURATION, Duration::from_secs(30));
-        assert_eq!(DEFAULT_OFFSET_DURATION, Duration::from_secs(10 * 60));
-        assert_eq!(CLEAN_DURATION, Duration::from_secs(12 * 60 * 60));
-        assert_eq!(CACHE_TTL, Duration::from_secs(3 * 60 * 60));
     }
 }
 
@@ -638,5 +532,115 @@ mod sqlx_impl {
             .map(|result| result.rows_affected())
             .map_err(crate::Error::from)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    type LatestState = Arc<Mutex<HashMap<(String, String), DateTime<Utc>>>>;
+
+    // Mock state implementation for testing
+    #[derive(Clone)]
+    struct MockState {
+        latest: LatestState,
+        processed: Arc<Mutex<HashMap<String, bool>>>,
+    }
+
+    impl MockState {
+        fn new() -> Self {
+            Self {
+                latest: Arc::new(Mutex::new(HashMap::new())),
+                processed: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FilePollerState for MockState {
+        async fn latest_timestamp(
+            &self,
+            process_name: &str,
+            file_type: &str,
+        ) -> Result<Option<DateTime<Utc>>> {
+            let latest = self.latest.lock().await;
+            Ok(latest
+                .get(&(process_name.to_string(), file_type.to_string()))
+                .copied())
+        }
+
+        async fn exists(&self, _process_name: &str, file_meta: &FileMeta) -> Result<bool> {
+            let processed = self.processed.lock().await;
+            Ok(processed.get(&file_meta.key).copied().unwrap_or(false))
+        }
+
+        async fn clean(
+            &self,
+            _process_name: &str,
+            _file_type: &str,
+            _offset: DateTime<Utc>,
+        ) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn test_lookback_behavior_from_datetime() {
+        let ts = Utc::now();
+        let lookback: LookbackBehavior = ts.into();
+        match lookback {
+            LookbackBehavior::StartAfter(t) => assert_eq!(t, ts),
+            _ => panic!("Expected StartAfter variant"),
+        }
+    }
+
+    #[test]
+    fn test_lookback_behavior_from_duration() {
+        let duration = Duration::from_secs(3600);
+        let lookback: LookbackBehavior = duration.into();
+        match lookback {
+            LookbackBehavior::Max(d) => assert_eq!(d, duration),
+            _ => panic!("Expected Max variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_state_latest_timestamp() {
+        let state = MockState::new();
+
+        // Should return None initially
+        let result = state.latest_timestamp("test", "prefix").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mock_state_exists() {
+        let state = MockState::new();
+        let file_meta = FileMeta::from(("test".to_string(), Utc::now()));
+
+        // Should return false for non-existent file
+        let exists = state.exists("test", &file_meta).await.unwrap();
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn test_mock_state_clean() {
+        let state = MockState::new();
+        let offset = Utc::now() - chrono::Duration::hours(12);
+
+        let count = state.clean("test", "prefix", offset).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(DEFAULT_POLL_DURATION_SECS, 30);
+        assert_eq!(DEFAULT_POLL_DURATION, Duration::from_secs(30));
+        assert_eq!(DEFAULT_OFFSET_DURATION, Duration::from_secs(10 * 60));
+        assert_eq!(CLEAN_DURATION, Duration::from_secs(12 * 60 * 60));
+        assert_eq!(CACHE_TTL, Duration::from_secs(3 * 60 * 60));
     }
 }

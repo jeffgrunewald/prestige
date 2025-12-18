@@ -1,4 +1,4 @@
-use crate::{error::ChannelError, Client, Result};
+use crate::{Client, Result, error::ChannelError};
 use futures::StreamExt;
 use std::{path::PathBuf, time::Duration};
 use super_visor::{ManagedProc, ShutdownSignal};
@@ -55,7 +55,9 @@ impl ManagedProc for FileUploadServer {
         shutdown: ShutdownSignal,
     ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
-            self.run(shutdown).await.map_err(|e| anyhow::anyhow!("{}", e))
+            self.run(shutdown)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))
         })
     }
 }
@@ -143,8 +145,9 @@ mod tests {
     async fn test_upload_closed_channel_error() {
         let (upload, _server) = FileUpload::new(
             crate::new_client(None, None, None, None).await,
-            "test-bucket".to_string()
-        ).await;
+            "test-bucket".to_string(),
+        )
+        .await;
 
         drop(_server); // Close receiver
 

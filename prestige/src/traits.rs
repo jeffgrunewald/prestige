@@ -58,10 +58,24 @@ macro_rules! impl_arrow_serialize {
     };
 }
 
-impl_parquet_serialize!(i8, parquet::basic::Type::INT32, Some(parquet::basic::LogicalType::Integer { bit_width: 8, is_signed: true }));
+impl_parquet_serialize!(
+    i8,
+    parquet::basic::Type::INT32,
+    Some(parquet::basic::LogicalType::Integer {
+        bit_width: 8,
+        is_signed: true
+    })
+);
 impl_arrow_serialize!(i8, arrow::datatypes::DataType::Int8);
 
-impl_parquet_serialize!(i16, parquet::basic::Type::INT32, Some(parquet::basic::LogicalType::Integer { bit_width: 16, is_signed: true }));
+impl_parquet_serialize!(
+    i16,
+    parquet::basic::Type::INT32,
+    Some(parquet::basic::LogicalType::Integer {
+        bit_width: 16,
+        is_signed: true
+    })
+);
 impl_arrow_serialize!(i16, arrow::datatypes::DataType::Int16);
 
 impl_parquet_serialize!(i32, parquet::basic::Type::INT32, None);
@@ -70,16 +84,44 @@ impl_arrow_serialize!(i32, arrow::datatypes::DataType::Int32);
 impl_parquet_serialize!(i64, parquet::basic::Type::INT64, None);
 impl_arrow_serialize!(i64, arrow::datatypes::DataType::Int64);
 
-impl_parquet_serialize!(u8, parquet::basic::Type::INT32, Some(parquet::basic::LogicalType::Integer { bit_width: 8, is_signed: false }));
+impl_parquet_serialize!(
+    u8,
+    parquet::basic::Type::INT32,
+    Some(parquet::basic::LogicalType::Integer {
+        bit_width: 8,
+        is_signed: false
+    })
+);
 impl_arrow_serialize!(u8, arrow::datatypes::DataType::UInt8);
 
-impl_parquet_serialize!(u16, parquet::basic::Type::INT32, Some(parquet::basic::LogicalType::Integer { bit_width: 16, is_signed: false }));
+impl_parquet_serialize!(
+    u16,
+    parquet::basic::Type::INT32,
+    Some(parquet::basic::LogicalType::Integer {
+        bit_width: 16,
+        is_signed: false
+    })
+);
 impl_arrow_serialize!(u16, arrow::datatypes::DataType::UInt16);
 
-impl_parquet_serialize!(u32, parquet::basic::Type::INT32, Some(parquet::basic::LogicalType::Integer { bit_width: 32, is_signed: false }));
+impl_parquet_serialize!(
+    u32,
+    parquet::basic::Type::INT32,
+    Some(parquet::basic::LogicalType::Integer {
+        bit_width: 32,
+        is_signed: false
+    })
+);
 impl_arrow_serialize!(u32, arrow::datatypes::DataType::UInt32);
 
-impl_parquet_serialize!(u64, parquet::basic::Type::INT64, Some(parquet::basic::LogicalType::Integer { bit_width: 64, is_signed: false }));
+impl_parquet_serialize!(
+    u64,
+    parquet::basic::Type::INT64,
+    Some(parquet::basic::LogicalType::Integer {
+        bit_width: 64,
+        is_signed: false
+    })
+);
 impl_arrow_serialize!(u64, arrow::datatypes::DataType::UInt64);
 
 impl_parquet_serialize!(f32, parquet::basic::Type::FLOAT, None);
@@ -91,7 +133,11 @@ impl_arrow_serialize!(f64, arrow::datatypes::DataType::Float64);
 impl_parquet_serialize!(bool, parquet::basic::Type::BOOLEAN, None);
 impl_arrow_serialize!(bool, arrow::datatypes::DataType::Boolean);
 
-impl_parquet_serialize!(String, parquet::basic::Type::BYTE_ARRAY, Some(parquet::basic::LogicalType::String));
+impl_parquet_serialize!(
+    String,
+    parquet::basic::Type::BYTE_ARRAY,
+    Some(parquet::basic::LogicalType::String)
+);
 impl_arrow_serialize!(String, arrow::datatypes::DataType::Utf8);
 
 // Fixed-size byte array support - enables use as HashMap keys and in collections
@@ -117,34 +163,56 @@ impl<const N: usize> ArrowSerialize for [u8; N] {
 #[cfg(feature = "chrono")]
 mod chrono_impls {
     use super::*;
-    use chrono::{DateTime, NaiveDateTime, NaiveDate, NaiveTime, Utc};
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
-    impl_parquet_serialize!(DateTime<Utc>, parquet::basic::Type::INT64, Some(parquet::basic::LogicalType::Timestamp {
-        is_adjusted_to_u_t_c: true,
-        unit: parquet::basic::TimeUnit::MILLIS(parquet::format::MilliSeconds {})
-    }));
-    impl_arrow_serialize!(DateTime<Utc>, arrow::datatypes::DataType::Timestamp(
-        arrow::datatypes::TimeUnit::Millisecond,
-        Some("UTC".into())
-    ));
+    impl_parquet_serialize!(
+        DateTime<Utc>,
+        parquet::basic::Type::INT64,
+        Some(parquet::basic::LogicalType::Timestamp {
+            is_adjusted_to_u_t_c: true,
+            unit: parquet::basic::TimeUnit::MILLIS(parquet::format::MilliSeconds {})
+        })
+    );
+    impl_arrow_serialize!(
+        DateTime<Utc>,
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Millisecond,
+            Some("UTC".into())
+        )
+    );
 
-    impl_parquet_serialize!(NaiveDateTime, parquet::basic::Type::INT64, Some(parquet::basic::LogicalType::Timestamp {
-        is_adjusted_to_u_t_c: false,
-        unit: parquet::basic::TimeUnit::MILLIS(parquet::format::MilliSeconds {})
-    }));
-    impl_arrow_serialize!(NaiveDateTime, arrow::datatypes::DataType::Timestamp(
-        arrow::datatypes::TimeUnit::Millisecond,
-        None
-    ));
+    impl_parquet_serialize!(
+        NaiveDateTime,
+        parquet::basic::Type::INT64,
+        Some(parquet::basic::LogicalType::Timestamp {
+            is_adjusted_to_u_t_c: false,
+            unit: parquet::basic::TimeUnit::MILLIS(parquet::format::MilliSeconds {})
+        })
+    );
+    impl_arrow_serialize!(
+        NaiveDateTime,
+        arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)
+    );
 
-    impl_parquet_serialize!(NaiveDate, parquet::basic::Type::INT32, Some(parquet::basic::LogicalType::Date));
+    impl_parquet_serialize!(
+        NaiveDate,
+        parquet::basic::Type::INT32,
+        Some(parquet::basic::LogicalType::Date)
+    );
     impl_arrow_serialize!(NaiveDate, arrow::datatypes::DataType::Date32);
 
-    impl_parquet_serialize!(NaiveTime, parquet::basic::Type::INT64, Some(parquet::basic::LogicalType::Time {
-        is_adjusted_to_u_t_c: false,
-        unit: parquet::basic::TimeUnit::NANOS(parquet::format::NanoSeconds {})
-    }));
-    impl_arrow_serialize!(NaiveTime, arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond));
+    impl_parquet_serialize!(
+        NaiveTime,
+        parquet::basic::Type::INT64,
+        Some(parquet::basic::LogicalType::Time {
+            is_adjusted_to_u_t_c: false,
+            unit: parquet::basic::TimeUnit::NANOS(parquet::format::NanoSeconds {})
+        })
+    );
+    impl_arrow_serialize!(
+        NaiveTime,
+        arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond)
+    );
 }
 
 #[cfg(feature = "decimal")]
@@ -154,8 +222,8 @@ mod decimal_impls {
 
     impl ParquetSerialize for Decimal {
         fn parquet_schema_element() -> parquet::schema::types::Type {
-            use parquet::schema::types::Type;
             use parquet::basic::{LogicalType, Type as PhysicalType};
+            use parquet::schema::types::Type;
 
             // rust_decimal::Decimal is a 128-bit decimal with precision up to 28
             // We use 16 bytes (128 bits) to store the value
@@ -183,16 +251,16 @@ mod decimal_impls {
 
 impl<T: ArrowSerialize> ArrowSerialize for Vec<T> {
     fn arrow_data_type() -> arrow::datatypes::DataType {
-        arrow::datatypes::DataType::List(
-            arrow::datatypes::FieldRef::new(arrow::datatypes::Field::new("item", T::arrow_data_type(), true))
-        )
+        arrow::datatypes::DataType::List(arrow::datatypes::FieldRef::new(
+            arrow::datatypes::Field::new("item", T::arrow_data_type(), true),
+        ))
     }
 }
 
 impl<T: ParquetSerialize> ParquetSerialize for Vec<T> {
     fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::basic::{LogicalType, Repetition};
         use parquet::schema::types::Type;
-        use parquet::basic::{Repetition, LogicalType};
         use std::sync::Arc;
 
         // Get the inner element type and rebuild it with name "element" and OPTIONAL repetition
@@ -217,10 +285,12 @@ impl<T: ParquetSerialize> ParquetSerialize for Vec<T> {
 }
 
 // HashMap support - uses Parquet MAP logical type
-impl<K: ParquetSerialize, V: ParquetSerialize> ParquetSerialize for std::collections::HashMap<K, V> {
+impl<K: ParquetSerialize, V: ParquetSerialize> ParquetSerialize
+    for std::collections::HashMap<K, V>
+{
     fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::basic::{LogicalType, Repetition};
         use parquet::schema::types::Type;
-        use parquet::basic::{Repetition, LogicalType};
         use std::sync::Arc;
 
         // Build the key field (required/non-nullable)
@@ -253,7 +323,7 @@ impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::
         use arrow::datatypes::{DataType, Field, Fields};
 
         // Map = List<Struct<key: K, value: V>>
-        let key_field = Field::new("key", K::arrow_data_type(), false);  // Non-nullable
+        let key_field = Field::new("key", K::arrow_data_type(), false); // Non-nullable
         let value_field = Field::new("value", V::arrow_data_type(), true); // Nullable
 
         let entries_struct = DataType::Struct(Fields::from(vec![key_field, value_field]));
@@ -261,16 +331,18 @@ impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::
 
         DataType::Map(
             std::sync::Arc::new(entries_field),
-            false  // keys_sorted = false for HashMap
+            false, // keys_sorted = false for HashMap
         )
     }
 }
 
 // BTreeMap support - similar to HashMap but with sorted keys hint
-impl<K: ParquetSerialize, V: ParquetSerialize> ParquetSerialize for std::collections::BTreeMap<K, V> {
+impl<K: ParquetSerialize, V: ParquetSerialize> ParquetSerialize
+    for std::collections::BTreeMap<K, V>
+{
     fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::basic::{LogicalType, Repetition};
         use parquet::schema::types::Type;
-        use parquet::basic::{Repetition, LogicalType};
         use std::sync::Arc;
 
         // Build the key field (required/non-nullable)
@@ -303,7 +375,7 @@ impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::
         use arrow::datatypes::{DataType, Field, Fields};
 
         // Map = List<Struct<key: K, value: V>>
-        let key_field = Field::new("key", K::arrow_data_type(), false);  // Non-nullable
+        let key_field = Field::new("key", K::arrow_data_type(), false); // Non-nullable
         let value_field = Field::new("value", V::arrow_data_type(), true); // Nullable
 
         let entries_struct = DataType::Struct(Fields::from(vec![key_field, value_field]));
@@ -311,7 +383,7 @@ impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::
 
         DataType::Map(
             std::sync::Arc::new(entries_field),
-            true  // keys_sorted = true for BTreeMap
+            true, // keys_sorted = true for BTreeMap
         )
     }
 }
@@ -319,9 +391,8 @@ impl<K: ArrowSerialize, V: ArrowSerialize> ArrowSerialize for std::collections::
 impl<T: ParquetSerialize> ParquetSerialize for Option<T> {
     fn parquet_schema_element() -> parquet::schema::types::Type {
         // For Option<T>, we modify the inner element to be optional
-        let inner_element = T::parquet_schema_element();
         // We can't easily modify the repetition of an existing element, so we rebuild it
         // This is a simplified approach - in practice we'd need more complex logic
-        inner_element
+        T::parquet_schema_element()
     }
 }

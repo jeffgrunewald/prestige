@@ -21,9 +21,8 @@ pub struct FileMeta {
     pub size: usize,
 }
 
-static RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([a-z,\d,_]+)\.(\d+)(\.parquet)?").unwrap()
-});
+static RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([a-z,\d,_]+)\.(\d+)(\.parquet)?").unwrap());
 
 impl FromStr for FileMeta {
     type Err = FileMetaError;

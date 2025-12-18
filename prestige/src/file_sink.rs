@@ -1,4 +1,4 @@
-use crate::{FileMeta, Result, error::ChannelError, file_upload::FileUpload};
+use crate::{Error, FileMeta, Result, error::ChannelError, file_upload::FileUpload};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use chrono::{DateTime, Utc};
@@ -592,7 +592,7 @@ where
 
             // Time threshold
             let roll_duration = chrono::Duration::from_std(self.roll_time)
-                .map_err(|e| crate::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
             if (sink.created_at + roll_duration) <= Utc::now() {
                 tracing::debug!("rotating on time");
                 return Ok(true);
@@ -628,7 +628,7 @@ where
 
             // Convert buffer to RecordBatch using serde_arrow
             let arrays = serde_arrow::to_arrow(self.schema.fields(), &sink.buffer)
-                .map_err(|e| crate::Error::SerdeArrow(e.to_string()))?;
+                .map_err(|e| Error::SerdeArrow(e.to_string()))?;
 
             let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
 
@@ -689,11 +689,11 @@ where
             sink.writer.close()?;
 
             // Move from tmp to target
-            let target_file =
-                self.target_path
-                    .join(sink.file_path.file_name().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "no filename")
-                    })?);
+            let target_file = self.target_path.join(
+                sink.file_path
+                    .file_name()
+                    .ok_or_else(|| std::io::Error::other("no filename"))?,
+            );
 
             fs::rename(&sink.file_path, &target_file).await?;
             self.staged_files.push(target_file);
@@ -1035,7 +1035,7 @@ mod tests {
         let result = client.write(record, &[]).await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), crate::Error::Channel(_)));
+        assert!(matches!(result.unwrap_err(), Error::Channel(_)));
     }
 
     #[tokio::test]
