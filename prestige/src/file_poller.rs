@@ -344,28 +344,43 @@ where
                     self.cache.insert(file_meta.key.clone(), true, CACHE_TTL).await;
 
                     // Download and create stream
-                    let batches = crate::file_source::source_s3_file(
+                    match crate::file_source::source_s3_file(
                         &self.config.client,
                         &self.config.bucket,
                         &file_meta.key,
                         None,
-                        Some(format!("file_poller_{}", prefix)),
+                        Some(format!("file_poller_{prefix}")),
                     )
-                    .await?;
+                    .await {
+                        Ok(batches) => {
+                            let file_stream = FileStream::new(
+                                process_name.clone(),
+                                file_meta,
+                                batches,
+                            );
 
-                    let file_stream = FileStream::new(
-                        process_name.clone(),
-                        file_meta,
-                        batches,
-                    );
-
-                    if sender.send(file_stream).await.is_err() {
-                        tracing::warn!(
-                            r#type = prefix,
-                            %process_name,
-                            "file stream receiver dropped"
-                        );
-                        break Ok(());
+                            if sender.send(file_stream).await.is_err() {
+                                tracing::warn!(
+                                    r#type = prefix,
+                                    %process_name,
+                                    "file stream receiver dropped",
+                                );
+                                break Ok(());
+                            }
+                        }
+                        Err(err) => {
+                            metrics::counter!("invalid-parquet-file").increment(1);
+                            tracing::error!(
+                                r#type = prefix,
+                                %process_name,
+                                file_key = %file_meta.key,
+                                file_size = ?file_meta.timestamp,
+                                ?err,
+                                "failed to process file",
+                            );
+                            // Continue processing subsequent files instead of crashing
+                            continue;
+                        }
                     }
                 }
             }
