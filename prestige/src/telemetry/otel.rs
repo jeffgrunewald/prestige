@@ -6,8 +6,8 @@ use opentelemetry::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    std::sync::{
-        Arc, OneLock, RwLock,
+    sync::{
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -38,7 +38,7 @@ fn to_key_values(labels: &[Label]) -> Vec<KeyValue> {
     labels
         .iter()
         .map(|l| KeyValue::new(l.key, l.value.clone()))
-        .collect();
+        .collect()
 }
 
 // ====================================================================
@@ -95,7 +95,7 @@ fn get_or_create_histogram(name: &'static str) -> Histogram<f64> {
 /// Record a value to a histogram metric
 pub fn record_histogram(name: &'static str, value: f64, labels: &[Label]) {
     let histogram = get_or_create_histogram(name);
-    let attrs = to_key_value(labels);
+    let attrs = to_key_values(labels);
     histogram.record(value, &attrs);
 }
 
