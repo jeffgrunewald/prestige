@@ -35,7 +35,7 @@ pub use file_poller::{
     FilePollerStateRecorder, FileStream, FileStreamReceiver, LookbackBehavior,
 };
 pub use file_sink::{ParquetSink, ParquetSinkBuilder, ParquetSinkClient};
-pub use file_source::RecordBatchStream;
+pub use file_source::{RecordBatchStream, deserialize_stream, deserialize_to_vec};
 pub use file_upload::{FileUpload, FileUploadServer};
 pub use settings::Settings;
 pub use traits::{ArrowSchema, ArrowSerialize, ParquetSerialize};

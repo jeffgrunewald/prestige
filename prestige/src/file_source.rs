@@ -291,6 +291,90 @@ pub fn source_s3_files_unordered(
         .boxed()
 }
 
+/// Deserialize a RecordBatchStream into a Vec<T>
+///
+/// Consumes the stream and deserializes all RecordBatch items into
+/// a vector of strongly-typed records
+///
+/// # Arguments
+/// * `stream` - RecordBatchStream to deserialize
+///
+/// # Example
+/// ```no_run
+/// use prestige::file_source;
+///
+/// let stream = file_source::source(paths, None, None);
+/// let records: Vec<MyData> = file_source::deserialize_to_vec(stream).await?;
+/// ```
+pub async fn deserialize_to_vec<T>(mut stream: RecordBatchStream) -> Result<Vec<T>>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let mut stream_results = Vec::new();
+
+    while let Some(batch) = stream.next().await.transpose()? {
+        let records: Vec<T> =
+            serde_arrow::from_record_batch(&batch).map_err(|e| Error::SerdeArrow(e.to_string()))?;
+        stream_results.extend(records);
+    }
+
+    Ok(stream_results)
+}
+
+/// Deserialize a RecordBatchStream into a Stream<Item = T>
+///
+/// Returns a stream that lazily deserializes RecordBatch items into individual
+/// typed records as they're consumed. This is more memory-efficient that
+/// `deserialize_to_vec()` for large datasets and allows avoiding intermediary
+/// allocations when additional transformations or map operations are intended on
+/// the deserialized records immediately
+///
+/// # Arguments
+/// * `stream` - RecordBatchStream to deserialize
+///
+/// # Example
+/// ```no_run
+/// use prestige::file_source;
+/// use futures::StreamExt;
+///
+/// let stream = file_source::source(paths, None, None);
+/// let mut item_stream = file_source::deserialize_stream::<MyData>(stream);
+///
+/// while let Some(result) = item_stream.next().await {
+///     let record = result?;
+///     // process record individually
+/// }
+/// ```
+pub fn deserialize_stream<T>(stream: RecordBatchStream) -> BoxStream<'static, Result<T>>
+where
+    T: for<'de> serde::Deserialize<'de> + Send + 'static,
+{
+    stream
+        .flat_map(|batch_result| {
+            match batch_result {
+                Ok(batch) => {
+                    // Deserialize the entire batch
+                    match serde_arrow::from_record_batch::<Vec<T>>(&batch) {
+                        Ok(records) => {
+                            // Convert Vec<T> into a stream of Result<T>
+                            stream::iter(records).map(Ok).boxed()
+                        }
+                        Err(e) => {
+                            // Return stream with a single error
+                            stream::once(async move { Err(Error::SerdeArrow(e.to_string())) })
+                                .boxed()
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Propagate the error as a single-item stream
+                    stream::once(async move { Err(e) }).boxed()
+                }
+            }
+        })
+        .boxed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
