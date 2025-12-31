@@ -1,3 +1,23 @@
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{config, primitives};
+use aws_smithy_types_convert::stream::PaginationStreamExt;
+use chrono::{DateTime, Utc};
+use futures::{
+    StreamExt, TryFutureExt, TryStreamExt, future,
+    stream::{self, BoxStream},
+};
+use parquet::{
+    basic::Repetition,
+    schema::types::{Type, TypePtr},
+};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
+use tokio::sync::Mutex;
+use tracing::debug;
+
 mod error;
 pub mod file_meta;
 pub mod file_poller;
@@ -5,6 +25,7 @@ pub mod file_sink;
 pub mod file_source;
 pub mod file_upload;
 mod settings;
+pub(crate) mod telemetry;
 pub mod traits;
 
 pub use error::{AwsError, ChannelError, Error, FileMetaError, Result};
@@ -24,14 +45,7 @@ pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter, PrestigeSchema};
 
 /// Helper function to rebuild a parquet Type with OPTIONAL repetition and a new field name
 /// This is used by the derive macros to properly handle Option<T> fields
-pub fn rebuild_type_with_optional(
-    base_type: parquet::schema::types::Type,
-    field_name: &str,
-) -> parquet::schema::types::Type {
-    use parquet::basic::Repetition;
-    use parquet::schema::types::{Type, TypePtr};
-    use std::sync::Arc;
-
+pub fn rebuild_type_with_optional(base_type: Type, field_name: &str) -> Type {
     match base_type {
         Type::PrimitiveType {
             basic_info,
@@ -79,14 +93,7 @@ pub fn rebuild_type_with_optional(
 
 /// Helper function to rebuild a parquet Type with REQUIRED repetition and a new field name
 /// This is used for map keys which must be non-nullable
-pub fn rebuild_type_as_required(
-    base_type: parquet::schema::types::Type,
-    field_name: &str,
-) -> parquet::schema::types::Type {
-    use parquet::basic::Repetition;
-    use parquet::schema::types::{Type, TypePtr};
-    use std::sync::Arc;
-
+pub fn rebuild_type_as_required(base_type: Type, field_name: &str) -> Type {
     match base_type {
         Type::PrimitiveType {
             basic_info,
@@ -132,16 +139,8 @@ pub fn rebuild_type_as_required(
     }
 }
 
-// AWS S3 Client Integration
-use aws_config::BehaviorVersion;
-use aws_smithy_types_convert::stream::PaginationStreamExt;
-use chrono::{DateTime, Utc};
-use futures::{StreamExt, TryFutureExt, TryStreamExt, future, stream};
-use std::{collections::HashMap, sync::OnceLock};
-use tokio::sync::Mutex;
-
 pub type Client = aws_sdk_s3::Client;
-pub type Stream<T> = futures::stream::BoxStream<'static, Result<T>>;
+pub type Stream<T> = BoxStream<'static, Result<T>>;
 pub type FileMetaStream = Stream<FileMeta>;
 
 static CLIENT_MAP: OnceLock<Mutex<HashMap<ClientKey, Client>>> = OnceLock::new();
@@ -177,13 +176,13 @@ pub async fn new_client(
     };
 
     if let Some(client) = client_map.get(&key) {
-        tracing::debug!(params = ?key, "Using existing prestige s3 client");
+        debug!(params = ?key, "Using existing prestige s3 client");
         return client.clone();
     }
 
     let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
-    let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
+    let mut s3_config = config::Builder::from(&config);
 
     if let Some(region_str) = region {
         s3_config = s3_config.region(aws_config::Region::new(region_str));
@@ -195,7 +194,7 @@ pub async fn new_client(
     }
 
     if let Some((access_key_id, secret_access_key)) = access_key_id.zip(secret_access_key) {
-        let creds = aws_sdk_s3::config::Credentials::builder()
+        let creds = config::Credentials::builder()
             .provider_name("Static")
             .access_key_id(access_key_id)
             .secret_access_key(secret_access_key);
@@ -203,7 +202,7 @@ pub async fn new_client(
         s3_config = s3_config.credentials_provider(creds.build());
     }
 
-    tracing::debug!(params = ?key, "Creating new prestige s3 client");
+    debug!(params = ?key, "Creating new prestige s3 client");
     let client = Client::from_conf(s3_config.build());
     client_map.insert(key, client.clone());
     client
@@ -265,12 +264,8 @@ where
 }
 
 /// Upload a parquet file to S3
-pub async fn put_file(
-    client: &Client,
-    bucket: impl Into<String>,
-    file: &std::path::Path,
-) -> Result {
-    let byte_stream = aws_sdk_s3::primitives::ByteStream::from_path(&file).await?;
+pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -> Result {
+    let byte_stream = primitives::ByteStream::from_path(&file).await?;
 
     client
         .put_object()

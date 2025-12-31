@@ -254,6 +254,76 @@ prestige = { version = "0.1", features = ["chrono", "decimal", "sqlx-postgres"] 
 - `decimal`: Support for `rust_decimal::Decimal` types
 - `sqlx`: Enable SQLx integration
 - `sqlx-postgres`: PostgreSQL support via SQLx
+- `metrics`: Instrument with performance metrics compatible with the `metrics` crate
+- `opentelemetry`: Instrument with performance metrics compatible with the `opentelemetry` crate
+
+## Metrics Support
+
+Prestige supports optional metrics collection via two backends:
+
+### Using metrics-rs
+```toml
+[dependencies]
+prestige = { version = "0.1", features = ["metrics"] }
+metrics-exporter-prometheus = "0.16" # or your preferred exporter library
+```
+
+### Using OpenTelemetry
+```toml
+[dependencies]
+prestige = { version = "0.1", features = ["opentelemetry"] }
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
+```
+
+Configure the meter provider in your application
+\```rust
+use opentelemetry::global;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::metrics::{MeterProviderBuilder, PeriodicReader};
+
+fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint("http://localhost:4317")
+        .build()?;
+
+    let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_interval(std::time::Duration::from_secs(60))
+        .build();
+
+    let provider = MeterProviderBuilder::default()
+        .with_reader(reader)
+        .build();
+
+    global::set_meter_provider(provider);
+    Ok(())
+}
+\```
+
+### Available Metrics
+
+| Metric Name | Type | Description | Labels |
+|-------------|------|-------------|--------|
+| `prestige.file_poller.latency_ms` | Histogram | File processing latency | process_name, file_type |
+| `prestige.file_poller.latest_timestamp_ms` | Gauge | Latest processed file timestamp | process_name, file_type |
+| `prestige.file_poller.files_processed` | Counter | Files processed count | process_name, file_type, status |
+| `prestige.file_upload.duration_ms` | Histogram | S3 upload duration | bucket |
+| `prestige.file_upload.count` | Counter | Files uploaded count | bucket, status |
+| `prestige.file_upload.size_bytes` | Histogram | Uploaded file sizes | bucket |
+| `prestige.file_sink.records_written` | Counter | Records written to parquet | sink |
+| `prestige.file_sink.files_created` | Counter | Parquet files created | sink |
+| `prestige.file_sink.write_duration_ms` | Histogram | Batch write duration | sink |
+
+### Disabling Metrics
+
+To compile without any metrics overhead, simply don't enable either feature:
+
+\```
+[dependencies]
+prestige = "0.1"  # No features = no-op metrics impl
+\```
 
 ## Performance Considerations
 

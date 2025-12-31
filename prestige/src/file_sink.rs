@@ -1,12 +1,22 @@
-use crate::{Error, FileMeta, Result, error::ChannelError, file_upload::FileUpload};
-use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use crate::{
+    ArrowSchema, Error, FileMeta, FileUpload, Result,
+    error::ChannelError,
+    telemetry::{
+        self, SINK_BATCH_SIZE, SINK_FILES_ROTATED, SINK_RECORDS_WRITTEN, SINK_WRITE_ERRORS,
+        telemetry_labels,
+    },
+};
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use chrono::{DateTime, Utc};
-use metrics::Label;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use futures::future::LocalBoxFuture;
+use parquet::{
+    arrow::ArrowWriter,
+    basic::Compression,
+    file::properties::{EnabledStatistics, WriterProperties},
+};
+use serde::Serialize;
 use std::{
+    fs::File,
     marker::PhantomData,
     path::{Path, PathBuf},
     time::Duration,
@@ -20,6 +30,7 @@ use tokio::{
     },
     time,
 };
+use tracing::{debug, error, info, warn};
 
 // Configuration constants
 pub const DEFAULT_SINK_ROLL_SECS: u64 = 3 * 60; // 3 minutes
@@ -34,8 +45,6 @@ pub const SINK_CHECK_MILLIS: u64 = 60_000; // 1 minute
 pub const SINK_CHECK_MILLIS: u64 = 50; // Fast for tests
 
 // Metrics constants
-const OK_LABEL: Label = Label::from_static_parts("status", "ok");
-const ERROR_LABEL: Label = Label::from_static_parts("status", "error");
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type FileManifest = Vec<String>;
@@ -64,7 +73,7 @@ pub struct ParquetSinkBuilder<T> {
     roll_time: Duration,
     file_upload: FileUpload,
     auto_commit: bool,
-    metric: String,
+    label: String,
     compression: Compression,
     row_group_size: usize,
     batch_size: usize,
@@ -78,12 +87,12 @@ impl<T> ParquetSinkBuilder<T> {
     /// * `prefix` - File prefix for generated parquet files
     /// * `target_path` - Directory for completed files
     /// * `file_upload` - FileUpload handle for S3 uploads
-    /// * `metric` - Metric name for tracking writes
+    /// * `label` - Metric name for tracking writes
     pub fn new(
         prefix: impl ToString,
         target_path: &Path,
         file_upload: FileUpload,
-        metric: impl ToString,
+        label: impl ToString,
     ) -> Self {
         let tmp_path = target_path.join("tmp");
         Self {
@@ -95,7 +104,7 @@ impl<T> ParquetSinkBuilder<T> {
             roll_time: Duration::from_secs(DEFAULT_SINK_ROLL_SECS),
             file_upload,
             auto_commit: false,
-            metric: metric.to_string(),
+            label: label.to_string(),
             compression: Compression::SNAPPY,
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
@@ -175,15 +184,12 @@ impl<T> ParquetSinkBuilder<T> {
     /// Type T must implement ArrowSchema and serde::Serialize
     pub async fn create(self) -> Result<(ParquetSinkClient<T>, ParquetSink<T>)>
     where
-        T: crate::ArrowSchema + serde::Serialize,
+        T: ArrowSchema + Serialize,
     {
         let (tx, rx) = message_channel(50);
 
-        // Seed the metric with an initial value
-        metrics::counter!(self.metric.clone(), vec![OK_LABEL]).increment(1);
-
         Ok((
-            ParquetSinkClient::new(tx, self.metric.clone()),
+            ParquetSinkClient::new(tx, self.label.clone()),
             ParquetSink {
                 target_path: self.target_path,
                 tmp_path: self.tmp_path,
@@ -209,25 +215,20 @@ impl<T> ParquetSinkBuilder<T> {
 #[derive(Debug, Clone)]
 pub struct ParquetSinkClient<T> {
     pub sender: MessageSender<T>,
-    pub metric: String,
+    pub label: String,
 }
 
 impl<T> ParquetSinkClient<T> {
-    pub fn new(sender: MessageSender<T>, metric: impl Into<String>) -> Self {
+    pub fn new(sender: MessageSender<T>, label: impl Into<String>) -> Self {
         Self {
             sender,
-            metric: metric.into(),
+            label: label.into(),
         }
     }
 
     /// Write a single record to the sink with optional labels for metrics
-    pub async fn write(
-        &self,
-        item: impl Into<T>,
-        labels: impl IntoIterator<Item = &(&'static str, &'static str)>,
-    ) -> Result<oneshot::Receiver<Result>> {
+    pub async fn write(&self, item: impl Into<T>) -> Result<oneshot::Receiver<Result>> {
         let (on_write_tx, on_write_rx) = oneshot::channel();
-        let labels = labels.into_iter().map(Label::from);
 
         match self
             .sender
@@ -235,36 +236,37 @@ impl<T> ParquetSinkClient<T> {
             .await
         {
             Ok(_) => {
-                metrics::counter!(
-                    self.metric.clone(),
-                    labels
-                        .chain(std::iter::once(OK_LABEL))
-                        .collect::<Vec<Label>>()
-                )
-                .increment(1);
-                tracing::debug!("parquet_sink write succeeded for {:?}", self.metric);
+                telemetry::increment_counter(
+                    SINK_RECORDS_WRITTEN,
+                    1,
+                    telemetry_labels!("sink_name" => self.label.as_str()),
+                );
+                debug!("parquet_sink write succeeded for {:?}", self.label);
                 Ok(on_write_rx)
             }
             Err(SendTimeoutError::Closed(_)) => {
-                metrics::counter!(
-                    self.metric.clone(),
-                    labels
-                        .chain(std::iter::once(ERROR_LABEL))
-                        .collect::<Vec<Label>>()
-                )
-                .increment(1);
-                tracing::error!(
-                    "parquet_sink write failed for {:?} channel closed",
-                    self.metric
+                telemetry::increment_counter(
+                    SINK_WRITE_ERRORS,
+                    1,
+                    telemetry_labels!("sink_name" => self.label.as_str(), "error_type" => "channel_closed"),
                 );
-                Err(ChannelError::sink_closed(&self.metric))
+                error!(
+                    "parquet_sink write failed for {:?} channel closed",
+                    self.label
+                );
+                Err(ChannelError::sink_closed(&self.label))
             }
             Err(SendTimeoutError::Timeout(_)) => {
-                tracing::error!(
-                    "parquet_sink write failed for {:?} due to send timeout",
-                    self.metric
+                telemetry::increment_counter(
+                    SINK_WRITE_ERRORS,
+                    1,
+                    telemetry_labels!("sink_name" => self.label.as_str(), "error_type" => "timeout"),
                 );
-                Err(ChannelError::sink_timeout(&self.metric))
+                error!(
+                    "parquet_sink write failed for {:?} due to send timeout",
+                    self.label
+                );
+                Err(ChannelError::sink_timeout(&self.label))
             }
         }
     }
@@ -276,7 +278,7 @@ impl<T> ParquetSinkClient<T> {
     ) -> Result<Vec<oneshot::Receiver<Result>>> {
         let mut receivers = Vec::new();
         for item in items {
-            receivers.push(self.write(item, &[]).await?);
+            receivers.push(self.write(item).await?);
         }
         Ok(receivers)
     }
@@ -287,7 +289,7 @@ impl<T> ParquetSinkClient<T> {
         self.sender
             .send_timeout(Message::Commit(on_commit_tx), SEND_TIMEOUT)
             .await
-            .map_err(|_| ChannelError::sink_timeout(&self.metric))?;
+            .map_err(|_| ChannelError::sink_timeout(self.label.as_str()))?;
         Ok(on_commit_rx)
     }
 
@@ -297,7 +299,7 @@ impl<T> ParquetSinkClient<T> {
         self.sender
             .send_timeout(Message::Rollback(on_rollback_tx), SEND_TIMEOUT)
             .await
-            .map_err(|_| ChannelError::sink_timeout(&self.metric))?;
+            .map_err(|_| ChannelError::sink_timeout(self.label.as_str()))?;
         Ok(on_rollback_rx)
     }
 }
@@ -305,7 +307,7 @@ impl<T> ParquetSinkClient<T> {
 /// Active parquet file being written
 struct ActiveParquetSink<T> {
     file_path: PathBuf,
-    writer: ArrowWriter<std::fs::File>,
+    writer: ArrowWriter<File>,
     row_count: usize,
     buffer: Vec<T>,
     created_at: DateTime<Utc>,
@@ -333,12 +335,12 @@ pub struct ParquetSink<T> {
 
 impl<T> ManagedProc for ParquetSink<T>
 where
-    T: Send + serde::Serialize + 'static,
+    T: Send + Serialize + 'static,
 {
     fn run_proc(
         self: Box<Self>,
         shutdown: ShutdownSignal,
-    ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+    ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
             self.run(shutdown)
                 .await
@@ -349,7 +351,7 @@ where
 
 impl<T> ParquetSink<T>
 where
-    T: serde::Serialize,
+    T: Serialize,
 {
     #[cfg(test)]
     pub async fn init(&mut self) -> Result {
@@ -389,22 +391,18 @@ where
                     if file_name_str.starts_with(&self.prefix)
                         && file_name_str.ends_with(".parquet")
                     {
-                        tracing::info!(
+                        info!(
                             "crash recovery: re-uploading completed file {}",
                             file_name_str
                         );
                         if let Err(err) = self.file_upload.upload_file(&entry.path()).await {
-                            tracing::warn!(
-                                "failed to upload recovered file {}: {}",
-                                file_name_str,
-                                err
-                            );
+                            warn!("failed to upload recovered file {}: {}", file_name_str, err);
                         }
                     }
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    tracing::warn!("error reading target directory during recovery: {}", err);
+                    warn!("error reading target directory during recovery: {}", err);
                     continue;
                 }
             }
@@ -426,28 +424,23 @@ where
 
                         if self.auto_commit {
                             // Move incomplete file to target and upload
-                            tracing::info!(
+                            info!(
                                 "crash recovery: recovering incomplete file {}",
                                 file_name_str
                             );
                             if let Err(err) = self.deposit_file(&entry_path).await {
-                                tracing::warn!(
+                                warn!(
                                     "failed to deposit recovered file {}: {}",
-                                    file_name_str,
-                                    err
+                                    file_name_str, err
                                 );
                             }
                         } else {
                             // Delete incomplete file
-                            tracing::info!(
-                                "crash recovery: deleting incomplete file {}",
-                                file_name_str
-                            );
+                            info!("crash recovery: deleting incomplete file {}", file_name_str);
                             if let Err(err) = fs::remove_file(&entry_path).await {
-                                tracing::warn!(
+                                warn!(
                                     "failed to remove incomplete file {}: {}",
-                                    file_name_str,
-                                    err
+                                    file_name_str, err
                                 );
                             }
                         }
@@ -455,7 +448,7 @@ where
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    tracing::warn!("error reading tmp directory during recovery: {}", err);
+                    warn!("error reading tmp directory during recovery: {}", err);
                     continue;
                 }
             }
@@ -483,7 +476,7 @@ where
 
     /// Run the sink server loop
     pub async fn run(mut self, mut shutdown: ShutdownSignal) -> Result {
-        tracing::info!(
+        info!(
             "starting parquet sink {} in {}",
             self.prefix,
             self.target_path.display()
@@ -521,7 +514,7 @@ where
             self.maybe_close_active_sink().await?;
         }
 
-        tracing::info!("stopping parquet sink {}", self.prefix);
+        info!("stopping parquet sink {}", self.prefix);
         Ok(())
     }
 
@@ -542,8 +535,8 @@ where
             }
 
             // Check rotation triggers
-            if self.should_rotate()? {
-                self.rotate().await?;
+            if let Some(reason) = self.should_rotate()? {
+                self.rotate(reason).await?;
             }
         }
 
@@ -567,8 +560,8 @@ where
             }
 
             // Check rotation triggers
-            if self.should_rotate()? {
-                self.rotate().await?;
+            if let Some(reason) = self.should_rotate()? {
+                self.rotate(reason).await?;
             }
         }
 
@@ -576,43 +569,49 @@ where
     }
 
     /// Check if file should rotate based on thresholds
-    fn should_rotate(&self) -> Result<bool> {
+    fn should_rotate(&self) -> Result<Option<&'static str>> {
         if let Some(sink) = &self.active_sink {
             // Row count threshold
             if sink.row_count >= self.max_rows {
-                tracing::debug!("rotating on row count: {}", sink.row_count);
-                return Ok(true);
+                debug!("rotating on row count: {}", sink.row_count);
+                return Ok(Some("row_count"));
             }
 
             // Size threshold (approximate)
             if sink.approximate_size >= self.max_size_bytes {
-                tracing::debug!("rotating on size: {}", sink.approximate_size);
-                return Ok(true);
+                debug!("rotating on size: {}", sink.approximate_size);
+                return Ok(Some("size"));
             }
 
             // Time threshold
             let roll_duration = chrono::Duration::from_std(self.roll_time)
                 .map_err(|e| Error::Io(std::io::Error::other(e)))?;
             if (sink.created_at + roll_duration) <= Utc::now() {
-                tracing::debug!("rotating on time");
-                return Ok(true);
+                debug!("rotating on time");
+                return Ok(Some("time"));
             }
         }
 
-        Ok(false)
+        Ok(None)
     }
 
     /// Periodic rotation check
     async fn maybe_roll(&mut self) -> Result {
-        if self.should_rotate()? {
-            self.rotate().await?;
+        if let Some(reason) = self.should_rotate()? {
+            self.rotate(reason).await?;
         }
         Ok(())
     }
 
     /// Rotate to a new file
-    async fn rotate(&mut self) -> Result {
+    async fn rotate(&mut self, reason: &str) -> Result {
         self.maybe_close_active_sink().await?;
+
+        telemetry::increment_counter(
+            SINK_FILES_ROTATED,
+            1,
+            telemetry_labels!("file_type" => self.prefix.as_str(), "reason" => reason),
+        );
         if self.auto_commit {
             self.commit().await?;
         }
@@ -632,8 +631,16 @@ where
 
             let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
 
+            let buffer_size = sink.buffer.len() as f64;
+
             // Write batch to parquet file
             sink.writer.write(&batch)?;
+
+            telemetry::record_histogram(
+                SINK_BATCH_SIZE,
+                buffer_size,
+                telemetry_labels!("file_type" => self.prefix.as_str()),
+            );
 
             // Update counts
             sink.row_count += sink.buffer.len();
@@ -658,7 +665,7 @@ where
             .set_max_row_group_size(self.row_group_size)
             .set_write_batch_size(1024)
             .set_statistics_enabled(EnabledStatistics::Page)
-            .set_created_by("prestige v0.1.0".to_string())
+            .set_created_by(format!("prestige/{}", env!("CARGO_PKG_VERSION")))
             .build();
 
         // Create Arrow writer
@@ -673,7 +680,7 @@ where
             approximate_size: 0,
         });
 
-        tracing::info!("created new parquet file: {}", file_meta.key);
+        info!("created new parquet file: {}", file_meta.key);
         Ok(())
     }
 
@@ -698,7 +705,7 @@ where
             fs::rename(&sink.file_path, &target_file).await?;
             self.staged_files.push(target_file);
 
-            tracing::info!("closed parquet file with {} rows", sink.row_count);
+            info!("closed parquet file with {} rows", sink.row_count);
         }
 
         Ok(())
@@ -735,7 +742,7 @@ where
         // Delete staged files
         for file_path in self.staged_files.drain(..) {
             if let Err(err) = fs::remove_file(&file_path).await {
-                tracing::warn!("failed to remove file {:?}: {}", file_path, err);
+                warn!("failed to remove file {:?}: {}", file_path, err);
             }
         }
 
@@ -746,6 +753,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FileUploadServer, new_client};
     use arrow::datatypes::{DataType, Field, Schema};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
@@ -760,7 +768,7 @@ mod tests {
         value: f64,
     }
 
-    impl crate::ArrowSchema for TestRecord {
+    impl ArrowSchema for TestRecord {
         fn arrow_schema() -> SchemaRef {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -780,9 +788,9 @@ mod tests {
             .collect()
     }
 
-    async fn create_test_file_upload() -> (crate::FileUpload, crate::FileUploadServer) {
-        let client = crate::new_client(None, None, None, None).await;
-        crate::FileUpload::new(client, "test-bucket".to_string()).await
+    async fn create_test_file_upload() -> (FileUpload, FileUploadServer) {
+        let client = new_client(None, None, None, None).await;
+        FileUpload::new(client, "test-bucket".to_string()).await
     }
 
     #[tokio::test]
@@ -1009,7 +1017,7 @@ mod tests {
         let record = create_test_records(1)[0].clone();
 
         // Should be able to send a record
-        let result = client.write(record, &[]).await;
+        let result = client.write(record).await;
         assert!(result.is_ok());
     }
 
@@ -1032,7 +1040,7 @@ mod tests {
         drop(sink);
 
         let record = create_test_records(1)[0].clone();
-        let result = client.write(record, &[]).await;
+        let result = client.write(record).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Channel(_)));
@@ -1067,7 +1075,7 @@ mod tests {
 
         // Verify we can read the parquet file back
         let file_path = PathBuf::from(&manifest[0]);
-        let file = std::fs::File::open(&file_path).unwrap();
+        let file = File::open(&file_path).unwrap();
         let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
             .unwrap()
             .build()

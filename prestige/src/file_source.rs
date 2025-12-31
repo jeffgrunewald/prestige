@@ -1,19 +1,21 @@
-use crate::{Client, Error, FileMetaStream, Result};
+use crate::{
+    Client, Error, FileMetaStream, Result,
+    telemetry::{
+        self, FILE_SOURCE_BYTES_DOWNLOADED, FILE_SOURCE_FILES_READ, FILE_SOURCE_READ_DURATION_MS,
+        FILE_SOURCE_READ_ERRORS, FILE_SOURCE_ROWS_READ, telemetry_labels,
+    },
+};
 use arrow::array::RecordBatch;
 use futures::{
     StreamExt, TryStreamExt,
     stream::{self, BoxStream},
 };
-use metrics::Label;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
-use std::{io::Cursor, path::Path, sync::Arc};
+use std::{io::Cursor, path::Path, sync::Arc, time::Instant};
 use tokio::fs::File;
 
 /// Default batch size for reading parquet files
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
-
-const OK_LABEL: Label = Label::from_static_parts("status", "ok");
-const ERROR_LABEL: Label = Label::from_static_parts("status", "error");
 
 /// Stream of Arrow RecordBatch from parquet files
 pub type RecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
@@ -26,7 +28,7 @@ pub type RecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 /// # Arguments
 /// * `paths` - Iterator of file paths to read
 /// * `batch_size` - Optional batch size (defaults to DEFAULT_BATCH_SIZE)
-/// * `metric` - Optional metric name for tracking read operations
+/// * `label` - Optional metric name for tracking read operations
 ///
 /// # Example
 /// ```no_run
@@ -35,11 +37,7 @@ pub type RecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 /// let paths = vec!["data/file1.parquet", "data/file2.parquet"];
 /// let stream = file_source::source(paths, None, None);
 /// ```
-pub fn source<I, P>(
-    paths: I,
-    batch_size: Option<usize>,
-    metric: Option<String>,
-) -> RecordBatchStream
+pub fn source<I, P>(paths: I, batch_size: Option<usize>, label: Option<String>) -> RecordBatchStream
 where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
@@ -50,46 +48,51 @@ where
         .map(|p| p.as_ref().to_path_buf())
         .collect();
 
-    let metric_clone = metric.clone();
+    let label_clone = label.clone();
     stream::iter(paths)
         .map(move |path| {
-            let metric = metric_clone.clone();
+            let name_label = label_clone.clone();
             async move {
+                let start = Instant::now();
                 let file = File::open(&path).await?;
                 let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
                 let stream = builder.with_batch_size(batch_size).build()?;
 
-                if let Some(ref m) = metric {
-                    metrics::counter!(m.clone(), vec![OK_LABEL]).increment(1);
-                }
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                let label = telemetry_labels!("source_name" => name_label.as_ref());
+                // Record file opened successfully
+                telemetry::increment_counter(FILE_SOURCE_FILES_READ, 1, label);
+                // Record open duration
+                telemetry::record_histogram(FILE_SOURCE_READ_DURATION_MS, duration_ms, label);
 
                 Ok(stream)
             }
         })
         .buffered(2) // Read up to 2 files concurrently
         .flat_map(move |result| {
-            let metric = metric.clone();
+            let name_label = label.clone();
             match result {
                 Ok(stream) => stream
-                    .inspect(move |result| {
-                        if let Some(ref m) = metric {
-                            match result {
-                                Ok(batch) => {
-                                    metrics::counter!(m.clone(), vec![OK_LABEL])
-                                        .increment(batch.num_rows() as u64);
-                                }
-                                Err(_) => {
-                                    metrics::counter!(m.clone(), vec![ERROR_LABEL]).increment(1);
-                                }
-                            }
+                    .inspect(move |result| match result {
+                        Ok(batch) => {
+                            let label = telemetry_labels!("source_name" => name_label.as_ref());
+                            telemetry::increment_counter(
+                                FILE_SOURCE_ROWS_READ,
+                                batch.num_rows() as u64,
+                                label,
+                            )
+                        }
+                        Err(_) => {
+                            let labels = telemetry_labels!("source_name" => name_label.as_ref(), "error_type" => "read");
+                            telemetry::increment_counter(FILE_SOURCE_READ_ERRORS, 1, labels)
                         }
                     })
                     .map_err(Error::from)
                     .boxed(),
                 Err(err) => {
-                    if let Some(ref m) = metric {
-                        metrics::counter!(m.clone(), vec![ERROR_LABEL]).increment(1);
-                    }
+                    let labels = telemetry_labels!("source_name" => name_label.as_ref(), "error_type" => "open");
+                    telemetry::increment_counter(FILE_SOURCE_READ_ERRORS, 1, labels);
                     stream::once(async { Err(err) }).boxed()
                 }
             }
@@ -107,25 +110,49 @@ where
 /// * `bucket` - S3 bucket name
 /// * `key` - S3 object key
 /// * `batch_size` - Optional batch size (defaults to DEFAULT_BATCH_SIZE)
-/// * `metric` - Optional metric name for tracking read operations
+/// * `label` - Optional metric name for tracking read operations
 pub async fn source_s3_file(
     client: &Client,
     bucket: impl Into<String>,
     key: impl Into<String>,
     batch_size: Option<usize>,
-    metric: Option<String>,
+    label: Option<String>,
 ) -> Result<RecordBatchStream> {
     let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
     let key = key.into();
+    let bucket = bucket.into();
+
+    // Time the S3 download
+    let download_start = Instant::now();
 
     // Download file from S3
-    let bytes = crate::get_file(client, bucket, &key).await?;
+    let bytes = crate::get_file(client, bucket.as_str(), &key).await?;
+
+    let download_duration_ms = download_start.elapsed().as_secs_f64() * 1000.0;
+    let bytes_len = bytes.len();
+
+    // Record download metrics
+    telemetry::record_histogram(
+        FILE_SOURCE_READ_DURATION_MS,
+        download_duration_ms,
+        telemetry_labels!("bucket" => bucket.as_str(), "source_name" => label.as_ref()),
+    );
+    telemetry::record_histogram(
+        FILE_SOURCE_BYTES_DOWNLOADED,
+        bytes_len as f64,
+        telemetry_labels!("bucket" => bucket.as_str(), "source_name" => label.as_ref()),
+    );
 
     // Validate file before parsing
     // Parquet files require minimum 12 bytes (PAR1 header + footer + metadata len)
     // In pratice, valid files are at least ~300 bytes
     const MIN_PARQUET_SIZE: usize = 12;
     if bytes.is_empty() {
+        telemetry::increment_counter(
+            FILE_SOURCE_READ_ERRORS,
+            1,
+            telemetry_labels!("bucket" => bucket.as_str(), "error_type" => "empty_file", "source_name" => label.as_ref()),
+        );
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Empty parquet file: {key}"),
@@ -133,6 +160,11 @@ pub async fn source_s3_file(
     }
 
     if bytes.len() < MIN_PARQUET_SIZE {
+        telemetry::increment_counter(
+            FILE_SOURCE_READ_ERRORS,
+            1,
+            telemetry_labels!("bucket" => bucket.as_str(), "error_type" => "invalid_size", "source_name" => label.as_ref()),
+        );
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -147,22 +179,28 @@ pub async fn source_s3_file(
     let builder = ParquetRecordBatchStreamBuilder::new(cursor).await?;
     let stream = builder.with_batch_size(batch_size).build()?;
 
-    if let Some(ref m) = metric {
-        metrics::counter!(m.clone(), vec![OK_LABEL]).increment(1);
-    }
+    // Record successful file read
+    telemetry::increment_counter(
+        FILE_SOURCE_FILES_READ,
+        1,
+        telemetry_labels!("bucket" => bucket.as_str(), "source_name" => label.as_ref()),
+    );
 
     Ok(stream
-        .inspect(move |result| {
-            if let Some(ref m) = metric {
-                match result {
-                    Ok(batch) => {
-                        metrics::counter!(m.clone(), vec![OK_LABEL])
-                            .increment(batch.num_rows() as u64);
-                    }
-                    Err(_) => {
-                        metrics::counter!(m.clone(), vec![ERROR_LABEL]).increment(1);
-                    }
-                }
+        .inspect(move |result| match result {
+            Ok(batch) => {
+                telemetry::increment_counter(
+                    FILE_SOURCE_ROWS_READ,
+                    batch.num_rows() as u64,
+                    telemetry_labels!("bucket" => bucket.as_str(), "source_name" => label.as_ref()),
+                );
+            }
+            Err(_) => {
+                telemetry::increment_counter(
+                    FILE_SOURCE_READ_ERRORS,
+                    1,
+                    telemetry_labels!("bucket" => bucket.as_str(), "error_type" => "read", "source_name" => label.as_ref()),
+                );
             }
         })
         .map_err(Error::from)
@@ -179,13 +217,13 @@ pub async fn source_s3_file(
 /// * `bucket` - S3 bucket name
 /// * `metas` - Stream of FileMeta (from list_files)
 /// * `batch_size` - Optional batch size (defaults to DEFAULT_BATCH_SIZE)
-/// * `metric` - Optional metric name for tracking read operations
+/// * `label` - Optional metric name for tracking read operations
 pub fn source_s3_files(
     client: &Client,
     bucket: impl Into<String>,
     metas: FileMetaStream,
     batch_size: Option<usize>,
-    metric: Option<String>,
+    label: Option<String>,
 ) -> RecordBatchStream {
     let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
     let bucket = bucket.into();
@@ -195,11 +233,11 @@ pub fn source_s3_files(
         .map(move |meta_result| {
             let client = Arc::clone(&client);
             let bucket = bucket.clone();
-            let metric = metric.clone();
+            let label = label.clone();
 
             async move {
                 let meta = meta_result?;
-                source_s3_file(&client, bucket, meta.key, Some(batch_size), metric).await
+                source_s3_file(&client, bucket, meta.key, Some(batch_size), label).await
             }
         })
         .buffered(1) // Sequential - one file at a time
@@ -221,14 +259,14 @@ pub fn source_s3_files(
 /// * `workers` - Number of concurrent downloads
 /// * `metas` - Stream of FileMeta (from list_files)
 /// * `batch_size` - Optional batch size (defaults to DEFAULT_BATCH_SIZE)
-/// * `metric` - Optional metric name for tracking read operations
+/// * `label` - Optional metric name for tracking read operations
 pub fn source_s3_files_unordered(
     client: &Client,
     bucket: impl Into<String>,
     workers: usize,
     metas: FileMetaStream,
     batch_size: Option<usize>,
-    metric: Option<String>,
+    label: Option<String>,
 ) -> RecordBatchStream {
     let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
     let bucket = bucket.into();
@@ -238,11 +276,11 @@ pub fn source_s3_files_unordered(
         .map(move |meta_result| {
             let client = Arc::clone(&client);
             let bucket = bucket.clone();
-            let metric = metric.clone();
+            let label = label.clone();
 
             async move {
                 let meta = meta_result?;
-                source_s3_file(&client, bucket, meta.key, Some(batch_size), metric).await
+                source_s3_file(&client, bucket, meta.key, Some(batch_size), label).await
             }
         })
         .buffer_unordered(workers) // Parallel - up to N files at once

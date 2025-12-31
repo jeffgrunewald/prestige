@@ -60,7 +60,7 @@ async fn write_sensor_data_to_parquet(
 
     // Write data using the client
     for record in data {
-        let rx = client.write(record, &[]).await?;
+        let rx = client.write(record).await?;
         rx.await
             .map_err(|_| prestige::ChannelError::sink_closed("test_sensor_metric"))??;
     }
@@ -229,7 +229,7 @@ async fn test_roundtrip_sensor_data_with_rotation() {
 
             // Write all data
             for record in original_data.clone() {
-                let rx = client.write(record, &[]).await.unwrap();
+                let rx = client.write(record).await.unwrap();
                 rx.await.unwrap().unwrap();
             }
 

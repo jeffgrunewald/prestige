@@ -1,9 +1,20 @@
-use crate::{Client, Result, error::ChannelError};
-use futures::StreamExt;
-use std::{path::PathBuf, time::Duration};
+use crate::{
+    Client, Result,
+    error::ChannelError,
+    put_file,
+    telemetry::{
+        self, FILE_UPLOAD_COUNT, FILE_UPLOAD_DURATION_MS, FILE_UPLOAD_SIZE_BYTES, telemetry_labels,
+    },
+};
+use futures::{StreamExt, future::LocalBoxFuture};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 use super_visor::{ManagedProc, ShutdownSignal};
-use tokio::{fs, sync::mpsc, time};
+use tokio::{fs, sync::mpsc, time::sleep};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::{debug, error, info, warn};
 
 pub type MessageSender = mpsc::UnboundedSender<PathBuf>;
 pub type MessageReceiver = mpsc::UnboundedReceiver<PathBuf>;
@@ -42,7 +53,7 @@ impl FileUpload {
     /// Queue a file for upload to S3
     ///
     /// The file will be uploaded asynchronously and deleted locally on success.
-    pub async fn upload_file(&self, file: &std::path::Path) -> Result {
+    pub async fn upload_file(&self, file: &Path) -> Result {
         self.sender
             .send(file.to_path_buf())
             .map_err(|_| ChannelError::upload_closed(file))
@@ -53,7 +64,7 @@ impl ManagedProc for FileUploadServer {
     fn run_proc(
         self: Box<Self>,
         shutdown: ShutdownSignal,
-    ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+    ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
             self.run(shutdown)
                 .await
@@ -68,7 +79,7 @@ impl FileUploadServer {
     /// Processes upload requests concurrently with retry logic.
     /// Automatically deletes files after successful upload.
     pub async fn run(self, shutdown: ShutdownSignal) -> Result {
-        tracing::info!("starting file uploader {}", self.bucket);
+        info!("starting file uploader {}", self.bucket);
 
         let client = &self.client;
         let bucket = &self.bucket;
@@ -76,40 +87,90 @@ impl FileUploadServer {
         let uploads = self.messages.for_each_concurrent(5, |path| async move {
             let path_str = path.display();
             if !path.exists() {
-                tracing::warn!("ignoring absent file {path_str}");
+                warn!("ignoring absent file {path_str}");
                 return;
             }
             if !path.is_file() {
-                tracing::warn!("ignoring non file {path_str}");
+                warn!("ignoring non file {path_str}");
                 return;
             }
+
+            // Get file size before upload to emit metrics
+            let file_size = match fs::metadata(&path).await {
+                Ok(meta) => Some(meta.len()),
+                Err(err) => {
+                    warn!("failed to get file size for {path_str}: {err:?}");
+                    None
+                }
+            };
 
             let mut retry = 0;
             const MAX_RETRIES: u8 = 5;
             const RETRY_WAIT: Duration = Duration::from_secs(10);
 
             while retry <= MAX_RETRIES {
-                tracing::debug!("storing {path_str} in {bucket} retry {retry}");
-                match crate::put_file(client, bucket, &path).await {
+                debug!("storing {path_str} in {bucket} retry {retry}");
+
+                // Start timing the upload attempt
+                let upload_start = Instant::now();
+
+                match put_file(client, bucket, &path).await {
                     Ok(()) => {
+                        let duration_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
+
+                        // Record successful upload duration
+                        telemetry::record_histogram(
+                            FILE_UPLOAD_DURATION_MS,
+                            duration_ms,
+                            telemetry_labels!("bucket" => bucket.as_str()),
+                        );
+                        // Record upload count increment
+                        telemetry::increment_counter(
+                            FILE_UPLOAD_COUNT,
+                            1,
+                            telemetry_labels!(
+                                "bucket" => bucket.as_str(),
+                                "status" => "success",
+                            ),
+                        );
+                        // Record file size on successful upload
+                        if let Some(size) = file_size {
+                            telemetry::record_histogram(
+                                FILE_UPLOAD_SIZE_BYTES,
+                                size as f64,
+                                telemetry_labels!("bucket" => bucket.as_str()),
+                            );
+                        }
+
                         match fs::remove_file(&path).await {
-                            Ok(()) => {
-                                tracing::info!("stored {path_str} in {bucket}");
-                            }
+                            Ok(()) => info!("stored {path_str} in {bucket}"),
                             Err(err) => {
-                                tracing::error!(
-                                    "failed to remove uploaded file {path_str}: {err:?}"
-                                );
+                                error!("failed to remove uploaded file {path_str}: {err:?}")
                             }
                         }
                         return;
                     }
                     Err(err) => {
-                        tracing::error!(
-                            "failed to store {path_str} in {bucket} retry: {retry}: {err:?}"
+                        let duration_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
+
+                        // Record failed upload duration (useful for identifying timeout patterns)
+                        telemetry::record_histogram(
+                            FILE_UPLOAD_DURATION_MS,
+                            duration_ms,
+                            telemetry_labels!("bucket" => bucket.as_str()),
                         );
+
+                        if retry == MAX_RETRIES {
+                            telemetry::increment_counter(
+                                FILE_UPLOAD_COUNT,
+                                1,
+                                telemetry_labels!("bucket" => bucket.as_str(), "status" => "error"),
+                            );
+                        }
+
+                        error!("failed to store {path_str} in {bucket} retry: {retry}: {err:?}");
                         retry += 1;
-                        time::sleep(RETRY_WAIT).await;
+                        sleep(RETRY_WAIT).await;
                     }
                 }
             }
@@ -120,7 +181,7 @@ impl FileUploadServer {
             _ = shutdown => (),
         }
 
-        tracing::info!("stopping file uploader {}", self.bucket);
+        info!("stopping file uploader {}", self.bucket);
         Ok(())
     }
 }

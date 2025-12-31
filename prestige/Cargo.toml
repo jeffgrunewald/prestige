@@ -19,7 +19,8 @@ config.workspace = true
 derive_builder.workspace = true
 futures.workspace = true
 futures-util.workspace = true
-metrics.workspace = true
+metrics = { version = "0.24", optional = true }
+opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet = { version = "55", features = ["async"] }
 prestige-macros = { path = "../macros" }
 regex.workspace = true
@@ -45,5 +46,7 @@ tokio-util = "0"
 default = ["chrono"]
 chrono = ["dep:chrono"]
 decimal = ["dep:rust_decimal"]
+metrics = ["dep:metrics"]
+opentelemetry = ["dep:opentelemetry"]
 sqlx-postgres = ["sqlx/postgres"]
 sqlx = ["dep:sqlx"]

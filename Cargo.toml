@@ -27,7 +27,6 @@ config = { version = "0", default-features = false, features = ["toml"] }
 derive_builder = "0.20"
 futures = "0"
 futures-util = "0"
-metrics = "0"
 regex = "1"
 retainer = "0.3"
 rust_decimal = { version = "1", features = ["serde"] }

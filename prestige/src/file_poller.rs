@@ -1,10 +1,21 @@
-use crate::{Client, FileMeta, RecordBatchStream, Result};
+use crate::{
+    Client, FileMeta, RecordBatchStream, Result, file_source, list_all_files,
+    telemetry::{
+        self, FILE_POLLER_FILES_PROCESSED, FILE_POLLER_LATENCY_MS, FILE_POLLER_LATEST_TIMESTAMP_MS,
+        telemetry_labels,
+    },
+};
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
+use futures::future::LocalBoxFuture;
 use retainer::Cache;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
-use super_visor::ManagedProc;
-use tokio::sync::mpsc::{Receiver, Sender};
+use super_visor::{ManagedProc, ShutdownSignal};
+use tokio::{
+    sync::mpsc::{self, Receiver, Sender},
+    time::{interval, sleep},
+};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_POLL_DURATION_SECS: i64 = 30;
 const DEFAULT_POLL_DURATION: Duration = Duration::from_secs(DEFAULT_POLL_DURATION_SECS as u64);
@@ -71,20 +82,26 @@ impl FileStream {
         self,
         recorder: &mut impl FilePollerStateRecorder,
     ) -> Result<RecordBatchStream> {
-        let latency = Utc::now() - self.file_meta.timestamp;
-        metrics::gauge!(
-            "file-processing-latency",
-            "file-type" => self.file_meta.prefix.clone(),
-            "process-name" => self.process_name.clone(),
-        )
-        .set(latency.num_seconds() as f64);
+        let latency = (Utc::now() - self.file_meta.timestamp).num_milliseconds() as f64;
+        let latest_timestamp = self.file_meta.timestamp.timestamp_millis() as f64;
 
-        metrics::gauge!(
-            "file-processing-timestamp",
-            "file-type" => self.file_meta.prefix.clone(),
-            "process-name" => self.process_name.clone(),
-        )
-        .set(self.file_meta.timestamp.timestamp_millis() as f64);
+        telemetry::record_histogram(
+            FILE_POLLER_LATENCY_MS,
+            latency,
+            telemetry_labels!(
+                "process_name" => self.process_name.as_str(),
+                "file_type" => self.file_meta.prefix.as_str(),
+            ),
+        );
+
+        telemetry::set_gauge(
+            FILE_POLLER_LATEST_TIMESTAMP_MS,
+            latest_timestamp,
+            telemetry_labels!(
+                "process_name" => self.process_name.as_str(),
+                "file_type" => self.file_meta.prefix.as_str(),
+            ),
+        );
 
         recorder.record(&self.process_name, &self.file_meta).await?;
         Ok(self.batches)
@@ -169,7 +186,7 @@ where
         let config = self
             .build()
             .map_err(|e| crate::Error::Config(config::ConfigError::Message(e.to_string())))?;
-        let (sender, receiver) = tokio::sync::mpsc::channel(config.queue_size);
+        let (sender, receiver) = mpsc::channel(config.queue_size);
         let latest_file_timestamp = config
             .state
             .latest_timestamp(&config.process_name, &config.prefix)
@@ -271,7 +288,7 @@ where
 
             let after = self.after(self.latest_file_timestamp);
             let before = Utc::now();
-            let files = crate::list_all_files(
+            let files = list_all_files(
                 &self.config.client,
                 &self.config.bucket,
                 &self.config.prefix,
@@ -288,17 +305,17 @@ where
             }
 
             if self.file_queue.is_empty() {
-                tokio::time::sleep(self.poll_duration()).await;
+                sleep(self.poll_duration()).await;
             }
         }
     }
 
-    pub async fn run(mut self, mut shutdown: super_visor::ShutdownSignal) -> Result {
-        let mut cleanup_trigger = tokio::time::interval(CLEAN_DURATION);
+    pub async fn run(mut self, mut shutdown: ShutdownSignal) -> Result {
+        let mut cleanup_trigger = interval(CLEAN_DURATION);
         let process_name = self.config.process_name.clone();
         let prefix = self.config.prefix.clone();
 
-        tracing::info!(
+        info!(
             r#type = self.config.prefix,
             %process_name,
             "starting FilePoller",
@@ -309,7 +326,7 @@ where
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    tracing::info!(
+                    info!(
                         r#type = prefix,
                         %process_name,
                         "stopping FilePoller",
@@ -318,9 +335,9 @@ where
                 }
                 _ = cleanup_trigger.tick() => {
                     let offset = Utc::now() - chrono::Duration::from_std(CLEAN_DURATION).unwrap();
-                    match self.config.state.clean(&process_name, &prefix, offset).await {
+                    match self.config.state.clean(process_name.as_str(), &prefix, offset).await {
                         Ok(count) => {
-                            tracing::debug!(
+                            debug!(
                                 r#type = prefix,
                                 %process_name,
                                 %count,
@@ -328,7 +345,7 @@ where
                             );
                         }
                         Err(err) => {
-                            tracing::error!(
+                            error!(
                                 r#type = prefix,
                                 %process_name,
                                 ?err,
@@ -344,7 +361,7 @@ where
                     self.cache.insert(file_meta.key.clone(), true, CACHE_TTL).await;
 
                     // Download and create stream
-                    match crate::file_source::source_s3_file(
+                    let process_result_status = match file_source::source_s3_file(
                         &self.config.client,
                         &self.config.bucket,
                         &file_meta.key,
@@ -360,17 +377,17 @@ where
                             );
 
                             if sender.send(file_stream).await.is_err() {
-                                tracing::warn!(
+                                warn!(
                                     r#type = prefix,
                                     %process_name,
                                     "file stream receiver dropped",
                                 );
                                 break Ok(());
                             }
+                            "success"
                         }
                         Err(err) => {
-                            metrics::counter!("invalid-parquet-file").increment(1);
-                            tracing::error!(
+                            error!(
                                 r#type = prefix,
                                 %process_name,
                                 file_key = %file_meta.key,
@@ -378,10 +395,19 @@ where
                                 ?err,
                                 "failed to process file",
                             );
+                            "error"
                             // Continue processing subsequent files instead of crashing
-                            continue;
                         }
-                    }
+                    };
+                    telemetry::increment_counter(
+                        FILE_POLLER_FILES_PROCESSED,
+                        1,
+                        telemetry_labels!(
+                            "process_name" => process_name.as_str(),
+                            "file_type" => prefix.as_str(),
+                            "status" => process_result_status,
+                        ),
+                    );
                 }
             }
         }
@@ -394,8 +420,8 @@ where
 {
     fn run_proc(
         self: Box<Self>,
-        shutdown: super_visor::ShutdownSignal,
-    ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+        shutdown: ShutdownSignal,
+    ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
             self.run(shutdown)
                 .await
