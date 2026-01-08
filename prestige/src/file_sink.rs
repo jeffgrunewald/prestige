@@ -18,6 +18,7 @@ use std::{
     fs::File,
     marker::PhantomData,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::Duration,
 };
 use super_visor::{ManagedProc, ShutdownSignal};
@@ -325,16 +326,16 @@ pub struct ParquetSink<T> {
     file_upload: FileUpload,
     staged_files: Vec<PathBuf>,
     auto_commit: bool,
-    active_sink: Option<ActiveParquetSink<T>>,
+    active_sink: Option<Mutex<ActiveParquetSink<T>>>,
     compression: Compression,
     row_group_size: usize,
     batch_size: usize,
     schema: SchemaRef,
 }
 
-impl<T: Send + Sync + 'static> ManagedProc for ParquetSink<T> {
+impl<T: Send + Sync + Serialize + 'static> ManagedProc for ParquetSink<T> {
     fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> super_visor::ManagedFuture {
-        super_visor::spawn(self.run(shutdown))
+        super_visor::run(self.run(shutdown))
     }
 }
 
@@ -515,11 +516,15 @@ where
         }
 
         // Add to buffer
-        if let Some(sink) = &mut self.active_sink {
-            sink.buffer.push(item);
+        if let Some(sink_mutex) = &self.active_sink {
+            let should_flush = {
+                let mut sink = sink_mutex.lock().unwrap();
+                sink.buffer.push(item);
+                sink.buffer.len() >= self.batch_size
+            };
 
             // Write batch if buffer is full
-            if sink.buffer.len() >= self.batch_size {
+            if should_flush {
                 self.flush_buffer().await?;
             }
 
@@ -540,11 +545,15 @@ where
         }
 
         // Add to buffer
-        if let Some(sink) = &mut self.active_sink {
-            sink.buffer.push(item);
+        if let Some(sink_mutex) = &self.active_sink {
+            let should_flush = {
+                let mut sink = sink_mutex.lock().unwrap();
+                sink.buffer.push(item);
+                sink.buffer.len() >= self.batch_size
+            };
 
             // Write batch if buffer is full
-            if sink.buffer.len() >= self.batch_size {
+            if should_flush {
                 self.flush_buffer().await?;
             }
 
@@ -559,7 +568,8 @@ where
 
     /// Check if file should rotate based on thresholds
     fn should_rotate(&self) -> Result<Option<&'static str>> {
-        if let Some(sink) = &self.active_sink {
+        if let Some(sink_mutex) = &self.active_sink {
+            let sink = sink_mutex.lock().unwrap();
             // Row count threshold
             if sink.row_count >= self.max_rows {
                 debug!("rotating on row count: {}", sink.row_count);
@@ -609,7 +619,8 @@ where
 
     /// Flush buffered records to parquet file
     async fn flush_buffer(&mut self) -> Result {
-        if let Some(sink) = &mut self.active_sink {
+        if let Some(sink_mutex) = &mut self.active_sink {
+            let mut sink = sink_mutex.lock().unwrap();
             if sink.buffer.is_empty() {
                 return Ok(());
             }
@@ -660,14 +671,14 @@ where
         // Create Arrow writer
         let writer = ArrowWriter::try_new(std_file, self.schema.clone(), Some(props))?;
 
-        self.active_sink = Some(ActiveParquetSink {
+        self.active_sink = Some(Mutex::new(ActiveParquetSink {
             file_path,
             writer,
             row_count: 0,
             buffer: Vec::with_capacity(self.batch_size),
             created_at: Utc::now(),
             approximate_size: 0,
-        });
+        }));
 
         info!("created new parquet file: {}", file_meta.key);
         Ok(())
@@ -680,7 +691,8 @@ where
             self.flush_buffer().await?;
         }
 
-        if let Some(sink) = self.active_sink.take() {
+        if let Some(sink_mutex) = self.active_sink.take() {
+            let sink = sink_mutex.into_inner().unwrap();
             // Close the writer
             sink.writer.close()?;
 
