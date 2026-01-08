@@ -6,7 +6,7 @@ use crate::{
         self, FILE_UPLOAD_COUNT, FILE_UPLOAD_DURATION_MS, FILE_UPLOAD_SIZE_BYTES, telemetry_labels,
     },
 };
-use futures::{StreamExt, future::LocalBoxFuture};
+use futures::StreamExt;
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -61,15 +61,8 @@ impl FileUpload {
 }
 
 impl ManagedProc for FileUploadServer {
-    fn run_proc(
-        self: Box<Self>,
-        shutdown: ShutdownSignal,
-    ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(async move {
-            self.run(shutdown)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))
-        })
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> super_visor::ManagedFuture {
+        super_visor::spawn(self.run(shutdown))
     }
 }
 

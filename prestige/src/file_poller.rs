@@ -7,7 +7,6 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
-use futures::future::LocalBoxFuture;
 use retainer::Cache;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use super_visor::{ManagedProc, ShutdownSignal};
@@ -418,15 +417,8 @@ impl<State> ManagedProc for FilePollerServer<State>
 where
     State: FilePollerState,
 {
-    fn run_proc(
-        self: Box<Self>,
-        shutdown: ShutdownSignal,
-    ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(async move {
-            self.run(shutdown)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))
-        })
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> super_visor::ManagedFuture {
+        super_visor::spawn(self.run(shutdown))
     }
 }
 
