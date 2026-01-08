@@ -8,7 +8,6 @@ use crate::{
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use chrono::{DateTime, Utc};
-use futures::future::LocalBoxFuture;
 use parquet::{
     arrow::ArrowWriter,
     basic::Compression,
@@ -333,19 +332,9 @@ pub struct ParquetSink<T> {
     schema: SchemaRef,
 }
 
-impl<T> ManagedProc for ParquetSink<T>
-where
-    T: Send + Serialize + 'static,
-{
-    fn run_proc(
-        self: Box<Self>,
-        shutdown: ShutdownSignal,
-    ) -> LocalBoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(async move {
-            self.run(shutdown)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))
-        })
+impl<T: Send + Sync + 'static> ManagedProc for ParquetSink<T> {
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> super_visor::ManagedFuture {
+        super_visor::spawn(self.run(shutdown))
     }
 }
 
