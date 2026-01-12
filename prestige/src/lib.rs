@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 mod error;
+pub mod file_compactor;
 pub mod file_meta;
 pub mod file_poller;
 pub mod file_sink;
@@ -28,7 +29,8 @@ mod settings;
 pub(crate) mod telemetry;
 pub mod traits;
 
-pub use error::{AwsError, ChannelError, Error, FileMetaError, Result};
+pub use error::{AwsError, ChannelError, CompactionError, Error, FileMetaError, Result};
+pub use file_compactor::{CompactionResult, FileCompactorConfig, FileCompactorConfigBuilder};
 pub use file_meta::FileMeta;
 pub use file_poller::{
     FilePollerConfig, FilePollerConfigBuilder, FilePollerServer, FilePollerState,

@@ -620,7 +620,7 @@ where
     /// Flush buffered records to parquet file
     async fn flush_buffer(&mut self) -> Result {
         if let Some(sink_mutex) = &mut self.active_sink {
-            let mut sink = sink_mutex.lock().unwrap();
+            let sink = sink_mutex.get_mut().unwrap();
             if sink.buffer.is_empty() {
                 return Ok(());
             }
