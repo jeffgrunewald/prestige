@@ -22,7 +22,7 @@ futures-util.workspace = true
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet = { version = "55", features = ["async"] }
-prestige-macros = { version = "0.1.1", path = "../macros" }
+prestige-macros = { version = "0.2.0", path = "../macros" }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
