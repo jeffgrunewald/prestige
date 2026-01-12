@@ -160,7 +160,6 @@ impl<const N: usize> ArrowSerialize for [u8; N] {
     }
 }
 
-#[cfg(feature = "chrono")]
 mod chrono_impls {
     use super::*;
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};

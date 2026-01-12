@@ -32,6 +32,9 @@ pub enum Error {
     #[cfg(feature = "sqlx")]
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),
+
+    #[error("compaction error: {0}")]
+    Compaction(#[from] CompactionError),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -110,6 +113,15 @@ impl ChannelError {
             path: path.to_owned(),
         })
     }
+}
+
+#[derive(Error, Debug)]
+pub enum CompactionError {
+    #[error("upload failed for {file_key}")]
+    UploadFailed { file_key: String },
+
+    #[error("no source files provided for compaction")]
+    NoSourceFiles,
 }
 
 impl From<aws_sdk_s3::Error> for Error {

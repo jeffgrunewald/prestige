@@ -14,7 +14,7 @@ aws-sdk-s3.workspace = true
 aws-smithy-types-convert.workspace = true
 blake3.workspace = true
 bytes.workspace = true
-chrono = { workspace = true, optional = true }
+chrono.workspace = true
 config.workspace = true
 derive_builder.workspace = true
 futures.workspace = true
@@ -32,6 +32,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, optional = true }
 super-visor.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -43,8 +44,7 @@ tempfile.workspace = true
 tokio-util = "0"
 
 [features]
-default = ["chrono"]
-chrono = ["dep:chrono"]
+default = []
 decimal = ["dep:rust_decimal"]
 metrics = ["dep:metrics"]
 opentelemetry = ["dep:opentelemetry"]
