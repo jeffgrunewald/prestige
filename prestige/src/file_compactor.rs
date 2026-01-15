@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::{
     Client,
-    error::{CompactionError, Result},
+    error::{CompactionError, Error, Result},
     file_meta::FileMeta,
     file_sink::DEFAULT_MAX_SIZE_BYTES,
     file_source::{deserialize_to_vec, source_s3_file},
@@ -472,14 +472,36 @@ where
         info!("Processing file: {}", file_meta.key);
 
         // Download and deserialize this file
-        let stream =
-            source_s3_file(&config.client, &config.bucket, &file_meta.key, None, None).await?;
+        let stream = match source_s3_file(
+            &config.client,
+            &config.bucket,
+            &file_meta.key,
+            None,
+            None,
+        )
+        .await
+        {
+            Err(Error::Io(err)) => {
+                info!(
+                    %err,
+                    "Skipping empty or insufficiently sized file: {}",
+                    file_meta.key
+                );
+                files_processed += 1;
+                source_files.push(file_meta.clone());
+                continue;
+            }
+            other_result => other_result?,
+        };
 
         let records: Vec<T> = deserialize_to_vec(stream).await?;
 
+        // A truly empty file will fail `source_s3_file/5` above with an empty file IO error
+        // but handle here in case a structurally valid parquet file with 0 records is such a thing
         if records.is_empty() {
             info!("Skipping empty file: {}", file_meta.key);
             files_processed += 1;
+            source_files.push(file_meta.clone()); // ensure the empty file is still cleaned up
             continue;
         }
 
