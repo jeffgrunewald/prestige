@@ -14,9 +14,10 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 mod error;
 pub mod file_compactor;
@@ -282,19 +283,54 @@ pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -
 }
 
 /// Remove a file from S3
+///
+/// Retries up to 3 times with backoff (0.5s, 1s) on failure.
 pub async fn remove_file(
     client: &Client,
     bucket: impl Into<String>,
     key: impl Into<String>,
 ) -> Result {
-    client
-        .delete_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .map_ok(|_| ())
-        .map_err(AwsError::s3_error)
-        .await
+    let bucket = bucket.into();
+    let key = key.into();
+    let delays = [
+        Some(Duration::from_millis(500)),
+        Some(Duration::from_millis(1000)),
+        None,
+    ];
+
+    let mut last_error = None;
+
+    for (attempt, delay) in delays.iter().enumerate() {
+        match client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if let Some(d) = delay {
+                    warn!(
+                        %bucket,
+                        %key,
+                        attempt = attempt + 1,
+                        "Failed to delete S3 object, retrying"
+                    );
+                    tokio::time::sleep(*d).await;
+                }
+            }
+        }
+    }
+
+    let err = last_error.expect("last_error must be set after 3 failed attempts");
+    error!(
+        %bucket,
+        %key,
+        "Failed to delete S3 object after 3 attempts"
+    );
+    Err(AwsError::s3_error(err))
 }
 
 /// Download a file from S3 as bytes
