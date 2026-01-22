@@ -29,11 +29,11 @@ use crate::{
 /// # File Naming Convention
 ///
 /// Original files: `{prefix}.{timestamp_millis}.parquet`
-/// Compacted files: `{prefix}.c.{timestamp_millis}.parquet`
+/// Compacted files: `{prefix}.{timestamp_millis}.c.parquet`
 ///
 /// Examples:
 /// - `sensor_data.1234567890123.parquet` (original)
-/// - `sensor_data.c.1234567890123.parquet` (compacted)
+/// - `sensor_data.1234567890123.c.parquet` (compacted)
 ///
 /// # Algorithm
 ///
@@ -135,12 +135,12 @@ use crate::{
 ///
 ///     /// Run a single compaction cycle
 ///     async fn run_compaction(&self) -> Result<(), Box<dyn std::error::Error>> {
-///         let before_timestamp = self.get_compaction_timestamp().await?;
+///         let until_timestamp = self.get_compaction_timestamp().await?;
 ///
 ///         info!(
 ///             prefix = %self.settings.prefix,
 ///             bucket = %self.settings.bucket,
-///             before = %before_timestamp,
+///             until = %until_timestamp,
 ///             "Starting compaction cycle"
 ///         );
 ///
@@ -149,7 +149,7 @@ use crate::{
 ///             .client(self.settings.s3_client.clone())
 ///             .bucket(self.settings.bucket.clone())
 ///             .prefix(self.settings.prefix.clone())
-///             .before_timestamp(before_timestamp)
+///             .until_timestamp(until_timestamp)
 ///             .max_bytes_per_file(100 * 1024 * 1024) // 100MB, or use default
 ///             .compression(parquet::basic::Compression::SNAPPY)
 ///             .delete_originals(true)
@@ -266,8 +266,15 @@ pub struct FileCompactorConfig<T> {
     /// File prefix to compact (e.g., "sensor_data")
     prefix: String,
 
-    /// Compact files before this timestamp (exclusive)
-    before_timestamp: DateTime<Utc>,
+    /// Optional timestamp to start compaction after (for checkpoint-based processing)
+    /// When None, compacts all files from the beginning
+    /// When Some, only compacts files with timestamp > after_timestamp (exclusive)
+    #[builder(default = "None")]
+    after_timestamp: Option<DateTime<Utc>>,
+
+    /// Compact files until this timestamp (inclusive)
+    /// Files with timestamp <= until_timestamp will be compacted
+    until_timestamp: DateTime<Utc>,
 
     /// Maximum bytes per output file (soft limit, default 100MB)
     #[builder(default = "DEFAULT_MAX_SIZE_BYTES")]
@@ -580,30 +587,27 @@ where
         "Starting compaction for prefix '{}' in bucket '{}'",
         config.prefix, config.bucket
     );
-    info!("Time range: before {}", config.before_timestamp);
+    info!(
+        "Time range: after {:?}, until {}",
+        config.after_timestamp, config.until_timestamp
+    );
 
-    // 1. Stream files and stop at first compacted file (optimization)
-    // Since lexicographic ordering guarantees all original files (starting with digits)
-    // come before all compacted files (starting with 'c'), we can stop listing early.
+    // 1. Stream files and filter out compacted ones
+    // With new naming convention ({prefix}.{timestamp}.c.parquet), compacted and
+    // uncompacted files are interleaved, so we filter client-side.
     let mut uncompacted_files = Vec::new();
     let mut file_stream = list_files(
         &config.client,
         &config.bucket,
         &config.prefix,
-        None, // No after filter
-        Some(config.before_timestamp),
+        config.after_timestamp,       // Use checkpoint if provided
+        Some(config.until_timestamp), // Upper bound for compaction
     );
 
     while let Some(file) = file_stream.try_next().await? {
-        if file.compacted {
-            // Hit first compacted file - all remaining files are compacted
-            info!(
-                "Reached first compacted file at {}, stopping listing (optimization)",
-                file.key
-            );
-            break;
+        if !file.compacted {
+            uncompacted_files.push(file);
         }
-        uncompacted_files.push(file);
     }
 
     if uncompacted_files.is_empty() {

@@ -9,11 +9,11 @@ use crate::error::FileMetaError;
 ///
 /// File naming convention:
 /// - Original files: {prefix}.{timestamp_millis}.parquet
-/// - Compacted files: {prefix}.c.{timestamp_millis}.parquet
+/// - Compacted files: {prefix}.{timestamp_millis}.c.parquet
 ///
 /// Examples:
 /// - sensor_data.1234567890123.parquet (original)
-/// - sensor_data.c.1234567890123.parquet (compacted)
+/// - sensor_data.1234567890123.c.parquet (compacted)
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FileMeta {
     /// Full S3 key (filename)
@@ -30,7 +30,7 @@ pub struct FileMeta {
 }
 
 static RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([a-z,\d,_]+)(\.c)?\.(\d+)(\.parquet)?").unwrap());
+    LazyLock::new(|| Regex::new(r"([a-z,\d,_]+)\.(\d+)(\.c)?(\.parquet)?").unwrap());
 
 impl FromStr for FileMeta {
     type Err = FileMetaError;
@@ -42,11 +42,11 @@ impl FromStr for FileMeta {
             .ok_or_else(|| FileMetaError::Regex(key.clone()))?;
         let prefix = cap[1].to_owned();
 
-        // Check for .c marker (group 2 is optional)
-        let compacted = cap.get(2).is_some();
+        // Timestamp is in group 2
+        let timestamp_millis = i64::from_str(&cap[2])?;
 
-        // Timestamp is now in group 3 (after the optional .c)
-        let timestamp_millis = i64::from_str(&cap[3])?;
+        // Check for .c marker (group 3 is optional)
+        let compacted = cap.get(3).is_some();
         let timestamp = DateTime::from_timestamp_millis(timestamp_millis)
             .ok_or(FileMetaError::InvalidTimestamp(timestamp_millis))?;
 
@@ -117,7 +117,7 @@ impl FileMeta {
 
     /// Create a compacted file metadata with .c marker
     ///
-    /// Transforms: `{prefix}.{timestamp}.parquet` → `{prefix}.c.{timestamp}.parquet`
+    /// Transforms: `{prefix}.{timestamp}.parquet` → `{prefix}.{timestamp}.c.parquet`
     ///
     /// # Example
     /// ```
@@ -132,10 +132,8 @@ impl FileMeta {
     /// ```
     pub fn as_compacted(prefix: String, timestamp: DateTime<Utc>) -> Self {
         let base = Self::from((prefix.clone(), timestamp));
-        // Transform key: "prefix.123456789.parquet" -> "prefix.c.123456789.parquet"
-        let key = base
-            .key
-            .replace(&format!("{prefix}."), &format!("{prefix}.c."));
+        // Transform key: "prefix.123456789.parquet" -> "prefix.123456789.c.parquet"
+        let key = base.key.replace(".parquet", ".c.parquet");
         Self {
             key,
             prefix,
@@ -207,10 +205,10 @@ mod tests {
     #[test]
     fn test_file_meta_compacted_marker_parsing() {
         // Test parsing file with .c marker
-        let compacted = FileMeta::from_str("sensor_data.c.1234567890123.parquet").unwrap();
+        let compacted = FileMeta::from_str("sensor_data.1234567890123.c.parquet").unwrap();
         assert_eq!(compacted.prefix, "sensor_data");
         assert_eq!(compacted.timestamp.timestamp_millis(), 1234567890123);
-        assert_eq!(compacted.key, "sensor_data.c.1234567890123.parquet");
+        assert_eq!(compacted.key, "sensor_data.1234567890123.c.parquet");
         assert!(compacted.compacted);
 
         // Test parsing file without .c marker
@@ -224,7 +222,7 @@ mod tests {
     #[test]
     fn test_file_meta_compacted_marker_without_extension() {
         // Test parsing compacted file without .parquet extension
-        let compacted = FileMeta::from_str("data.c.999").unwrap();
+        let compacted = FileMeta::from_str("data.999.c").unwrap();
         assert_eq!(compacted.prefix, "data");
         assert!(compacted.compacted);
 
@@ -243,8 +241,8 @@ mod tests {
         assert_eq!(compacted.timestamp, timestamp);
         assert!(compacted.compacted);
         assert!(compacted.key.contains(".c."));
-        assert!(compacted.key.starts_with("test_prefix.c."));
-        assert!(compacted.key.ends_with(".parquet"));
+        assert!(compacted.key.starts_with("test_prefix."));
+        assert!(compacted.key.ends_with(".c.parquet"));
     }
 
     #[test]
@@ -255,9 +253,9 @@ mod tests {
         assert!(FileMeta::matches("data.123456"));
 
         // Compacted files
-        assert!(FileMeta::matches("data.c.123456.parquet"));
-        assert!(FileMeta::matches("my_data.c.999.parquet"));
-        assert!(FileMeta::matches("data.c.123456"));
+        assert!(FileMeta::matches("data.123456.c.parquet"));
+        assert!(FileMeta::matches("my_data.999.c.parquet"));
+        assert!(FileMeta::matches("data.123456.c"));
 
         // Invalid patterns
         assert!(!FileMeta::matches("invalid"));
