@@ -10,5 +10,5 @@ name = "prestige"
 path = "src/main.rs"
 
 [dependencies]
-prestige = { version = "0.2.2", path = "../prestige" }
+prestige = { version = "0.2.3", path = "../prestige" }
 clap = { version = "4", features = ["derive"] }

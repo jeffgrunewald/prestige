@@ -311,6 +311,12 @@ pub struct CompactionResult {
 
     /// Approximate storage savings in bytes
     pub bytes_saved: usize,
+
+    /// Timestamp of the last source file successfully processed.
+    /// Use this as `after_timestamp` for subsequent compaction runs to implement checkpointing.
+    /// None if no files were processed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_processed_timestamp: Option<DateTime<Utc>>,
 }
 
 impl CompactionResult {
@@ -321,6 +327,7 @@ impl CompactionResult {
             files_created: 0,
             records_consolidated: 0,
             bytes_saved: 0,
+            last_processed_timestamp: None,
         }
     }
 }
@@ -474,6 +481,7 @@ where
     let mut files_created = 0;
     let mut records_consolidated = 0;
     let mut bytes_saved = 0;
+    let mut last_processed_timestamp: Option<DateTime<Utc>> = None;
 
     for file_meta in files {
         info!("Processing file: {}", file_meta.key);
@@ -495,6 +503,7 @@ where
                     file_meta.key
                 );
                 files_processed += 1;
+                last_processed_timestamp = Some(file_meta.timestamp);
                 source_files.push(file_meta.clone());
                 continue;
             }
@@ -508,6 +517,7 @@ where
         if records.is_empty() {
             info!("Skipping empty file: {}", file_meta.key);
             files_processed += 1;
+            last_processed_timestamp = Some(file_meta.timestamp);
             source_files.push(file_meta.clone()); // ensure the empty file is still cleaned up
             continue;
         }
@@ -552,6 +562,7 @@ where
         current_size_bytes += batch_size;
         source_files.push(file_meta.clone());
         files_processed += 1;
+        last_processed_timestamp = Some(file_meta.timestamp);
     }
 
     // Finalize any remaining records
@@ -575,6 +586,7 @@ where
         files_created,
         records_consolidated,
         bytes_saved,
+        last_processed_timestamp,
     })
 }
 
@@ -652,6 +664,7 @@ mod tests {
         assert_eq!(result.files_created, 0);
         assert_eq!(result.records_consolidated, 0);
         assert_eq!(result.bytes_saved, 0);
+        assert_eq!(result.last_processed_timestamp, None);
     }
 
     #[test]
