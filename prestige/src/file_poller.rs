@@ -333,7 +333,8 @@ where
                     break Ok(());
                 }
                 _ = cleanup_trigger.tick() => {
-                    let offset = Utc::now() - chrono::Duration::from_std(CLEAN_DURATION).unwrap();
+                    let offset = self.after(self.latest_file_timestamp)
+                        .unwrap_or_else(|| Utc::now() - chrono::Duration::from_std(CLEAN_DURATION).unwrap());
                     match self.config.state.clean(process_name.as_str(), &prefix, offset).await {
                         Ok(count) => {
                             debug!(
@@ -549,6 +550,33 @@ mod sqlx_impl {
             file_type: &str,
             offset: DateTime<Utc>,
         ) -> Result<u64> {
+            // Step 1: Find the 100th most recent file's timestamp
+            let t100_timestamp: Option<DateTime<Utc>> = sqlx::query_scalar(
+                r#"
+                SELECT file_timestamp
+                FROM files_processed
+                WHERE process_name = $1
+                    AND file_type = $2
+                ORDER BY file_timestamp DESC
+                LIMIT 1 OFFSET 100
+                "#,
+            )
+            .bind(process_name)
+            .bind(file_type)
+            .fetch_optional(self)
+            .await
+            .map_err(crate::Error::from)?;
+
+            // Step 2: If fewer than 100 records exist, don't delete anything
+            let Some(t100) = t100_timestamp else {
+                return Ok(0);
+            };
+
+            // Step 3: Use the more conservative of the two boundaries
+            // This ensures files within the offset window are never deleted
+            let older_than_limit = t100.min(offset);
+
+            // Step 4: Delete records older than the conservative limit
             sqlx::query(
                 r#"
                 DELETE FROM files_processed
@@ -559,7 +587,7 @@ mod sqlx_impl {
             )
             .bind(process_name)
             .bind(file_type)
-            .bind(offset)
+            .bind(older_than_limit)
             .execute(self)
             .await
             .map(|result| result.rows_affected())
@@ -616,6 +644,8 @@ mod tests {
             _file_type: &str,
             _offset: DateTime<Utc>,
         ) -> Result<u64> {
+            // Mock implementation returns 0 to simulate fewer than 100 records
+            // In production, this would preserve at least 100 records
             Ok(0)
         }
     }
