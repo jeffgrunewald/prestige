@@ -8,6 +8,8 @@ description = "Prestige file reading and writing utilities and tools"
 [dependencies]
 anyhow.workspace = true
 arrow = { version = "55", features = ["ipc"] }
+arrow-row = "55"
+arrow-select = "55"
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
@@ -21,11 +23,12 @@ futures.workspace = true
 futures-util.workspace = true
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
-parquet = { version = "55", features = ["async"] }
-prestige-macros = { version = "0.2.4", path = "../macros" }
+parquet.workspace = true
+prestige-macros = { version = "0.2.5", path = "../macros" }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
+seahash = "4"
 serde.workspace = true
 serde_arrow.workspace = true
 serde_json.workspace = true
