@@ -175,62 +175,26 @@ async fn execute_plan(
     start_ts: DateTime<Utc>,
     end_ts: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    use futures::TryStreamExt;
-    use serde_json::json;
+    let mut builder = prestige::FileCompactorConfigBuilder::default();
 
-    // List files in range
-    let mut files = Vec::new();
-    let mut file_stream = prestige::list_files(
-        client,
-        &args.bucket,
-        &args.prefix,
-        Some(start_ts),
-        Some(end_ts),
-    );
+    builder = builder
+        .client(client.clone())
+        .bucket(args.bucket.clone())
+        .prefix(args.prefix.clone())
+        .after_timestamp(Some(start_ts))
+        .until_timestamp(end_ts)
+        .max_bytes_per_file(args.target_bytes)
+        .enable_deduplication(args.deduplicate);
 
-    while let Some(file) = file_stream.try_next().await? {
-        if !file.compacted {
-            files.push(file);
-        }
+    if let Some(comp) = &args.compression {
+        builder = builder.compression(comp.0);
     }
 
-    if files.is_empty() {
-        let result = json!({
-            "compacted_files_produced": 0,
-            "uncompacted_files_deleted": 0,
-            "records_processed": 0,
-            "duplicate_records_eliminated": 0,
-            "storage_saved_bytes": 0
-        });
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+    if let Some(rg_size) = args.row_group_size {
+        builder = builder.row_group_size(rg_size);
     }
 
-    // Calculate statistics from metadata
-    let total_size: usize = files.iter().map(|f| f.size).sum();
-    let file_count = files.len();
-    let estimated_output_files = (total_size / args.target_bytes).max(1);
-
-    // Estimate records (assuming ~1KB per record average)
-    let estimated_records = total_size / 1024;
-
-    // Estimate compression savings (30% for SNAPPY default)
-    let estimated_saved = (total_size as f64 * 0.3) as usize;
-
-    // Duplicate estimation (0 if not deduplicating, otherwise conservative 5%)
-    let estimated_duplicates = if args.deduplicate {
-        (estimated_records as f64 * 0.05) as usize
-    } else {
-        0
-    };
-
-    let result = json!({
-        "compacted_files_produced": estimated_output_files,
-        "uncompacted_files_deleted": file_count,
-        "records_processed": estimated_records,
-        "duplicate_records_eliminated": estimated_duplicates,
-        "storage_saved_bytes": estimated_saved
-    });
+    let result = builder.plan_schema_agnostic().await?;
 
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())

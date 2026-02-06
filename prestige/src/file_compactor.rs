@@ -10,13 +10,7 @@ use parquet::{
     file::properties::{EnabledStatistics, WriterProperties},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashSet,
-    hash::{Hash, Hasher},
-    marker::PhantomData,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashSet, marker::PhantomData, path::Path, sync::Arc};
 use tracing::{info, warn};
 
 use crate::{
@@ -431,7 +425,7 @@ struct FinalizeResult {
 /// Accumulator for deduplicating RecordBatches
 struct DeduplicatingAccumulator {
     batches: Vec<RecordBatch>,
-    seen_hashes: HashSet<u64>,
+    seen_hashes: HashSet<u128>,
     total_records: usize,
     duplicate_count: usize,
 }
@@ -484,7 +478,6 @@ impl DeduplicatingAccumulator {
         let duplicate_count = self.duplicate_count;
         self.total_records = 0;
         self.duplicate_count = 0;
-        self.seen_hashes.clear();
         (batches, duplicate_count)
     }
 
@@ -498,7 +491,7 @@ impl DeduplicatingAccumulator {
 }
 
 /// Compute hash for each row in a RecordBatch using arrow_row for efficient row conversion
-fn compute_row_hashes(batch: &RecordBatch) -> Result<Vec<u64>> {
+fn compute_row_hashes(batch: &RecordBatch) -> Result<Vec<u128>> {
     let schema = batch.schema();
     let sort_fields: Vec<SortField> = schema
         .fields()
@@ -509,13 +502,9 @@ fn compute_row_hashes(batch: &RecordBatch) -> Result<Vec<u64>> {
     let converter = RowConverter::new(sort_fields)?;
     let rows = converter.convert_columns(batch.columns())?;
 
-    let mut hashes = Vec::with_capacity(batch.num_rows());
-    for idx in 0..batch.num_rows() {
-        let row = rows.row(idx);
-        let mut hasher = seahash::SeaHasher::new();
-        row.as_ref().hash(&mut hasher);
-        hashes.push(hasher.finish());
-    }
+    let hashes = (0..batch.num_rows())
+        .map(|idx| xxhash_rust::xxh3::xxh3_128(rows.row(idx).as_ref()))
+        .collect();
 
     Ok(hashes)
 }
@@ -526,6 +515,33 @@ fn filter_batch_by_mask(batch: &RecordBatch, keep: &[bool]) -> Result<RecordBatc
     let filter_array = BooleanArray::from(keep.to_vec());
     let filtered = filter_record_batch(batch, &filter_array)?;
     Ok(filtered)
+}
+
+/// Serialize batches to an in-memory buffer with the given writer properties
+/// and return the total byte count. Used by plan mode to measure output size
+/// without writing to disk or S3.
+fn measure_output_size(
+    batches: &[RecordBatch],
+    schema: &Arc<arrow::datatypes::Schema>,
+    compression: Compression,
+    row_group_size: usize,
+) -> Result<usize> {
+    let mut buf = Vec::new();
+    let props = WriterProperties::builder()
+        .set_compression(compression)
+        .set_max_row_group_size(row_group_size)
+        .set_write_batch_size(1024)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_created_by(format!("prestige/{}", env!("CARGO_PKG_VERSION")))
+        .build();
+
+    let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))?;
+    for batch in batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+
+    Ok(buf.len())
 }
 
 /// Create a marker file in S3 indicating a source file has been compacted
@@ -616,6 +632,17 @@ impl FileCompactorConfigBuilder<()> {
             .build()
             .map_err(|e| crate::error::Error::SerdeArrow(format!("Config builder error: {}", e)))?;
         execute_compaction_schema_agnostic(config).await
+    }
+
+    /// Plan compaction without writing or deleting any files.
+    /// Reads all source parquet files and performs the full accumulation and
+    /// deduplication logic to produce accurate statistics matching what an
+    /// actual compaction run would return.
+    pub async fn plan_schema_agnostic(self) -> Result<CompactionResult> {
+        let config = self
+            .build()
+            .map_err(|e| crate::error::Error::SerdeArrow(format!("Config builder error: {}", e)))?;
+        plan_compaction_schema_agnostic(config).await
     }
 }
 
@@ -980,6 +1007,220 @@ async fn execute_compaction_schema_agnostic(
         duplicate_records_eliminated,
         last_processed_timestamp,
         deletion_failures,
+    })
+}
+
+/// Read-only compaction plan that mirrors `execute_compaction_schema_agnostic`
+/// without writing or deleting any files. Downloads and processes all source
+/// parquet files to produce accurate record counts, deduplication counts,
+/// output file counts, and byte savings estimates.
+async fn plan_compaction_schema_agnostic(
+    config: FileCompactorConfig<()>,
+) -> Result<CompactionResult> {
+    info!(
+        "Planning schema-agnostic compaction for prefix '{}' in bucket '{}'",
+        config.prefix, config.bucket
+    );
+    info!(
+        "Time range: after {:?}, until {}",
+        config.after_timestamp, config.until_timestamp
+    );
+
+    // 1. Stream files and filter out compacted ones
+    let mut uncompacted_files = Vec::new();
+    let mut file_stream = list_files(
+        &config.client,
+        &config.bucket,
+        &config.prefix,
+        config.after_timestamp,
+        Some(config.until_timestamp),
+    );
+
+    while let Some(file) = file_stream.try_next().await? {
+        if !file.compacted {
+            uncompacted_files.push(file);
+        }
+    }
+
+    if uncompacted_files.is_empty() {
+        info!("No uncompacted files found");
+        return Ok(CompactionResult::empty());
+    }
+
+    info!(
+        "Found {} uncompacted files to process",
+        uncompacted_files.len()
+    );
+
+    // 2. Sort by timestamp for deterministic ordering
+    uncompacted_files.sort_by_key(|f| f.timestamp);
+
+    // 3. Process files with streaming accumulation (read-only)
+    let mut accumulator = DeduplicatingAccumulator::new();
+    let mut source_files: Vec<FileMeta> = Vec::new();
+    let mut schema: Option<Arc<arrow::datatypes::Schema>> = None;
+
+    let mut files_processed = 0;
+    let mut files_created = 0;
+    let mut records_consolidated = 0;
+    let mut bytes_saved = 0;
+    let mut duplicate_records_eliminated = 0;
+    let mut last_processed_timestamp: Option<DateTime<Utc>> = None;
+
+    for file_meta in uncompacted_files {
+        info!("Planning file: {}", file_meta.key);
+
+        // Skip if already processed (idempotency check — same as execute path)
+        if has_processed_marker(&config.client, &config.bucket, &file_meta.key).await {
+            info!(
+                "Skipping already-processed file: {} (marker exists)",
+                file_meta.key
+            );
+            files_processed += 1;
+            last_processed_timestamp = Some(file_meta.timestamp);
+            continue;
+        }
+
+        // Download and stream RecordBatches from parquet
+        let file_content = config
+            .client
+            .get_object()
+            .bucket(&config.bucket)
+            .key(&file_meta.key)
+            .send()
+            .await
+            .map_err(|e| Error::from(aws_sdk_s3::Error::from(e)))?;
+
+        let bytes = file_content
+            .body
+            .collect()
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?
+            .into_bytes();
+
+        // Handle empty or invalid files
+        if bytes.is_empty() {
+            info!("Skipping empty file: {}", file_meta.key);
+            files_processed += 1;
+            last_processed_timestamp = Some(file_meta.timestamp);
+            source_files.push(file_meta.clone());
+            continue;
+        }
+
+        // Create parquet reader
+        let cursor = std::io::Cursor::new(bytes);
+        let builder = match ParquetRecordBatchStreamBuilder::new(cursor).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Failed to read parquet file {}: {}", file_meta.key, e);
+                files_processed += 1;
+                last_processed_timestamp = Some(file_meta.timestamp);
+                continue;
+            }
+        };
+
+        // Get schema from first file
+        if let Some(ref current_schema) = schema {
+            if current_schema != builder.schema() {
+                warn!("Schema mismatch in file {}, skipping", file_meta.key);
+                files_processed += 1;
+                last_processed_timestamp = Some(file_meta.timestamp);
+                continue;
+            }
+        } else {
+            let new_schema = builder.schema().clone();
+            info!("Detected schema with {} fields", new_schema.fields().len());
+            schema = Some(new_schema);
+        }
+
+        let mut stream = builder.build()?;
+
+        // Stream RecordBatches and accumulate
+        let mut file_had_records = false;
+        while let Some(batch_result) = stream.try_next().await? {
+            if batch_result.num_rows() == 0 {
+                continue;
+            }
+
+            file_had_records = true;
+            let batch_size = batch_result.get_array_memory_size();
+
+            // Check if adding this batch would exceed limit (soft limit)
+            if !accumulator.is_empty()
+                && (accumulator.estimated_size() + batch_size) > config.max_bytes_per_file
+            {
+                info!(
+                    "Size limit reached, measuring planned output ({} bytes, {} records)",
+                    accumulator.estimated_size(),
+                    accumulator.total_records()
+                );
+
+                let (batches, dup_count) = accumulator.take_batches();
+                let original_bytes: usize = source_files.iter().map(|f| f.size).sum();
+                let output_bytes = measure_output_size(
+                    &batches,
+                    schema.as_ref().unwrap(),
+                    config.compression,
+                    config.row_group_size,
+                )?;
+
+                let record_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                files_created += 1;
+                records_consolidated += record_count;
+                bytes_saved += original_bytes.saturating_sub(output_bytes);
+                duplicate_records_eliminated += dup_count;
+
+                source_files = Vec::new();
+            }
+
+            // Add batch to accumulator (with optional deduplication)
+            accumulator.add_batch(batch_result, config.enable_deduplication)?;
+        }
+
+        if !file_had_records {
+            info!("Skipping file with no records: {}", file_meta.key);
+        }
+
+        source_files.push(file_meta.clone());
+        files_processed += 1;
+        last_processed_timestamp = Some(file_meta.timestamp);
+    }
+
+    // Finalize any remaining records
+    if !accumulator.is_empty() {
+        let (batches, dup_count) = accumulator.take_batches();
+        let original_bytes: usize = source_files.iter().map(|f| f.size).sum();
+        let output_bytes = measure_output_size(
+            &batches,
+            schema.as_ref().ok_or(CompactionError::NoSourceFiles)?,
+            config.compression,
+            config.row_group_size,
+        )?;
+
+        let record_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        files_created += 1;
+        records_consolidated += record_count;
+        bytes_saved += original_bytes.saturating_sub(output_bytes);
+        duplicate_records_eliminated += dup_count;
+    }
+
+    info!(
+        "Schema-agnostic compaction plan complete: {} files -> {} files, {} records, {} duplicates, ~{} bytes saved",
+        files_processed,
+        files_created,
+        records_consolidated,
+        duplicate_records_eliminated,
+        bytes_saved
+    );
+
+    Ok(CompactionResult {
+        files_processed,
+        files_created,
+        records_consolidated,
+        bytes_saved,
+        duplicate_records_eliminated,
+        last_processed_timestamp,
+        deletion_failures: Vec::new(),
     })
 }
 
