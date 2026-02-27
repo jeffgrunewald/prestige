@@ -7,9 +7,9 @@ description = "Prestige file reading and writing utilities and tools"
 
 [dependencies]
 anyhow.workspace = true
-arrow = { version = "55", features = ["ipc"] }
-arrow-row = "55"
-arrow-select = "55"
+arrow = { version = "57", features = ["ipc"] }
+arrow-row = "57"
+arrow-select = "57"
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
@@ -21,6 +21,9 @@ config.workspace = true
 derive_builder.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+iceberg = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
+iceberg-catalog-sql = { workspace = true, optional = true }
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet.workspace = true
@@ -49,6 +52,8 @@ tokio-util = "0"
 [features]
 default = []
 decimal = ["dep:rust_decimal"]
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest"]
+iceberg-sql-catalog = ["iceberg", "dep:iceberg-catalog-sql"]
 metrics = ["dep:metrics"]
 opentelemetry = ["dep:opentelemetry"]
 sqlx-postgres = ["sqlx/postgres"]

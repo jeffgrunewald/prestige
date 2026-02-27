@@ -9,9 +9,9 @@ description = "Proc macro for deriving Prestige parquet trait implementations"
 proc-macro = true
 
 [dependencies]
-arrow = { version = "55", features = ["ipc"] }
+arrow = { version = "57", features = ["ipc"] }
 chrono = { workspace = true, optional = true }
-parquet = "55"
+parquet = "57"
 quote = "1"
 proc-macro2 = "1"
 serde_arrow.workspace = true

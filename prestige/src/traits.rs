@@ -169,7 +169,7 @@ mod chrono_impls {
         parquet::basic::Type::INT64,
         Some(parquet::basic::LogicalType::Timestamp {
             is_adjusted_to_u_t_c: true,
-            unit: parquet::basic::TimeUnit::MILLIS(parquet::format::MilliSeconds {})
+            unit: parquet::basic::TimeUnit::MILLIS
         })
     );
     impl_arrow_serialize!(
@@ -185,7 +185,7 @@ mod chrono_impls {
         parquet::basic::Type::INT64,
         Some(parquet::basic::LogicalType::Timestamp {
             is_adjusted_to_u_t_c: false,
-            unit: parquet::basic::TimeUnit::MILLIS(parquet::format::MilliSeconds {})
+            unit: parquet::basic::TimeUnit::MILLIS
         })
     );
     impl_arrow_serialize!(
@@ -205,7 +205,7 @@ mod chrono_impls {
         parquet::basic::Type::INT64,
         Some(parquet::basic::LogicalType::Time {
             is_adjusted_to_u_t_c: false,
-            unit: parquet::basic::TimeUnit::NANOS(parquet::format::NanoSeconds {})
+            unit: parquet::basic::TimeUnit::NANOS
         })
     );
     impl_arrow_serialize!(
@@ -505,8 +505,8 @@ mod tests {
         // Should be a group type with LIST logical type
         assert!(schema.is_group());
         assert_eq!(
-            schema.get_basic_info().logical_type(),
-            Some(parquet::basic::LogicalType::List)
+            schema.get_basic_info().logical_type_ref(),
+            Some(&parquet::basic::LogicalType::List)
         );
         assert_eq!(schema.name(), "field");
 

@@ -26,6 +26,8 @@ pub mod file_poller;
 pub mod file_sink;
 pub mod file_source;
 pub mod file_upload;
+#[cfg(feature = "iceberg")]
+pub mod iceberg;
 mod settings;
 pub(crate) mod telemetry;
 pub mod traits;
@@ -60,7 +62,7 @@ pub fn rebuild_type_with_optional(base_type: Type, field_name: &str) -> Type {
             let mut builder = Type::primitive_type_builder(field_name, physical_type)
                 .with_repetition(Repetition::OPTIONAL);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
@@ -82,7 +84,7 @@ pub fn rebuild_type_with_optional(base_type: Type, field_name: &str) -> Type {
             let mut builder =
                 Type::group_type_builder(field_name).with_repetition(Repetition::OPTIONAL);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
@@ -108,7 +110,7 @@ pub fn rebuild_type_as_required(base_type: Type, field_name: &str) -> Type {
             let mut builder = Type::primitive_type_builder(field_name, physical_type)
                 .with_repetition(Repetition::REQUIRED);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
@@ -130,7 +132,7 @@ pub fn rebuild_type_as_required(base_type: Type, field_name: &str) -> Type {
             let mut builder =
                 Type::group_type_builder(field_name).with_repetition(Repetition::REQUIRED);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 

@@ -29,6 +29,10 @@ pub enum Error {
     #[error("serde arrow error: {0}")]
     SerdeArrow(String),
 
+    #[cfg(feature = "iceberg")]
+    #[error("iceberg error: {0}")]
+    Iceberg(#[from] iceberg::Error),
+
     #[cfg(feature = "sqlx")]
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),
