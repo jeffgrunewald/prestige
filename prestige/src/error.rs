@@ -33,6 +33,14 @@ pub enum Error {
     #[error("iceberg error: {0}")]
     Iceberg(#[from] iceberg::Error),
 
+    #[cfg(feature = "iceberg")]
+    #[error("catalog http error: {0}")]
+    CatalogHttp(String),
+
+    #[cfg(feature = "iceberg")]
+    #[error("branch error: {0}")]
+    Branch(String),
+
     #[cfg(feature = "sqlx")]
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),

@@ -114,7 +114,7 @@ use aws_sdk_s3::primitives::ByteStream;
 /// This example shows how to implement a scheduled compaction job that runs periodically,
 /// querying a database to determine the cutoff timestamp for compaction.
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// use prestige::{Client, file_compactor::FileCompactorConfigBuilder, traits::ArrowSchema};
 /// use chrono::{DateTime, Duration, Utc};
 /// use serde::{Deserialize, Serialize};

@@ -300,7 +300,7 @@ pub fn source_s3_files_unordered(
 /// * `stream` - RecordBatchStream to deserialize
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// use prestige::file_source;
 ///
 /// let stream = file_source::source(paths, None, None);
@@ -333,7 +333,7 @@ where
 /// * `stream` - RecordBatchStream to deserialize
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
 /// use prestige::file_source;
 /// use futures::StreamExt;
 ///

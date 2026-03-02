@@ -9,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 /// Test struct representing sensor data with various field types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, prestige::PrestigeSchema)]
 struct SensorData {
+    #[prestige(identifier)]
     timestamp: u64,
+    #[prestige(identifier)]
     sensor_id: String,
     temperature: f32,
     #[serde(with = "serde_bytes")]
@@ -446,4 +448,22 @@ async fn test_roundtrip_parquet_file_format_verification() {
             assert_eq!(total_rows, original_data.len());
         })
         .await;
+}
+
+#[test]
+fn test_identifier_field_names() {
+    let names = SensorData::identifier_field_names();
+    assert_eq!(names, &["timestamp", "sensor_id"]);
+}
+
+/// Struct with no identifier fields should return an empty slice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, prestige::PrestigeSchema)]
+struct NoIdentifiers {
+    x: i32,
+    y: String,
+}
+
+#[test]
+fn test_no_identifier_fields() {
+    assert!(NoIdentifiers::identifier_field_names().is_empty());
 }

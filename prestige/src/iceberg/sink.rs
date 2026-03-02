@@ -6,8 +6,8 @@ use crate::{
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use iceberg::Catalog;
 use iceberg::table::Table;
 use parquet::basic::Compression;
 use serde::Serialize;
@@ -19,6 +19,39 @@ use super_visor::{ManagedProc, ShutdownSignal};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use super::catalog::Catalog;
+
+// ---------------------------------------------------------------------------
+// DataWriter trait — generic write abstraction for iceberg sinks
+// ---------------------------------------------------------------------------
+
+/// Async trait for writing typed records to an iceberg table.
+///
+/// Decouples consumers from the concrete sink transport — implementations
+/// may write via the channel-based `IcebergSinkClient`, a direct writer,
+/// or a mock for testing.
+#[async_trait]
+pub trait DataWriter<T: Send + 'static>: Send + Sync {
+    /// Write a single record.
+    async fn write(&self, item: T) -> Result;
+
+    /// Write a batch of records in a single operation.
+    async fn write_all(&self, items: Vec<T>) -> Result;
+}
+
+/// Type-erased, shareable writer handle.
+pub type BoxedDataWriter<T> = Arc<dyn DataWriter<T>>;
+
+/// Blanket conversion into a `BoxedDataWriter<T>`.
+pub trait IntoBoxedDataWriter<T: Send + 'static>: DataWriter<T> + Sized + 'static {
+    fn boxed(self) -> BoxedDataWriter<T> {
+        Arc::new(self)
+    }
+}
+
+impl<T: Send + 'static, W: DataWriter<T> + 'static> IntoBoxedDataWriter<T> for W {}
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SINK_CHECK_MILLIS: u64 = 60_000;
@@ -27,13 +60,15 @@ pub type IcebergFileManifest = Vec<String>;
 
 pub enum IcebergMessage<T> {
     Data(oneshot::Sender<Result>, T),
+    DataBatch(oneshot::Sender<Result>, Vec<T>),
     Commit(oneshot::Sender<Result<IcebergFileManifest>>),
     Rollback(oneshot::Sender<Result<IcebergFileManifest>>),
+    Publish(oneshot::Sender<Result>),
 }
 
 pub struct IcebergSinkBuilder<T> {
     table: Table,
-    catalog: Arc<dyn Catalog>,
+    catalog: Catalog,
     max_rows: usize,
     max_size_bytes: usize,
     roll_time: Duration,
@@ -42,13 +77,15 @@ pub struct IcebergSinkBuilder<T> {
     compression: Compression,
     batch_size: usize,
     snapshot_properties: HashMap<String, String>,
+    wap_branch: Option<String>,
+    auto_publish: bool,
     _phantom: PhantomData<T>,
 }
 
 impl<T> IcebergSinkBuilder<T> {
     pub fn new(
         table: Table,
-        catalog: Arc<dyn Catalog>,
+        catalog: Catalog,
         label: impl ToString,
     ) -> Self {
         Self {
@@ -62,6 +99,8 @@ impl<T> IcebergSinkBuilder<T> {
             compression: Compression::SNAPPY,
             batch_size: DEFAULT_BATCH_SIZE,
             snapshot_properties: HashMap::new(),
+            wap_branch: None,
+            auto_publish: true,
             _phantom: PhantomData,
         }
     }
@@ -109,6 +148,28 @@ impl<T> IcebergSinkBuilder<T> {
         }
     }
 
+    /// Enable Write-Audit-Publish (WAP) mode: commits write to a named audit
+    /// branch instead of directly to main. By default the branch is
+    /// auto-published after each commit; disable with `auto_publish(false)`.
+    pub fn wap_enabled(self, branch_name: impl Into<String>) -> Self {
+        Self {
+            wap_branch: Some(branch_name.into()),
+            ..self
+        }
+    }
+
+    /// When WAP is enabled, control whether the audit branch is automatically
+    /// published to main after each commit. Defaults to `true`.
+    ///
+    /// When `false`, use `IcebergSinkClient::publish()` to manually promote
+    /// branch data to main after validation.
+    pub fn auto_publish(self, auto_publish: bool) -> Self {
+        Self {
+            auto_publish,
+            ..self
+        }
+    }
+
     pub fn create(self) -> (IcebergSinkClient<T>, IcebergSink<T>)
     where
         T: ArrowSchema + Serialize,
@@ -135,6 +196,8 @@ impl<T> IcebergSinkBuilder<T> {
                 created_at: None,
                 staged_batches: Vec::new(),
                 snapshot_properties: self.snapshot_properties,
+                wap_branch: self.wap_branch,
+                auto_publish: self.auto_publish,
                 _phantom: PhantomData,
             },
         )
@@ -206,11 +269,72 @@ impl<T> IcebergSinkClient<T> {
             .map_err(|_| ChannelError::sink_timeout(&self.label))?;
         Ok(rx)
     }
+
+    /// Write multiple items in a single channel message, avoiding per-item
+    /// channel overhead. The entire batch is acknowledged with one response.
+    pub async fn write_all(&self, items: Vec<T>) -> Result<oneshot::Receiver<Result>> {
+        let count = items.len();
+        let (tx, rx) = oneshot::channel();
+        match self
+            .sender
+            .send_timeout(IcebergMessage::DataBatch(tx, items), SEND_TIMEOUT)
+            .await
+        {
+            Ok(_) => {
+                telemetry::increment_counter(
+                    SINK_RECORDS_WRITTEN,
+                    count as u64,
+                    telemetry_labels!("sink_name" => self.label.as_str()),
+                );
+                Ok(rx)
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                telemetry::increment_counter(
+                    SINK_WRITE_ERRORS,
+                    1,
+                    telemetry_labels!("sink_name" => self.label.as_str(), "error_type" => "channel_closed"),
+                );
+                Err(ChannelError::sink_closed(&self.label))
+            }
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                telemetry::increment_counter(
+                    SINK_WRITE_ERRORS,
+                    1,
+                    telemetry_labels!("sink_name" => self.label.as_str(), "error_type" => "timeout"),
+                );
+                Err(ChannelError::sink_timeout(&self.label))
+            }
+        }
+    }
+
+    /// Publish the WAP audit branch to main. Only meaningful when the sink
+    /// was created with `wap_enabled(...)` and `auto_publish(false)`.
+    pub async fn publish(&self) -> Result<oneshot::Receiver<Result>> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send_timeout(IcebergMessage::Publish(tx), SEND_TIMEOUT)
+            .await
+            .map_err(|_| ChannelError::sink_timeout(&self.label))?;
+        Ok(rx)
+    }
+}
+
+#[async_trait]
+impl<T: Send + 'static> DataWriter<T> for IcebergSinkClient<T> {
+    async fn write(&self, item: T) -> Result {
+        let rx = IcebergSinkClient::write(self, item).await?;
+        rx.await.map_err(|_| ChannelError::sink_closed(&self.label))?
+    }
+
+    async fn write_all(&self, items: Vec<T>) -> Result {
+        let rx = IcebergSinkClient::write_all(self, items).await?;
+        rx.await.map_err(|_| ChannelError::sink_closed(&self.label))?
+    }
 }
 
 pub struct IcebergSink<T> {
     table: Table,
-    catalog: Arc<dyn Catalog>,
+    catalog: Catalog,
     max_rows: usize,
     max_size_bytes: usize,
     roll_time: Duration,
@@ -227,6 +351,8 @@ pub struct IcebergSink<T> {
     created_at: Option<DateTime<Utc>>,
     staged_batches: Vec<RecordBatch>,
     snapshot_properties: HashMap<String, String>,
+    wap_branch: Option<String>,
+    auto_publish: bool,
     _phantom: PhantomData<T>,
 }
 
@@ -251,6 +377,10 @@ impl<T: Serialize> IcebergSink<T> {
                         let res = self.write_item(item).await;
                         let _ = on_write_tx.send(res);
                     }
+                    Some(IcebergMessage::DataBatch(on_write_tx, items)) => {
+                        let res = self.write_items(items).await;
+                        let _ = on_write_tx.send(res);
+                    }
                     Some(IcebergMessage::Commit(on_commit_tx)) => {
                         let res = self.commit().await;
                         let _ = on_commit_tx.send(res);
@@ -258,6 +388,10 @@ impl<T: Serialize> IcebergSink<T> {
                     Some(IcebergMessage::Rollback(on_rollback_tx)) => {
                         let res = self.rollback().await;
                         let _ = on_rollback_tx.send(res);
+                    }
+                    Some(IcebergMessage::Publish(on_publish_tx)) => {
+                        let res = self.publish_wap().await;
+                        let _ = on_publish_tx.send(res);
                     }
                     None => break,
                 },
@@ -273,6 +407,24 @@ impl<T: Serialize> IcebergSink<T> {
         }
 
         info!(label = self.label, "stopping iceberg sink");
+        Ok(())
+    }
+
+    async fn write_items(&mut self, items: Vec<T>) -> Result {
+        if self.created_at.is_none() {
+            self.created_at = Some(Utc::now());
+        }
+
+        self.buffer.extend(items);
+
+        while self.buffer.len() >= self.batch_size {
+            self.flush_buffer()?;
+        }
+
+        if let Some(reason) = self.should_rotate()? {
+            self.rotate(reason).await?;
+        }
+
         Ok(())
     }
 
@@ -386,29 +538,87 @@ impl<T: Serialize> IcebergSink<T> {
             .map(|f| f.file_path().to_string())
             .collect();
 
-        let snapshot_props = if self.snapshot_properties.is_empty() {
-            None
+        if let Some(ref branch_name) = self.wap_branch {
+            // WAP commit path: write to audit branch.
+            if self.table.metadata().snapshot_for_ref(branch_name).is_none() {
+                super::branch::create_branch(&self.catalog, &self.table, branch_name).await?;
+                self.table = self.catalog.load_table(self.table.identifier()).await?;
+            }
+
+            let wap_id = Uuid::now_v7().to_string();
+            super::branch::commit_to_branch(
+                &self.catalog,
+                &self.table,
+                branch_name,
+                data_files,
+                &wap_id,
+            )
+            .await?;
+
+            self.table = self.catalog.load_table(self.table.identifier()).await?;
+
+            if self.auto_publish {
+                super::branch::publish_branch(&self.catalog, &self.table, branch_name).await?;
+                self.table = self.catalog.load_table(self.table.identifier()).await?;
+                info!(
+                    label = self.label,
+                    files = manifest.len(),
+                    branch = branch_name,
+                    "committed and published iceberg WAP snapshot"
+                );
+            } else {
+                info!(
+                    label = self.label,
+                    files = manifest.len(),
+                    branch = branch_name,
+                    "committed iceberg WAP snapshot (awaiting publish)"
+                );
+            }
         } else {
-            Some(self.snapshot_properties.clone())
+            // Direct commit path: fast_append to main.
+            let snapshot_props = if self.snapshot_properties.is_empty() {
+                None
+            } else {
+                Some(self.snapshot_properties.clone())
+            };
+
+            let updated_table = super::writer::commit_data_files(
+                &self.table,
+                self.catalog.as_iceberg_catalog().as_ref(),
+                data_files,
+                snapshot_props,
+            )
+            .await?;
+
+            self.table = updated_table;
+
+            info!(
+                label = self.label,
+                files = manifest.len(),
+                "committed iceberg snapshot"
+            );
+        }
+
+        Ok(manifest)
+    }
+
+    async fn publish_wap(&mut self) -> Result {
+        let Some(ref branch_name) = self.wap_branch else {
+            return Err(crate::Error::Branch(
+                "cannot publish: WAP not enabled on this sink".into(),
+            ));
         };
 
-        let updated_table = super::writer::commit_data_files(
-            &self.table,
-            self.catalog.as_ref(),
-            data_files,
-            snapshot_props,
-        )
-        .await?;
-
-        self.table = updated_table;
+        super::branch::publish_branch(&self.catalog, &self.table, branch_name).await?;
+        self.table = self.catalog.load_table(self.table.identifier()).await?;
 
         info!(
             label = self.label,
-            files = manifest.len(),
-            "committed iceberg snapshot"
+            branch = branch_name,
+            "published WAP branch to main"
         );
 
-        Ok(manifest)
+        Ok(())
     }
 
     async fn rollback(&mut self) -> Result<IcebergFileManifest> {

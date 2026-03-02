@@ -24,6 +24,8 @@ futures-util.workspace = true
 iceberg = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+uuid = { version = "1", features = ["v4", "v7"], optional = true }
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet.workspace = true
@@ -45,15 +47,18 @@ tokio-stream.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 serde_bytes = "0"
 tempfile.workspace = true
 tokio-util = "0"
+uuid = { version = "1", features = ["v4"] }
 
 [features]
 default = []
 decimal = ["dep:rust_decimal"]
-iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest"]
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:reqwest", "dep:uuid"]
 iceberg-sql-catalog = ["iceberg", "dep:iceberg-catalog-sql"]
+iceberg-test-harness = ["iceberg"]
 metrics = ["dep:metrics"]
 opentelemetry = ["dep:opentelemetry"]
 sqlx-postgres = ["sqlx/postgres"]

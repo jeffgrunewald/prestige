@@ -309,6 +309,13 @@ struct IcebergScanArgs {
     /// Specific snapshot ID to scan
     #[arg(long)]
     snapshot_id: Option<i64>,
+
+    /// Row filter expression (repeatable, ANDed together).
+    /// Format: "column op value" where op is =, !=, >, >=, <, or <=.
+    /// Values are auto-typed: integers, floats, booleans, or strings.
+    /// Quote string values with ' or " if they could parse as numbers.
+    #[arg(long)]
+    filter: Vec<String>,
 }
 
 #[cfg(feature = "iceberg")]
@@ -323,25 +330,30 @@ struct IcebergInfoArgs {
 #[cfg(feature = "iceberg")]
 async fn connect_iceberg(
     args: &IcebergCatalogArgs,
-) -> anyhow::Result<std::sync::Arc<dyn iceberg::Catalog>> {
-    let mut builder = prestige::iceberg::CatalogConfigBuilder::default();
-    builder = builder
-        .name(args.catalog_name.clone())
-        .uri(args.catalog_uri.clone())
-        .warehouse(args.warehouse.clone())
-        .s3_endpoint(args.s3_endpoint.clone())
-        .s3_region(args.s3_region.clone())
-        .s3_access_key_id(args.s3_access_key.clone())
-        .s3_secret_access_key(args.s3_secret_key.clone());
+) -> anyhow::Result<prestige::iceberg::Catalog> {
+    let s3 = prestige::iceberg::S3Config {
+        endpoint: args.s3_endpoint.clone(),
+        access_key_id: args.s3_access_key.clone(),
+        secret_access_key: args.s3_secret_key.clone(),
+        region: args.s3_region.clone(),
+        path_style_access: None,
+    };
 
-    let config = builder.build()?;
+    let config = prestige::iceberg::CatalogConfig::builder(
+        args.catalog_uri.clone(),
+        args.catalog_name.clone(),
+    )
+    .warehouse(args.warehouse.clone())
+    .s3(s3)
+    .build();
+
     let catalog = prestige::iceberg::connect_catalog(&config).await?;
     Ok(catalog)
 }
 
 #[cfg(feature = "iceberg")]
 async fn load_iceberg_table(
-    catalog: &std::sync::Arc<dyn iceberg::Catalog>,
+    catalog: &prestige::iceberg::Catalog,
     args: &IcebergTableArgs,
 ) -> anyhow::Result<iceberg::table::Table> {
     let ns_parts: Vec<String> = args.namespace.split('.').map(String::from).collect();
@@ -362,7 +374,7 @@ async fn iceberg_compact_command(args: IcebergCompactArgs) -> anyhow::Result<()>
 
     let config = prestige::iceberg::IcebergCompactorConfigBuilder::default()
         .table(table)
-        .catalog(catalog)
+        .catalog(catalog.clone())
         .target_file_size_bytes(args.target_bytes)
         .min_files_to_compact(args.min_files)
         .deduplicate(args.deduplicate)
@@ -379,6 +391,7 @@ async fn iceberg_compact_command(args: IcebergCompactArgs) -> anyhow::Result<()>
         "bytes_before": result.bytes_before,
         "bytes_after": result.bytes_after,
         "duplicates_eliminated": result.duplicates_eliminated,
+        "partitions_compacted": result.partitions_compacted,
     });
 
     println!("{}", serde_json::to_string_pretty(&output)?);
@@ -390,9 +403,20 @@ async fn iceberg_scan_command(args: IcebergScanArgs) -> anyhow::Result<()> {
     let catalog = connect_iceberg(&args.catalog).await?;
     let table = load_iceberg_table(&catalog, &args.table).await?;
 
-    let stream = match args.snapshot_id {
-        Some(sid) => prestige::iceberg::scan_snapshot(&table, sid).await?,
-        None => prestige::iceberg::scan_table(&table).await?,
+    let stream = if let Some(sid) = args.snapshot_id {
+        prestige::iceberg::scan_snapshot(&table, sid).await?
+    } else if !args.filter.is_empty() {
+        let predicate = args
+            .filter
+            .iter()
+            .map(|f| parse_filter(f))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .reduce(|a, b| a.and(b))
+            .unwrap();
+        prestige::iceberg::scan_with_filter(&table, predicate).await?
+    } else {
+        prestige::iceberg::scan_table(&table).await?
     };
 
     let mut pinned = std::pin::pin!(stream);
@@ -421,6 +445,64 @@ async fn iceberg_scan_command(args: IcebergScanArgs) -> anyhow::Result<()> {
 
     println!("\n({total_rows} rows scanned, limit {limit})", limit = args.limit);
     Ok(())
+}
+
+#[cfg(feature = "iceberg")]
+fn parse_filter(filter: &str) -> anyhow::Result<iceberg::expr::Predicate> {
+    // Try operators longest-first to avoid ">" matching before ">="
+    let operators = [">=", "<=", "!=", "=", ">", "<"];
+    for op in operators {
+        if let Some(pos) = filter.find(op) {
+            let column = filter[..pos].trim();
+            let value_str = filter[pos + op.len()..].trim();
+            if column.is_empty() || value_str.is_empty() {
+                anyhow::bail!("invalid filter: '{filter}' (column and value must be non-empty)");
+            }
+
+            let reference = iceberg::expr::Reference::new(column);
+            let datum = parse_datum(value_str);
+
+            return Ok(match op {
+                "=" => reference.equal_to(datum),
+                "!=" => reference.not_equal_to(datum),
+                ">" => reference.greater_than(datum),
+                ">=" => reference.greater_than_or_equal_to(datum),
+                "<" => reference.less_than(datum),
+                "<=" => reference.less_than_or_equal_to(datum),
+                _ => unreachable!(),
+            });
+        }
+    }
+    anyhow::bail!("invalid filter: '{filter}' (expected: column op value, where op is =, !=, >, >=, <, <=)")
+}
+
+#[cfg(feature = "iceberg")]
+fn parse_datum(value: &str) -> iceberg::spec::Datum {
+    // Strip surrounding quotes → string literal
+    let stripped = value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
+    if let Some(s) = stripped {
+        return iceberg::spec::Datum::string(s);
+    }
+
+    if value.eq_ignore_ascii_case("true") {
+        return iceberg::spec::Datum::bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return iceberg::spec::Datum::bool(false);
+    }
+
+    if let Ok(v) = value.parse::<i64>() {
+        return iceberg::spec::Datum::long(v);
+    }
+
+    if let Ok(v) = value.parse::<f64>() {
+        return iceberg::spec::Datum::double(v);
+    }
+
+    iceberg::spec::Datum::string(value)
 }
 
 #[cfg(feature = "iceberg")]

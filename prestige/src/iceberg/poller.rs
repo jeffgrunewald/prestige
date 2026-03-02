@@ -2,7 +2,6 @@ use crate::error::Result;
 use arrow::array::RecordBatch;
 use futures::stream::BoxStream;
 use iceberg::table::Table;
-use iceberg::Catalog;
 use std::sync::Arc;
 use std::time::Duration;
 use super_visor::{ManagedProc, ShutdownSignal};
@@ -24,14 +23,14 @@ pub type IcebergStreamReceiver = mpsc::Receiver<IcebergFileStream>;
 
 pub struct IcebergPollerConfig {
     table: Table,
-    catalog: Arc<dyn Catalog>,
+    catalog: Arc<dyn iceberg::Catalog>,
     poll_interval: Duration,
     label: String,
 }
 
 pub struct IcebergPollerConfigBuilder {
     table: Table,
-    catalog: Arc<dyn Catalog>,
+    catalog: Arc<dyn iceberg::Catalog>,
     poll_interval: Duration,
     channel_size: usize,
     label: String,
@@ -39,7 +38,7 @@ pub struct IcebergPollerConfigBuilder {
 }
 
 impl IcebergPollerConfigBuilder {
-    pub fn new(table: Table, catalog: Arc<dyn Catalog>, label: impl Into<String>) -> Self {
+    pub fn new(table: Table, catalog: Arc<dyn iceberg::Catalog>, label: impl Into<String>) -> Self {
         Self {
             table,
             catalog,
@@ -166,11 +165,13 @@ impl IcebergPollerServer {
             "new iceberg snapshot detected"
         );
 
-        // Build scan — if we have a previous snapshot, we scan incremental
-        // by scanning the current snapshot. Full data is returned since
-        // iceberg-rust 0.8 doesn't support incremental/append-only scans.
-        let scan = self.config.table.scan().snapshot_id(current_id).build()?;
-        let stream = scan.to_arrow().await?;
+        // Build scan — if we have a previous snapshot, scan only the data
+        // added since that snapshot (incremental). Otherwise do a full scan.
+        let stream = if let Some(after_id) = self.last_snapshot_id {
+            super::scanner::scan_since_snapshot(&self.config.table, after_id).await?
+        } else {
+            super::scanner::scan_snapshot(&self.config.table, current_id).await?
+        };
 
         let table_name = self.config.table.identifier().to_string();
 
