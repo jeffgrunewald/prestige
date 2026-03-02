@@ -1,8 +1,8 @@
 use crate::error::Result;
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, ManifestFile, ManifestListWriter,
+    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestFile, ManifestListWriter,
     ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Summary, MAIN_BRANCH,
+    SnapshotSummaryCollector, Summary,
 };
 use iceberg::table::Table;
 use iceberg::{TableIdent, TableRequirement, TableUpdate};
@@ -266,9 +266,7 @@ fn validate_branch_name(branch_name: &str) -> Result<()> {
         ));
     }
     if branch_name.is_empty() {
-        return Err(crate::Error::Branch(
-            "branch name cannot be empty".into(),
-        ));
+        return Err(crate::Error::Branch("branch name cannot be empty".into()));
     }
     Ok(())
 }

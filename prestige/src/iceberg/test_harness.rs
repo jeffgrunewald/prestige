@@ -1,7 +1,7 @@
+use crate::ArrowSchema;
 use crate::error::Result;
 use crate::iceberg::catalog::{AuthConfig, Catalog, CatalogConfig, S3Config};
 use crate::iceberg::sink::{BoxedDataWriter, DataWriter, IntoBoxedDataWriter};
-use crate::ArrowSchema;
 use async_trait::async_trait;
 use derive_builder::Builder;
 use iceberg::NamespaceIdent;
@@ -55,7 +55,7 @@ impl From<TestHarnessError> for crate::Error {
 ///
 /// ```ignore
 /// #[tokio::test]
-/// async fn test_roundtrip() -> anyhow::Result<()> {
+/// async fn test_roundtrip() -> Result<()> {
 ///     let harness = IcebergTestHarness::new().await?;
 ///
 ///     let table_config = IcebergTableConfigBuilder::default()
@@ -457,24 +457,21 @@ async fn connect_catalog(
     catalog_name: &str,
     namespace: &str,
 ) -> Result<Catalog> {
-    let catalog_config = CatalogConfig::builder(
-        config.catalog_url(),
-        catalog_name.to_string(),
-    )
-    .warehouse(catalog_name.to_string())
-    .auth(AuthConfig {
-        credential: Some(config.catalog_oauth2_credential.clone()),
-        scope: Some(config.catalog_oauth2_scope.clone()),
-        ..Default::default()
-    })
-    .s3(S3Config {
-        endpoint: Some(config.s3_url()),
-        access_key_id: Some(config.s3_access_key.clone()),
-        secret_access_key: Some(config.s3_secret_key.clone()),
-        region: Some(config.s3_region.clone()),
-        path_style_access: Some(true),
-    })
-    .build();
+    let catalog_config = CatalogConfig::builder(config.catalog_url(), catalog_name.to_string())
+        .warehouse(catalog_name.to_string())
+        .auth(AuthConfig {
+            credential: Some(config.catalog_oauth2_credential.clone()),
+            scope: Some(config.catalog_oauth2_scope.clone()),
+            ..Default::default()
+        })
+        .s3(S3Config {
+            endpoint: Some(config.s3_url()),
+            access_key_id: Some(config.s3_access_key.clone()),
+            secret_access_key: Some(config.s3_secret_key.clone()),
+            region: Some(config.s3_region.clone()),
+            path_style_access: Some(true),
+        })
+        .build();
 
     let catalog = catalog_config.connect().await?;
     let ns = NamespaceIdent::from_strs([namespace])?;

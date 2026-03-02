@@ -17,11 +17,11 @@
 #![cfg(feature = "iceberg-test-harness")]
 
 use futures::TryStreamExt;
-use prestige::iceberg::{
-    self, IcebergTableConfigBuilder, scan_since_snapshot, scan_table,
-    scan_with_filter, write_and_commit, IcebergTestHarness, Reference,
-};
 use prestige::PrestigeSchema;
+use prestige::iceberg::{
+    self, IcebergTableConfigBuilder, IcebergTestHarness, Reference, scan_since_snapshot,
+    scan_table, scan_with_filter, write_and_commit,
+};
 use serde::{Deserialize, Serialize};
 use std::pin::pin;
 
@@ -53,16 +53,18 @@ fn make_readings(count: usize) -> Vec<SensorReading> {
             sensor_id: format!("sensor-{:04}", i % 10),
             timestamp: 1700000000 + (i as i64 * 60),
             temperature: 20.0 + (i as f64 * 0.1),
-            humidity: if i % 3 == 0 { None } else { Some(45.0 + i as f64) },
+            humidity: if i % 3 == 0 {
+                None
+            } else {
+                Some(45.0 + i as f64)
+            },
             location: format!("zone-{}", i % 4),
         })
         .collect()
 }
 
 /// Collect all records from a scan stream.
-async fn collect_readings(
-    stream: iceberg::IcebergRecordBatchStream,
-) -> Vec<SensorReading> {
+async fn collect_readings(stream: iceberg::IcebergRecordBatchStream) -> Vec<SensorReading> {
     let mut pinned = pin!(stream);
     let mut all = Vec::new();
 
@@ -117,10 +119,7 @@ async fn test_ensure_table_creates_from_struct() {
         .expect("config");
 
     let result = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure_table");
 
@@ -185,10 +184,7 @@ async fn test_direct_writer_roundtrip() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -198,13 +194,9 @@ async fn test_direct_writer_roundtrip() {
     writer.write_all(readings.clone()).await.expect("write_all");
 
     // Reload table to see new snapshot
-    let table = iceberg::load_table(
-        harness.catalog(),
-        &["default".into()],
-        "writer_roundtrip",
-    )
-    .await
-    .expect("reload");
+    let table = iceberg::load_table(harness.catalog(), &["default".into()], "writer_roundtrip")
+        .await
+        .expect("reload");
 
     let scanned = collect_readings(scan_table(&table).await.expect("scan")).await;
 
@@ -233,10 +225,7 @@ async fn test_write_single_via_trait() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -254,13 +243,9 @@ async fn test_write_single_via_trait() {
     // write() goes through the DataWriter trait
     writer.write(reading.clone()).await.expect("write single");
 
-    let table = iceberg::load_table(
-        harness.catalog(),
-        &["default".into()],
-        "writer_single",
-    )
-    .await
-    .expect("reload");
+    let table = iceberg::load_table(harness.catalog(), &["default".into()], "writer_single")
+        .await
+        .expect("reload");
 
     let scanned = collect_readings(scan_table(&table).await.expect("scan")).await;
     assert_eq!(scanned.len(), 1);
@@ -283,10 +268,7 @@ async fn test_write_and_commit_convenience() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -322,10 +304,7 @@ async fn test_write_and_commit_empty_is_noop() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -363,10 +342,7 @@ async fn test_incremental_scan() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -402,9 +378,12 @@ async fn test_incremental_scan() {
         .expect("batch 2");
 
     // Incremental scan since snapshot1 should return only batch2 records
-    let incremental =
-        collect_readings(scan_since_snapshot(&table, snapshot1_id).await.expect("incremental"))
-            .await;
+    let incremental = collect_readings(
+        scan_since_snapshot(&table, snapshot1_id)
+            .await
+            .expect("incremental"),
+    )
+    .await;
 
     assert_eq!(
         incremental.len(),
@@ -444,10 +423,7 @@ async fn test_predicate_pushdown() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -479,8 +455,12 @@ async fn test_predicate_pushdown() {
 
     // Filter to location = "warehouse-b"
     let filter = Reference::new("location").equal_to(iceberg::Datum::string("warehouse-b"));
-    let filtered =
-        collect_readings(scan_with_filter(&table, filter).await.expect("filtered scan")).await;
+    let filtered = collect_readings(
+        scan_with_filter(&table, filter)
+            .await
+            .expect("filtered scan"),
+    )
+    .await;
 
     assert_eq!(filtered.len(), 8, "should return only warehouse-b records");
     for record in &filtered {
@@ -503,10 +483,7 @@ async fn test_nullable_field_roundtrip() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -572,10 +549,7 @@ async fn test_multiple_writes_accumulate() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -596,21 +570,26 @@ async fn test_multiple_writes_accumulate() {
         writer.write_all(batch).await.expect("write batch");
     }
 
-    let table = iceberg::load_table(
-        harness.catalog(),
-        &["default".into()],
-        "accumulate",
-    )
-    .await
-    .expect("reload");
+    let table = iceberg::load_table(harness.catalog(), &["default".into()], "accumulate")
+        .await
+        .expect("reload");
 
     let all = collect_readings(scan_table(&table).await.expect("scan")).await;
     assert_eq!(all.len(), 15, "3 batches * 5 records = 15 total");
 
     // Verify all three batches are present
-    let batch0_count = all.iter().filter(|r| r.sensor_id.starts_with("batch0")).count();
-    let batch1_count = all.iter().filter(|r| r.sensor_id.starts_with("batch1")).count();
-    let batch2_count = all.iter().filter(|r| r.sensor_id.starts_with("batch2")).count();
+    let batch0_count = all
+        .iter()
+        .filter(|r| r.sensor_id.starts_with("batch0"))
+        .count();
+    let batch1_count = all
+        .iter()
+        .filter(|r| r.sensor_id.starts_with("batch1"))
+        .count();
+    let batch2_count = all
+        .iter()
+        .filter(|r| r.sensor_id.starts_with("batch2"))
+        .count();
 
     assert_eq!(batch0_count, 5);
     assert_eq!(batch1_count, 5);
@@ -632,10 +611,7 @@ async fn test_compaction_via_harness() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -654,13 +630,9 @@ async fn test_compaction_via_harness() {
         writer.write_all(batch).await.expect("write");
     }
 
-    let table = iceberg::load_table(
-        harness.catalog(),
-        &["default".into()],
-        "compact",
-    )
-    .await
-    .expect("reload");
+    let table = iceberg::load_table(harness.catalog(), &["default".into()], "compact")
+        .await
+        .expect("reload");
 
     let compact_config = iceberg::IcebergCompactorConfigBuilder::default()
         .table(table)
@@ -695,10 +667,7 @@ async fn test_compaction_with_dedup_via_harness() {
         .expect("config");
 
     let table = harness
-        .ensure_table_with::<SensorReading>(
-            &config,
-            SensorReading::identifier_field_names(),
-        )
+        .ensure_table_with::<SensorReading>(&config, SensorReading::identifier_field_names())
         .await
         .expect("ensure")
         .into_table();
@@ -718,13 +687,9 @@ async fn test_compaction_with_dedup_via_harness() {
         writer.write(duplicate.clone()).await.expect("write dup");
     }
 
-    let table = iceberg::load_table(
-        harness.catalog(),
-        &["default".into()],
-        "compact_dedup",
-    )
-    .await
-    .expect("reload");
+    let table = iceberg::load_table(harness.catalog(), &["default".into()], "compact_dedup")
+        .await
+        .expect("reload");
 
     let compact_config = iceberg::IcebergCompactorConfigBuilder::default()
         .table(table)

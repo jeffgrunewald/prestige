@@ -78,11 +78,7 @@ pub async fn create_table_if_not_exists(
     create_table(catalog, config, schema).await
 }
 
-pub async fn load_table(
-    catalog: &Catalog,
-    namespace: &[String],
-    name: &str,
-) -> Result<Table> {
+pub async fn load_table(catalog: &Catalog, namespace: &[String], name: &str) -> Result<Table> {
     let namespace = NamespaceIdent::from_strs(namespace)?;
     let table_ident = TableIdent::new(namespace, name.to_string());
     let table = catalog.load_table(&table_ident).await?;
@@ -224,10 +220,7 @@ fn build_table_creation(config: &IcebergTableConfig, schema: Schema) -> TableCre
     }
 
     if let Some(ref codec) = config.parquet_compression {
-        properties.insert(
-            "write.parquet.compression-codec".to_string(),
-            codec.clone(),
-        );
+        properties.insert("write.parquet.compression-codec".to_string(), codec.clone());
     }
 
     TableCreation::builder()
@@ -252,10 +245,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let schema = Schema::builder()
-            .with_fields(vec![])
-            .build()
-            .unwrap();
+        let schema = Schema::builder().with_fields(vec![]).build().unwrap();
 
         let creation = build_table_creation(&config, schema);
         assert_eq!(creation.name, "test_table");
@@ -270,10 +260,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let schema = Schema::builder()
-            .with_fields(vec![])
-            .build()
-            .unwrap();
+        let schema = Schema::builder().with_fields(vec![]).build().unwrap();
 
         let creation = build_table_creation(&config, schema);
         assert_eq!(
@@ -307,10 +294,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let schema = Schema::builder()
-            .with_fields(vec![])
-            .build()
-            .unwrap();
+        let schema = Schema::builder().with_fields(vec![]).build().unwrap();
 
         let creation = build_table_creation(&config, schema);
         assert_eq!(creation.sort_order.as_ref(), Some(&sort_order));
@@ -328,18 +312,19 @@ mod tests {
             .build()
             .unwrap();
 
-        let schema = Schema::builder()
-            .with_fields(vec![])
-            .build()
-            .unwrap();
+        let schema = Schema::builder().with_fields(vec![]).build().unwrap();
 
         let creation = build_table_creation(&config, schema);
         assert_eq!(
-            creation.properties.get("history.expire.max-snapshot-age-ms"),
+            creation
+                .properties
+                .get("history.expire.max-snapshot-age-ms"),
             Some(&"86400000".to_string())
         );
         assert_eq!(
-            creation.properties.get("history.expire.min-snapshots-to-keep"),
+            creation
+                .properties
+                .get("history.expire.min-snapshots-to-keep"),
             Some(&"5".to_string())
         );
         assert_eq!(

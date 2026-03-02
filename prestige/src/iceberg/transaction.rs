@@ -105,11 +105,7 @@ impl WapTransaction {
     /// - `StaleBranch` → deletes stale branch, creates fresh, returns `Writer`
     /// - `WrittenNotPublished` → returns `Publisher` (data already on branch)
     /// - `AlreadyPublished` → returns `Complete` (nothing to do)
-    pub async fn begin(
-        catalog: Catalog,
-        table: Table,
-        wap_id: &str,
-    ) -> Result<Self> {
+    pub async fn begin(catalog: Catalog, table: Table, wap_id: &str) -> Result<Self> {
         let table = Arc::new(RwLock::new(table));
 
         reload_table(&catalog, &table).await?;
@@ -191,12 +187,9 @@ impl WapTransaction {
 
                 reload_table(&state.catalog, &state.table).await?;
                 let table_guard = state.table.read().await;
-                let data_files = super::writer::write_data_files(
-                    &table_guard,
-                    batches,
-                    state.compression,
-                )
-                .await?;
+                let data_files =
+                    super::writer::write_data_files(&table_guard, batches, state.compression)
+                        .await?;
                 let file_count = data_files.len();
                 branch::commit_to_branch(
                     &state.catalog,
@@ -208,7 +201,11 @@ impl WapTransaction {
                 .await?;
                 drop(table_guard);
 
-                info!(files = file_count, branch = state.branch_name, "WAP data committed to branch");
+                info!(
+                    files = file_count,
+                    branch = state.branch_name,
+                    "WAP data committed to branch"
+                );
 
                 *self = Self::Publisher(Box::new(WapPublisherState {
                     catalog: state.catalog,
@@ -224,11 +221,9 @@ impl WapTransaction {
                     "cannot write: data already committed to branch".into(),
                 ))
             }
-            Self::Complete => {
-                Err(crate::Error::Branch(
-                    "cannot write: transaction is complete".into(),
-                ))
-            }
+            Self::Complete => Err(crate::Error::Branch(
+                "cannot write: transaction is complete".into(),
+            )),
         }
     }
 
@@ -238,16 +233,13 @@ impl WapTransaction {
     /// Consumes the transaction.
     pub async fn publish(self) -> Result<()> {
         match self {
-            Self::Writer(_) => {
-                Err(crate::Error::Branch(
-                    "cannot publish: write data first".into(),
-                ))
-            }
+            Self::Writer(_) => Err(crate::Error::Branch(
+                "cannot publish: write data first".into(),
+            )),
             Self::Publisher(state) => {
                 reload_table(&state.catalog, &state.table).await?;
                 let table_guard = state.table.read().await;
-                branch::publish_branch(&state.catalog, &table_guard, &state.branch_name)
-                    .await?;
+                branch::publish_branch(&state.catalog, &table_guard, &state.branch_name).await?;
                 info!(branch = state.branch_name, "WAP branch published to main");
                 Ok(())
             }
@@ -275,10 +267,7 @@ mod tests {
 
     #[test]
     fn test_detect_wap_state_written_not_published() {
-        assert_eq!(
-            detect_wap_state(true, true),
-            WapState::WrittenNotPublished
-        );
+        assert_eq!(detect_wap_state(true, true), WapState::WrittenNotPublished);
     }
 
     #[test]

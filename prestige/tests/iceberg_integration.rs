@@ -43,9 +43,7 @@ fn s3_config() -> prestige::iceberg::S3Config {
         endpoint: Some(
             std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "http://localhost:9000".into()),
         ),
-        access_key_id: Some(
-            std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "admin".into()),
-        ),
+        access_key_id: Some(std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "admin".into())),
         secret_access_key: Some(
             std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "password".into()),
         ),
@@ -145,7 +143,10 @@ async fn test_create_table_and_scan() {
             .await
             .expect("write data files");
 
-    assert!(!data_files.is_empty(), "should produce at least one data file");
+    assert!(
+        !data_files.is_empty(),
+        "should produce at least one data file"
+    );
 
     let updated_table = prestige::iceberg::commit_data_files(
         &table,
@@ -531,9 +532,18 @@ async fn test_ensure_table_evolve_schema() {
 
             let schema = table.metadata().current_schema();
             assert!(schema.field_by_name("id").is_some(), "id should remain");
-            assert!(schema.field_by_name("email").is_some(), "email should be added");
-            assert!(schema.field_by_name("score").is_some(), "score should be added");
-            assert!(schema.field_by_name("name").is_none(), "name should be dropped");
+            assert!(
+                schema.field_by_name("email").is_some(),
+                "email should be added"
+            );
+            assert!(
+                schema.field_by_name("score").is_some(),
+                "score should be added"
+            );
+            assert!(
+                schema.field_by_name("name").is_none(),
+                "name should be dropped"
+            );
         }
         other => panic!("expected Evolved, got {other:?}"),
     }

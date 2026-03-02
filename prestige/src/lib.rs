@@ -275,7 +275,13 @@ pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -
     client
         .put_object()
         .bucket(bucket)
-        .key(file.file_name().map(|name| name.to_string_lossy()).unwrap())
+        .key(
+            file.file_name()
+                .map(|name| name.to_string_lossy())
+                .ok_or_else(|| {
+                    Error::Internal(format!("path has no file name: {}", file.display()))
+                })?,
+        )
         .body(byte_stream)
         .content_type("application/vnd.apache.parquet")
         .send()
@@ -326,7 +332,8 @@ pub async fn remove_file(
         }
     }
 
-    let err = last_error.expect("last_error must be set after 3 failed attempts");
+    let err = last_error
+        .ok_or_else(|| Error::Internal("retry loop exited without capturing an error".into()))?;
     error!(
         %bucket,
         %key,

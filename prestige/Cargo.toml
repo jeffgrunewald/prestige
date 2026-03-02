@@ -6,7 +6,6 @@ license.workspace = true
 description = "Prestige file reading and writing utilities and tools"
 
 [dependencies]
-anyhow.workspace = true
 arrow = { version = "57", features = ["ipc"] }
 arrow-row = "57"
 arrow-select = "57"
@@ -14,7 +13,6 @@ async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
 aws-smithy-types-convert.workspace = true
-blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 config.workspace = true
@@ -29,7 +27,7 @@ uuid = { version = "1", features = ["v4", "v7"], optional = true }
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet.workspace = true
-prestige-macros = { version = "0.2.6", path = "../macros" }
+prestige-macros = { version = "0.3.0", path = "../macros" }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }

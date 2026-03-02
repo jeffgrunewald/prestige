@@ -1,7 +1,7 @@
 use crate::error::Result;
 use arrow::array::RecordBatch;
-use futures::stream::BoxStream;
 use futures::TryStreamExt;
+use futures::stream::BoxStream;
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::Predicate;
 use iceberg::spec::ManifestStatus;
@@ -20,20 +20,14 @@ pub async fn scan_table(table: &Table) -> Result<IcebergRecordBatchStream> {
 }
 
 /// Scan an iceberg table at a specific snapshot.
-pub async fn scan_snapshot(
-    table: &Table,
-    snapshot_id: i64,
-) -> Result<IcebergRecordBatchStream> {
+pub async fn scan_snapshot(table: &Table, snapshot_id: i64) -> Result<IcebergRecordBatchStream> {
     let scan = table.scan().snapshot_id(snapshot_id).build()?;
     let stream = scan.to_arrow().await?;
     Ok(stream)
 }
 
 /// Scan an iceberg table with column projection.
-pub async fn scan_columns(
-    table: &Table,
-    columns: Vec<&str>,
-) -> Result<IcebergRecordBatchStream> {
+pub async fn scan_columns(table: &Table, columns: Vec<&str>) -> Result<IcebergRecordBatchStream> {
     let scan = table.scan().select(columns).build()?;
     let stream = scan.to_arrow().await?;
     Ok(stream)

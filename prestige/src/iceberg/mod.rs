@@ -15,7 +15,9 @@ mod writer;
 pub use catalog::{
     AuthConfig, Catalog, CatalogConfig, CatalogConfigBuilder, S3Config, connect_catalog,
 };
-pub use compactor::{IcebergCompactionResult, IcebergCompactorConfig, IcebergCompactorConfigBuilder};
+pub use compactor::{
+    IcebergCompactionResult, IcebergCompactorConfig, IcebergCompactorConfigBuilder,
+};
 pub use poller::{
     IcebergFileStream, IcebergPollerConfigBuilder, IcebergPollerServer, IcebergStreamReceiver,
 };

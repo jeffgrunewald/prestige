@@ -328,9 +328,7 @@ struct IcebergInfoArgs {
 }
 
 #[cfg(feature = "iceberg")]
-async fn connect_iceberg(
-    args: &IcebergCatalogArgs,
-) -> anyhow::Result<prestige::iceberg::Catalog> {
+async fn connect_iceberg(args: &IcebergCatalogArgs) -> anyhow::Result<prestige::iceberg::Catalog> {
     let s3 = prestige::iceberg::S3Config {
         endpoint: args.s3_endpoint.clone(),
         access_key_id: args.s3_access_key.clone(),
@@ -413,7 +411,7 @@ async fn iceberg_scan_command(args: IcebergScanArgs) -> anyhow::Result<()> {
             .collect::<anyhow::Result<Vec<_>>>()?
             .into_iter()
             .reduce(|a, b| a.and(b))
-            .unwrap();
+            .ok_or_else(|| anyhow::anyhow!("filter list must not be empty"))?;
         prestige::iceberg::scan_with_filter(&table, predicate).await?
     } else {
         prestige::iceberg::scan_table(&table).await?
@@ -443,7 +441,10 @@ async fn iceberg_scan_command(args: IcebergScanArgs) -> anyhow::Result<()> {
         total_rows += num_rows;
     }
 
-    println!("\n({total_rows} rows scanned, limit {limit})", limit = args.limit);
+    println!(
+        "\n({total_rows} rows scanned, limit {limit})",
+        limit = args.limit
+    );
     Ok(())
 }
 
@@ -473,7 +474,9 @@ fn parse_filter(filter: &str) -> anyhow::Result<iceberg::expr::Predicate> {
             });
         }
     }
-    anyhow::bail!("invalid filter: '{filter}' (expected: column op value, where op is =, !=, >, >=, <, <=)")
+    anyhow::bail!(
+        "invalid filter: '{filter}' (expected: column op value, where op is =, !=, >, >=, <, <=)"
+    )
 }
 
 #[cfg(feature = "iceberg")]

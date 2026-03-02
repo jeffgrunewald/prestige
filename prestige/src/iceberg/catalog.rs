@@ -177,14 +177,13 @@ impl CatalogConfigBuilder {
 
 impl From<&crate::Settings> for CatalogConfigBuilder {
     fn from(settings: &crate::Settings) -> Self {
-        let mut builder =
-            CatalogConfig::builder(&settings.region, "default").s3(S3Config {
-                endpoint: settings.endpoint.clone(),
-                access_key_id: settings.access_key_id.clone(),
-                secret_access_key: settings.secret_access_key.clone(),
-                region: Some(settings.region.clone()),
-                path_style_access: None,
-            });
+        let mut builder = CatalogConfig::builder(&settings.region, "default").s3(S3Config {
+            endpoint: settings.endpoint.clone(),
+            access_key_id: settings.access_key_id.clone(),
+            secret_access_key: settings.secret_access_key.clone(),
+            region: Some(settings.region.clone()),
+            path_style_access: None,
+        });
         builder.config.warehouse = settings.endpoint.clone();
         builder
     }
@@ -501,10 +500,7 @@ impl Catalog {
     }
 
     /// Create a namespace if it doesn't exist.
-    pub async fn create_namespace_if_not_exists(
-        &self,
-        namespace: &NamespaceIdent,
-    ) -> Result<()> {
+    pub async fn create_namespace_if_not_exists(&self, namespace: &NamespaceIdent) -> Result<()> {
         let exists = iceberg::Catalog::namespace_exists(&*self.inner, namespace).await?;
         if !exists {
             iceberg::Catalog::create_namespace(&*self.inner, namespace, HashMap::new()).await?;
@@ -593,10 +589,7 @@ mod tests {
                 extra_params,
                 ..
             } => {
-                assert_eq!(
-                    token_endpoint,
-                    "http://localhost:8181/v1/oauth/tokens"
-                );
+                assert_eq!(token_endpoint, "http://localhost:8181/v1/oauth/tokens");
                 assert_eq!(credential, "client_id:client_secret");
                 assert_eq!(
                     extra_params.get("scope"),
@@ -616,9 +609,7 @@ mod tests {
         };
         let endpoint_auth = EndpointAuth::from_auth_config(&auth, "http://localhost:8181");
         match endpoint_auth {
-            EndpointAuth::OAuth2 {
-                token_endpoint, ..
-            } => {
+            EndpointAuth::OAuth2 { token_endpoint, .. } => {
                 assert_eq!(token_endpoint, "http://auth.example.com/token");
             }
             _ => panic!("expected OAuth2 variant"),
@@ -690,13 +681,7 @@ mod tests {
             props.get("s3.endpoint"),
             Some(&"http://minio:9000".to_string())
         );
-        assert_eq!(
-            props.get("s3.access-key-id"),
-            Some(&"AKID".to_string())
-        );
-        assert_eq!(
-            props.get("s3.path-style-access"),
-            Some(&"true".to_string())
-        );
+        assert_eq!(props.get("s3.access-key-id"), Some(&"AKID".to_string()));
+        assert_eq!(props.get("s3.path-style-access"), Some(&"true".to_string()));
     }
 }

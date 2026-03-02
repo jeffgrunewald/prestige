@@ -3,8 +3,8 @@ use crate::traits::ArrowSchema;
 use arrow::datatypes::SchemaRef;
 use iceberg::arrow::{arrow_schema_to_schema_auto_assign_ids, arrow_type_to_type};
 use iceberg::spec::{
-    NestedField, NestedFieldRef, NullOrder, Schema, SortDirection, SortField, SortOrder,
-    Transform, UnboundPartitionField, UnboundPartitionSpec,
+    NestedField, NestedFieldRef, NullOrder, Schema, SortDirection, SortField, SortOrder, Transform,
+    UnboundPartitionField, UnboundPartitionSpec,
 };
 use std::collections::HashMap;
 
@@ -164,11 +164,13 @@ pub fn build_partition_spec(
             ref t => format!("{}_{}", def.name, t),
         };
 
-        fields.push(UnboundPartitionField::builder()
-            .source_id(source_id)
-            .name(partition_name)
-            .transform(def.transform)
-            .build());
+        fields.push(
+            UnboundPartitionField::builder()
+                .source_id(source_id)
+                .name(partition_name)
+                .transform(def.transform)
+                .build(),
+        );
     }
 
     let spec = UnboundPartitionSpec::builder()
@@ -216,7 +218,11 @@ pub fn reconcile_schema(
         .map(|f| (f.name.as_str(), f))
         .collect();
 
-    let arrow_field_names: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let arrow_field_names: Vec<&str> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
 
     let mut reconciled_fields: Vec<NestedFieldRef> = Vec::new();
     let mut columns_added: Vec<String> = Vec::new();
@@ -384,9 +390,11 @@ mod tests {
 
     #[test]
     fn test_reconcile_drop_columns() {
-        let arrow_schema = Arc::new(ArrowSchemaType::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchemaType::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
 
         let catalog_schema = catalog_schema_with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
@@ -491,9 +499,11 @@ mod tests {
 
     #[test]
     fn test_arrow_to_iceberg_schema_with_no_identifiers() {
-        let arrow_schema = Arc::new(ArrowSchemaType::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let arrow_schema = Arc::new(ArrowSchemaType::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
 
         let schema = arrow_to_iceberg_schema_with_identifiers(&arrow_schema, &[]).unwrap();
         let ids: Vec<i32> = schema.identifier_field_ids().collect();
@@ -513,13 +523,16 @@ mod tests {
             NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
         ]);
 
-        let result =
-            reconcile_schema(&arrow_schema, &catalog_schema, &["id"]).unwrap();
+        let result = reconcile_schema(&arrow_schema, &catalog_schema, &["id"]).unwrap();
 
         match result {
             SchemaReconciliation::Evolved { schema, .. } => {
                 let ids: Vec<i32> = schema.identifier_field_ids().collect();
-                assert_eq!(ids, vec![1], "identifier should be the 'id' field with ID 1");
+                assert_eq!(
+                    ids,
+                    vec![1],
+                    "identifier should be the 'id' field with ID 1"
+                );
             }
             other => panic!("expected Evolved, got {other:?}"),
         }
@@ -544,8 +557,7 @@ mod tests {
             .unwrap();
 
         // Now declare both "id" and "name" as identifiers.
-        let result =
-            reconcile_schema(&arrow_schema, &catalog_schema, &["id", "name"]).unwrap();
+        let result = reconcile_schema(&arrow_schema, &catalog_schema, &["id", "name"]).unwrap();
 
         match result {
             SchemaReconciliation::Evolved { schema, .. } => {
@@ -578,7 +590,8 @@ mod tests {
     fn test_schema() -> Schema {
         catalog_schema_with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            NestedField::required(2, "timestamp", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+            NestedField::required(2, "timestamp", Type::Primitive(PrimitiveType::Timestamptz))
+                .into(),
             NestedField::optional(3, "name", Type::Primitive(PrimitiveType::String)).into(),
             NestedField::optional(4, "region", Type::Primitive(PrimitiveType::String)).into(),
         ])

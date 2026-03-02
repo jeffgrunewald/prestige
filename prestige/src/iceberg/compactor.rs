@@ -6,9 +6,9 @@ use derive_builder::Builder;
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, ManifestListWriter,
+    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestListWriter,
     ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Struct, Summary, MAIN_BRANCH,
+    SnapshotSummaryCollector, Struct, Summary,
 };
 use iceberg::table::Table;
 use iceberg::{TableRequirement, TableUpdate};
@@ -203,10 +203,7 @@ impl IcebergCompactorConfig {
         .await?;
 
         let files_written = new_data_files.len();
-        let bytes_after: u64 = new_data_files
-            .iter()
-            .map(|f| f.file_size_in_bytes())
-            .sum();
+        let bytes_after: u64 = new_data_files.iter().map(|f| f.file_size_in_bytes()).sum();
         let records_consolidated = total_records - duplicates_eliminated;
 
         // Commit as an atomic rewrite: delete old files + add new files.
@@ -259,8 +256,7 @@ impl IcebergCompactorConfig {
             summary_collector.add_file(new_file, schema.clone(), partition_spec.clone());
         }
         let mut additional_properties = summary_collector.build();
-        additional_properties
-            .insert("prestige.operation".to_string(), "compaction".to_string());
+        additional_properties.insert("prestige.operation".to_string(), "compaction".to_string());
         let summary = Summary {
             operation: Operation::Replace,
             additional_properties,
@@ -332,11 +328,9 @@ impl IcebergCompactorConfig {
         );
         let manifest_list_output = self.table.file_io().new_output(&manifest_list_path)?;
         let mut manifest_list_writer = match metadata.format_version() {
-            FormatVersion::V1 => ManifestListWriter::v1(
-                manifest_list_output,
-                snapshot_id,
-                Some(parent_snapshot_id),
-            ),
+            FormatVersion::V1 => {
+                ManifestListWriter::v1(manifest_list_output, snapshot_id, Some(parent_snapshot_id))
+            }
             FormatVersion::V2 => ManifestListWriter::v2(
                 manifest_list_output,
                 snapshot_id,
@@ -452,29 +446,29 @@ impl DeduplicatingAccumulator {
 
     fn add_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let schema = batch.schema();
-        let (sort_fields, columns): (Vec<SortField>, Vec<arrow::array::ArrayRef>) =
-            match &self.key {
-                DeduplicationKey::IdentifierColumns(indices) => indices
-                    .iter()
-                    .map(|&i| {
-                        (
-                            SortField::new(schema.field(i).data_type().clone()),
-                            batch.column(i).clone(),
-                        )
-                    })
-                    .unzip(),
-                DeduplicationKey::AllColumns => schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, field)| {
-                        (
-                            SortField::new(field.data_type().clone()),
-                            batch.column(i).clone(),
-                        )
-                    })
-                    .unzip(),
-            };
+        let (sort_fields, columns): (Vec<SortField>, Vec<arrow::array::ArrayRef>) = match &self.key
+        {
+            DeduplicationKey::IdentifierColumns(indices) => indices
+                .iter()
+                .map(|&i| {
+                    (
+                        SortField::new(schema.field(i).data_type().clone()),
+                        batch.column(i).clone(),
+                    )
+                })
+                .unzip(),
+            DeduplicationKey::AllColumns => schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, field)| {
+                    (
+                        SortField::new(field.data_type().clone()),
+                        batch.column(i).clone(),
+                    )
+                })
+                .unzip(),
+        };
 
         let converter = RowConverter::new(sort_fields)?;
         let rows = converter.convert_columns(&columns)?;

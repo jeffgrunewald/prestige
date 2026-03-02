@@ -1,8 +1,13 @@
 use crate::{
     ArrowSchema, Error, Result,
     error::ChannelError,
-    file_sink::{DEFAULT_BATCH_SIZE, DEFAULT_MAX_ROWS, DEFAULT_MAX_SIZE_BYTES, DEFAULT_SINK_ROLL_SECS},
-    telemetry::{self, SINK_BATCH_SIZE, SINK_FILES_ROTATED, SINK_RECORDS_WRITTEN, SINK_WRITE_ERRORS, telemetry_labels},
+    file_sink::{
+        DEFAULT_BATCH_SIZE, DEFAULT_MAX_ROWS, DEFAULT_MAX_SIZE_BYTES, DEFAULT_SINK_ROLL_SECS,
+    },
+    telemetry::{
+        self, SINK_BATCH_SIZE, SINK_FILES_ROTATED, SINK_RECORDS_WRITTEN, SINK_WRITE_ERRORS,
+        telemetry_labels,
+    },
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -83,11 +88,7 @@ pub struct IcebergSinkBuilder<T> {
 }
 
 impl<T> IcebergSinkBuilder<T> {
-    pub fn new(
-        table: Table,
-        catalog: Catalog,
-        label: impl ToString,
-    ) -> Self {
+    pub fn new(table: Table, catalog: Catalog, label: impl ToString) -> Self {
         Self {
             table,
             catalog,
@@ -323,12 +324,14 @@ impl<T> IcebergSinkClient<T> {
 impl<T: Send + 'static> DataWriter<T> for IcebergSinkClient<T> {
     async fn write(&self, item: T) -> Result {
         let rx = IcebergSinkClient::write(self, item).await?;
-        rx.await.map_err(|_| ChannelError::sink_closed(&self.label))?
+        rx.await
+            .map_err(|_| ChannelError::sink_closed(&self.label))?
     }
 
     async fn write_all(&self, items: Vec<T>) -> Result {
         let rx = IcebergSinkClient::write_all(self, items).await?;
-        rx.await.map_err(|_| ChannelError::sink_closed(&self.label))?
+        rx.await
+            .map_err(|_| ChannelError::sink_closed(&self.label))?
     }
 }
 
@@ -526,12 +529,8 @@ impl<T: Serialize> IcebergSink<T> {
             return Ok(Vec::new());
         }
 
-        let data_files = super::writer::write_data_files(
-            &self.table,
-            batches,
-            Some(self.compression),
-        )
-        .await?;
+        let data_files =
+            super::writer::write_data_files(&self.table, batches, Some(self.compression)).await?;
 
         let manifest: Vec<String> = data_files
             .iter()
@@ -540,7 +539,12 @@ impl<T: Serialize> IcebergSink<T> {
 
         if let Some(ref branch_name) = self.wap_branch {
             // WAP commit path: write to audit branch.
-            if self.table.metadata().snapshot_for_ref(branch_name).is_none() {
+            if self
+                .table
+                .metadata()
+                .snapshot_for_ref(branch_name)
+                .is_none()
+            {
                 super::branch::create_branch(&self.catalog, &self.table, branch_name).await?;
                 self.table = self.catalog.load_table(self.table.identifier()).await?;
             }

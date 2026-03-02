@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Concrete builder type alias used throughout the writer pipeline.
-type WriterBuilder = DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+type WriterBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
 /// Write record batches to iceberg data files via the table's writer stack.
 ///
@@ -97,7 +98,14 @@ pub async fn write_data_files_with_target_size(
     let writer_builder = DataFileWriterBuilder::new(rolling_builder);
 
     if is_partitioned {
-        write_partitioned(table, &batches, writer_builder, schema, partition_spec.clone()).await
+        write_partitioned(
+            table,
+            &batches,
+            writer_builder,
+            schema,
+            partition_spec.clone(),
+        )
+        .await
     } else {
         write_unpartitioned(&batches, writer_builder).await
     }
@@ -182,8 +190,8 @@ pub async fn write_and_commit<T: ArrowSchema + Serialize>(
     }
 
     let schema = T::arrow_schema();
-    let arrays =
-        serde_arrow::to_arrow(schema.fields(), records).map_err(|e| Error::SerdeArrow(e.to_string()))?;
+    let arrays = serde_arrow::to_arrow(schema.fields(), records)
+        .map_err(|e| Error::SerdeArrow(e.to_string()))?;
     let batch = RecordBatch::try_new(schema, arrays)?;
 
     let data_files = write_data_files(table, vec![batch], compression).await?;

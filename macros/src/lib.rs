@@ -240,9 +240,7 @@ fn collect_sort_field_defs(
         .iter()
         .enumerate()
         .filter_map(|(pos, f)| {
-            extract_sort_key_attr(f).map(|attr| {
-                (f.ident.as_ref().unwrap().to_string(), attr, pos)
-            })
+            extract_sort_key_attr(f).map(|attr| (f.ident.as_ref().unwrap().to_string(), attr, pos))
         })
         .collect()
 }
@@ -304,7 +302,9 @@ fn generate_sort_and_partition_impl(
                 PartitionTransform::Day => quote! { ::iceberg::spec::Transform::Day },
                 PartitionTransform::Hour => quote! { ::iceberg::spec::Transform::Hour },
                 PartitionTransform::Bucket(n) => quote! { ::iceberg::spec::Transform::Bucket(#n) },
-                PartitionTransform::Truncate(w) => quote! { ::iceberg::spec::Transform::Truncate(#w) },
+                PartitionTransform::Truncate(w) => {
+                    quote! { ::iceberg::spec::Transform::Truncate(#w) }
+                }
             };
             quote! {
                 ::prestige::iceberg::PartitionFieldDef {

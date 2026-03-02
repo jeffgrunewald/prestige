@@ -47,6 +47,9 @@ pub enum Error {
 
     #[error("compaction error: {0}")]
     Compaction(#[from] CompactionError),
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 #[derive(thiserror::Error, Debug)]
