@@ -1,16 +1,19 @@
 use crate::error::Result;
 use arrow::datatypes::SchemaRef;
 use derive_builder::Builder;
-use iceberg::spec::{Schema, SortOrder, UnboundPartitionSpec};
-use iceberg::table::Table;
-use iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
+use iceberg::{
+    NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate,
+    spec::{Schema, SortOrder, UnboundPartitionSpec},
+    table::Table,
+};
 use iceberg_catalog_rest::CommitTableRequest;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use tracing::info;
 
-use super::catalog::Catalog;
-use super::schema::{SchemaReconciliation, reconcile_schema};
+use super::{
+    catalog::Catalog,
+    schema::{IcebergSchema, SchemaReconciliation, reconcile_schema},
+};
 
 #[derive(Debug, Clone, Builder)]
 #[builder(pattern = "owned")]
@@ -107,6 +110,58 @@ impl EnsureTableResult {
             Self::Created(t) | Self::UpToDate(t) | Self::Evolved { table: t, .. } => t,
         }
     }
+}
+
+impl IcebergTableConfig {
+    /// Build an `IcebergTableConfigBuilder` pre-populated from a type's `IcebergSchema` impl.
+    ///
+    /// `label` is used as fallback table name when `#[prestige(table = "...")]` is absent.
+    /// Returns the builder so callers can override any field before building.
+    pub fn from_schema<T: IcebergSchema>(label: &str) -> IcebergTableConfigBuilder {
+        let name = T::default_table_name()
+            .map(String::from)
+            .unwrap_or_else(|| label.to_string());
+        let namespace = T::default_namespace()
+            .map(|parts| parts.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        let mut builder = IcebergTableConfigBuilder::default();
+        builder = builder.name(name).namespace(namespace);
+        if let Some(spec) = T::table_partition_spec() {
+            builder = builder.partition_spec(Some(spec));
+        }
+        if let Some(order) = T::table_sort_order() {
+            builder = builder.sort_order(Some(order));
+        }
+        builder
+    }
+}
+
+/// Ensure a table exists for a type implementing `IcebergSchema`, using its
+/// derive-generated metadata for table name, namespace, partition spec, and sort order.
+///
+/// `label` is used as fallback table name when `#[prestige(table = "...")]` is absent.
+pub async fn ensure_table_for<T: IcebergSchema>(
+    catalog: &Catalog,
+    label: &str,
+) -> Result<EnsureTableResult> {
+    ensure_table_for_with::<T>(catalog, label, |b| b).await
+}
+
+/// Like `ensure_table_for`, but accepts a closure to override builder fields
+/// before the config is finalized.
+pub async fn ensure_table_for_with<T: IcebergSchema>(
+    catalog: &Catalog,
+    label: &str,
+    config_override: impl FnOnce(IcebergTableConfigBuilder) -> IcebergTableConfigBuilder,
+) -> Result<EnsureTableResult> {
+    let builder = IcebergTableConfig::from_schema::<T>(label);
+    let config = config_override(builder)
+        .build()
+        .map_err(|e| crate::Error::Internal(e.to_string()))?;
+    let arrow_schema = T::arrow_schema();
+    let identifier_names = T::identifier_field_names();
+    ensure_table(catalog, &config, &arrow_schema, identifier_names).await
 }
 
 /// Ensure a table exists and its schema matches the struct-derived Arrow schema.

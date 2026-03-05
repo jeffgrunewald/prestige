@@ -9,24 +9,26 @@ use crate::{
         telemetry_labels,
     },
 };
-use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use iceberg::table::Table;
 use parquet::basic::Compression;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
 use super_visor::{ManagedProc, ShutdownSignal};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time;
+use tokio::{
+    sync::{mpsc, oneshot},
+    time,
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::catalog::Catalog;
+use super::{
+    catalog::Catalog,
+    schema::IcebergSchema,
+    table::{IcebergTableConfigBuilder, ensure_table_for, ensure_table_for_with},
+};
 
 // ---------------------------------------------------------------------------
 // DataWriter trait — generic write abstraction for iceberg sinks
@@ -85,6 +87,29 @@ pub struct IcebergSinkBuilder<T> {
     wap_branch: Option<String>,
     auto_publish: bool,
     _phantom: PhantomData<T>,
+}
+
+impl<T: IcebergSchema + Serialize> IcebergSinkBuilder<T> {
+    /// Create a sink builder by automatically ensuring the table exists using
+    /// the type's `IcebergSchema` metadata (table name, namespace, partition spec, sort order).
+    ///
+    /// `label` is used as fallback table name when `#[prestige(table = "...")]` is absent.
+    pub async fn for_type(catalog: Catalog, label: &str) -> crate::Result<Self> {
+        let table = ensure_table_for::<T>(&catalog, label).await?.into_table();
+        Ok(Self::new(table, catalog, label))
+    }
+
+    /// Like `for_type`, but accepts a closure to override table config builder fields.
+    pub async fn for_type_with(
+        catalog: Catalog,
+        label: &str,
+        config_override: impl FnOnce(IcebergTableConfigBuilder) -> IcebergTableConfigBuilder,
+    ) -> crate::Result<Self> {
+        let table = ensure_table_for_with::<T>(&catalog, label, config_override)
+            .await?
+            .into_table();
+        Ok(Self::new(table, catalog, label))
+    }
 }
 
 impl<T> IcebergSinkBuilder<T> {

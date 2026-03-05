@@ -36,7 +36,7 @@ pub use sink::{
 };
 pub use table::{
     EnsureTableResult, IcebergTableConfig, IcebergTableConfigBuilder, create_table,
-    create_table_if_not_exists, ensure_table, load_table,
+    create_table_if_not_exists, ensure_table, ensure_table_for, ensure_table_for_with, load_table,
 };
 pub use transaction::{WapPublisherState, WapTransaction, WapWriterState};
 pub use writer::{
@@ -47,8 +47,11 @@ pub use writer::{
 // don't need a separate `iceberg` dependency to construct predicates,
 // configure sort orders, or reference table handles.
 pub use iceberg::expr::{Predicate, Reference};
-pub use iceberg::spec::{Datum, NullOrder, SortDirection, Transform, UnboundPartitionSpec};
+pub use iceberg::spec::{
+    Datum, NullOrder, Schema, SortDirection, SortOrder, Transform, UnboundPartitionSpec,
+};
 pub use iceberg::table::Table;
+pub use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 
 #[cfg(feature = "iceberg-test-harness")]
 pub use test_harness::{

@@ -258,6 +258,177 @@ fn collect_partition_field_defs(
     Ok(result)
 }
 
+/// Parsed struct-level `#[prestige(...)]` attributes.
+#[derive(Debug, Default)]
+struct StructPrestigeAttrs {
+    table_name: Option<String>,
+    namespace: Option<Vec<String>>,
+}
+
+/// Parse `#[prestige(table = "name", namespace = "a.b")]` from struct-level attributes.
+fn parse_struct_prestige_attrs(attrs: &[syn::Attribute]) -> Result<StructPrestigeAttrs, Error> {
+    let mut result = StructPrestigeAttrs::default();
+    for attr in attrs {
+        if !attr.path().is_ident("prestige") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("table") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                result.table_name = Some(lit.value());
+            } else if meta.path.is_ident("namespace") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                result.namespace = Some(lit.value().split('.').map(String::from).collect());
+            }
+            Ok(())
+        })?;
+    }
+    Ok(result)
+}
+
+/// Generate the `impl IcebergSchema for T` block (gated by `#[cfg(feature = "iceberg")]`).
+fn generate_iceberg_schema_impl(
+    name: &syn::Ident,
+    struct_attrs: &StructPrestigeAttrs,
+    identifier_names: &[String],
+    fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+) -> Result<proc_macro2::TokenStream, Error> {
+    let sort_defs = collect_sort_field_defs(fields);
+    let partition_defs = collect_partition_field_defs(fields)?;
+
+    // Build sort order method body
+    let sort_order_impl = if sort_defs.is_empty() {
+        quote! { None }
+    } else {
+        let sort_entries: Vec<proc_macro2::TokenStream> = sort_defs
+            .iter()
+            .map(|(field_name, attr, pos)| {
+                let order = attr.explicit_order.unwrap_or(*pos as u32);
+                let (dir, null) = if attr.descending {
+                    (
+                        quote! { ::prestige::iceberg::SortDirection::Descending },
+                        quote! { ::prestige::iceberg::NullOrder::Last },
+                    )
+                } else {
+                    (
+                        quote! { ::prestige::iceberg::SortDirection::Ascending },
+                        quote! { ::prestige::iceberg::NullOrder::First },
+                    )
+                };
+                quote! {
+                    ::prestige::iceberg::SortFieldDef {
+                        name: #field_name,
+                        direction: #dir,
+                        null_order: #null,
+                        order: #order,
+                    }
+                }
+            })
+            .collect();
+
+        quote! {
+            {
+                let schema = Self::iceberg_schema();
+                let defs = &[#(#sort_entries),*];
+                // Field names are macro-generated from the struct — guaranteed to exist.
+                Some(::prestige::iceberg::build_sort_order(&schema, defs).expect("sort order fields must exist in schema"))
+            }
+        }
+    };
+
+    // Build partition spec method body
+    let partition_spec_impl = if partition_defs.is_empty() {
+        quote! { None }
+    } else {
+        let partition_entries: Vec<proc_macro2::TokenStream> = partition_defs
+            .iter()
+            .map(|(field_name, transform)| {
+                let transform_expr = match transform {
+                    PartitionTransform::Identity => {
+                        quote! { ::prestige::iceberg::Transform::Identity }
+                    }
+                    PartitionTransform::Year => quote! { ::prestige::iceberg::Transform::Year },
+                    PartitionTransform::Month => quote! { ::prestige::iceberg::Transform::Month },
+                    PartitionTransform::Day => quote! { ::prestige::iceberg::Transform::Day },
+                    PartitionTransform::Hour => quote! { ::prestige::iceberg::Transform::Hour },
+                    PartitionTransform::Bucket(n) => {
+                        quote! { ::prestige::iceberg::Transform::Bucket(#n) }
+                    }
+                    PartitionTransform::Truncate(w) => {
+                        quote! { ::prestige::iceberg::Transform::Truncate(#w) }
+                    }
+                };
+                quote! {
+                    ::prestige::iceberg::PartitionFieldDef {
+                        name: #field_name,
+                        transform: #transform_expr,
+                    }
+                }
+            })
+            .collect();
+
+        quote! {
+            {
+                let schema = Self::iceberg_schema();
+                let defs = &[#(#partition_entries),*];
+                // Field names are macro-generated from the struct — guaranteed to exist.
+                Some(::prestige::iceberg::build_partition_spec(&schema, defs).expect("partition fields must exist in schema"))
+            }
+        }
+    };
+
+    // default_table_name
+    let table_name_impl = match &struct_attrs.table_name {
+        Some(name) => quote! { Some(#name) },
+        None => quote! { None },
+    };
+
+    // default_namespace
+    let namespace_impl = match &struct_attrs.namespace {
+        Some(parts) => {
+            quote! { Some(&[#(#parts),*]) }
+        }
+        None => quote! { None },
+    };
+
+    // identifier_field_names
+    let identifier_impl = quote! { &[#(#identifier_names),*] };
+
+    Ok(quote! {
+        #[cfg(feature = "iceberg")]
+        impl ::prestige::iceberg::IcebergSchema for #name {
+            fn iceberg_schema() -> ::prestige::iceberg::Schema {
+                ::prestige::iceberg::arrow_to_iceberg_schema_with_identifiers(
+                    &<Self as ::prestige::ArrowSchema>::arrow_schema(),
+                    Self::identifier_field_names(),
+                ).expect("arrow schema must convert to iceberg schema")
+            }
+
+            fn table_partition_spec() -> Option<::prestige::iceberg::UnboundPartitionSpec> {
+                #partition_spec_impl
+            }
+
+            fn table_sort_order() -> Option<::prestige::iceberg::SortOrder> {
+                #sort_order_impl
+            }
+
+            fn default_table_name() -> Option<&'static str> {
+                #table_name_impl
+            }
+
+            fn default_namespace() -> Option<&'static [&'static str]> {
+                #namespace_impl
+            }
+
+            fn identifier_field_names() -> &'static [&'static str] {
+                #identifier_impl
+            }
+        }
+    })
+}
+
 /// Generate the sort_field_definitions() and partition_field_defs() methods.
 fn generate_sort_and_partition_impl(
     name: &syn::Ident,
@@ -272,13 +443,13 @@ fn generate_sort_and_partition_impl(
             let order = attr.explicit_order.unwrap_or(*pos as u32);
             let (dir, null) = if attr.descending {
                 (
-                    quote! { ::iceberg::spec::SortDirection::Descending },
-                    quote! { ::iceberg::spec::NullOrder::Last },
+                    quote! { ::prestige::iceberg::SortDirection::Descending },
+                    quote! { ::prestige::iceberg::NullOrder::Last },
                 )
             } else {
                 (
-                    quote! { ::iceberg::spec::SortDirection::Ascending },
-                    quote! { ::iceberg::spec::NullOrder::First },
+                    quote! { ::prestige::iceberg::SortDirection::Ascending },
+                    quote! { ::prestige::iceberg::NullOrder::First },
                 )
             };
             quote! {
@@ -296,14 +467,16 @@ fn generate_sort_and_partition_impl(
         .iter()
         .map(|(field_name, transform)| {
             let transform_expr = match transform {
-                PartitionTransform::Identity => quote! { ::iceberg::spec::Transform::Identity },
-                PartitionTransform::Year => quote! { ::iceberg::spec::Transform::Year },
-                PartitionTransform::Month => quote! { ::iceberg::spec::Transform::Month },
-                PartitionTransform::Day => quote! { ::iceberg::spec::Transform::Day },
-                PartitionTransform::Hour => quote! { ::iceberg::spec::Transform::Hour },
-                PartitionTransform::Bucket(n) => quote! { ::iceberg::spec::Transform::Bucket(#n) },
+                PartitionTransform::Identity => quote! { ::prestige::iceberg::Transform::Identity },
+                PartitionTransform::Year => quote! { ::prestige::iceberg::Transform::Year },
+                PartitionTransform::Month => quote! { ::prestige::iceberg::Transform::Month },
+                PartitionTransform::Day => quote! { ::prestige::iceberg::Transform::Day },
+                PartitionTransform::Hour => quote! { ::prestige::iceberg::Transform::Hour },
+                PartitionTransform::Bucket(n) => {
+                    quote! { ::prestige::iceberg::Transform::Bucket(#n) }
+                }
                 PartitionTransform::Truncate(w) => {
-                    quote! { ::iceberg::spec::Transform::Truncate(#w) }
+                    quote! { ::prestige::iceberg::Transform::Truncate(#w) }
                 }
             };
             quote! {
@@ -582,10 +755,21 @@ pub fn derive_prestige_schema(input: TokenStream) -> TokenStream {
 
     let identifier_names = collect_identifier_field_names(fields);
 
+    let struct_attrs = match parse_struct_prestige_attrs(&input.attrs) {
+        Ok(attrs) => attrs,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
     let sort_and_partition = match generate_sort_and_partition_impl(name, fields) {
         Ok(tokens) => tokens,
         Err(err) => return err.to_compile_error().into(),
     };
+
+    let iceberg_schema_impl =
+        match generate_iceberg_schema_impl(name, &struct_attrs, &identifier_names, fields) {
+            Ok(tokens) => tokens,
+            Err(err) => return err.to_compile_error().into(),
+        };
 
     // Generate all implementations using helper functions
     let arrow_group = generate_arrow_group_impl(name, fields);
@@ -612,6 +796,9 @@ pub fn derive_prestige_schema(input: TokenStream) -> TokenStream {
 
         // Sort field and partition field definitions
         #sort_and_partition
+
+        // IcebergSchema trait implementation
+        #iceberg_schema_impl
 
         // ArrowReader implementation
         #arrow_reader

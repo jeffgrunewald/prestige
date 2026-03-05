@@ -1,10 +1,11 @@
-use crate::error::Result;
-use crate::traits::ArrowSchema;
+use crate::{error::Result, traits::ArrowSchema};
 use arrow::datatypes::SchemaRef;
-use iceberg::arrow::{arrow_schema_to_schema_auto_assign_ids, arrow_type_to_type};
-use iceberg::spec::{
-    NestedField, NestedFieldRef, NullOrder, Schema, SortDirection, SortField, SortOrder, Transform,
-    UnboundPartitionField, UnboundPartitionSpec,
+use iceberg::{
+    arrow::{arrow_schema_to_schema_auto_assign_ids, arrow_type_to_type},
+    spec::{
+        NestedField, NestedFieldRef, NullOrder, Schema, SortDirection, SortField, SortOrder,
+        Transform, UnboundPartitionField, UnboundPartitionSpec,
+    },
 };
 use std::collections::HashMap;
 
@@ -21,6 +22,18 @@ pub trait IcebergSchema: ArrowSchema {
 
     fn table_sort_order() -> Option<iceberg::spec::SortOrder> {
         None
+    }
+
+    fn default_table_name() -> Option<&'static str> {
+        None
+    }
+
+    fn default_namespace() -> Option<&'static [&'static str]> {
+        None
+    }
+
+    fn identifier_field_names() -> &'static [&'static str] {
+        &[]
     }
 }
 
