@@ -61,6 +61,7 @@ pub async fn create_table(
     schema: Schema,
 ) -> Result<Table> {
     let namespace = NamespaceIdent::from_strs(&config.namespace)?;
+    catalog.create_namespace_if_not_exists(&namespace).await?;
     let creation = build_table_creation(config, schema);
     let table = catalog.create_table(&namespace, creation).await?;
     Ok(table)
@@ -184,6 +185,8 @@ pub async fn ensure_table(
     identifier_field_names: &[&str],
 ) -> Result<EnsureTableResult> {
     let namespace = NamespaceIdent::from_strs(&config.namespace)?;
+    catalog.create_namespace_if_not_exists(&namespace).await?;
+
     let table_ident = TableIdent::new(namespace.clone(), config.name.clone());
 
     if !catalog.table_exists(&table_ident).await? {
