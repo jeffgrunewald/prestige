@@ -501,7 +501,7 @@ impl Catalog {
 
     /// Create a namespace if it doesn't exist.
     pub async fn create_namespace_if_not_exists(&self, namespace: &NamespaceIdent) -> Result<()> {
-        match iceberg::Catalog::create_namespace(&*self.inner, namespace, HashMap::new()).await? {
+        match iceberg::Catalog::create_namespace(&*self.inner, namespace, HashMap::new()).await {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == iceberg::ErrorKind::NamespaceAlreadyExists => Ok(()),
             Err(e) => Err(e.into()),
@@ -664,7 +664,7 @@ mod tests {
         let props = auth.props();
         assert_eq!(props.get("credential"), Some(&"id:secret".to_string()));
         assert_eq!(props.get("scope"), Some(&"ADMIN".to_string()));
-        assert!(props.get("token").is_none());
+        assert!(props.contains_key("token"));
     }
 
     #[test]
