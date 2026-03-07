@@ -79,7 +79,13 @@ pub async fn create_table_if_not_exists(
         return load_table(catalog, &config.namespace, &config.name).await;
     }
 
-    create_table(catalog, config, schema).await
+    match create_table(catalog, config, schema).await {
+        Ok(table) => Ok(table),
+        Err(crate::Error::Iceberg(ref e)) if super::catalog::is_already_exists_error(e) => {
+            load_table(catalog, &config.namespace, &config.name).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn load_table(catalog: &Catalog, namespace: &[String], name: &str) -> Result<Table> {
@@ -194,14 +200,19 @@ pub async fn ensure_table(
             arrow_schema,
             identifier_field_names,
         )?;
-        let table = create_table(catalog, config, iceberg_schema).await?;
-        info!(
-            table = %config.name,
-            columns = arrow_schema.fields().len(),
-            identifiers = ?identifier_field_names,
-            "created new iceberg table"
-        );
-        return Ok(EnsureTableResult::Created(table));
+        match create_table(catalog, config, iceberg_schema).await {
+            Ok(table) => {
+                info!(
+                    table = %config.name,
+                    columns = arrow_schema.fields().len(),
+                    identifiers = ?identifier_field_names,
+                    "created new iceberg table",
+                );
+                return Ok(EnsureTableResult::Created(table));
+            }
+            Err(crate::Error::Iceberg(ref e)) if super::catalog::is_already_exists_error(e) => {}
+            Err(e) => return Err(e),
+        }
     }
 
     let table = catalog.load_table(&table_ident).await?;

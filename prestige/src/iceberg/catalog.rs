@@ -503,7 +503,7 @@ impl Catalog {
     pub async fn create_namespace_if_not_exists(&self, namespace: &NamespaceIdent) -> Result<()> {
         match iceberg::Catalog::create_namespace(&*self.inner, namespace, HashMap::new()).await {
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == iceberg::ErrorKind::NamespaceAlreadyExists => Ok(()),
+            Err(e) if is_already_exists_error(&e) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -530,6 +530,20 @@ impl Catalog {
     pub(crate) async fn commit_table_request(&self, request: &CommitTableRequest) -> Result<()> {
         self.endpoint.commit_table(request).await
     }
+}
+
+/// Check whether an iceberg error indicates an "already exists conflict".
+///
+/// The iceberg-rust REST catalog (v0.8) maps HTTP 409 Conflict to
+/// `ErrorKind::Unexpected` for `create_namespace` and `create_table` instead
+/// of the semantically correct `NamespaceAlreadyExists` / `TableAlreadyExists`
+/// variants. We match the proper kind first, then fall back to detecting the
+/// `Unexpected` variant whose message contains `already exists`.
+pub(crate) fn is_already_exists_error(e: &iceberg::Error) -> bool {
+    matches!(
+        e.kind(),
+        iceberg::ErrorKind::NamespaceAlreadyExists | iceberg::ErrorKind::TableAlreadyExists
+    ) || (e.kind() == iceberg::ErrorKind::Unexpected && e.to_string().contains("already exists"))
 }
 
 impl AsRef<RestCatalog> for Catalog {
