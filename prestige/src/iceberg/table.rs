@@ -292,9 +292,14 @@ fn build_table_creation(config: &IcebergTableConfig, schema: Schema) -> TableCre
         properties.insert("write.parquet.compression-codec".to_string(), codec.clone());
     }
 
+    let location = config
+        .location
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}", config.namespace.join("/"), config.name));
+
     TableCreation::builder()
         .name(config.name.clone())
-        .location_opt(config.location.clone())
+        .location(location)
         .schema(schema)
         .partition_spec_opt(config.partition_spec.clone())
         .sort_order_opt(config.sort_order.clone())
@@ -318,6 +323,48 @@ mod tests {
 
         let creation = build_table_creation(&config, schema);
         assert_eq!(creation.name, "test_table");
+        assert_eq!(
+            creation.location.as_deref(),
+            Some("db/test_table"),
+            "location must be derived from namespace/name when not explicitly set",
+        );
+    }
+
+    #[test]
+    fn test_build_table_creation_derives_location_from_nested_namespace() {
+        let config = IcebergTableConfigBuilder::default()
+            .namespace(vec!["catalog".to_string(), "schema".to_string()])
+            .name("events".to_string())
+            .build()
+            .unwrap();
+
+        let schema = Schema::builder().with_fields(vec![]).build().unwrap();
+
+        let creation = build_table_creation(&config, schema);
+        assert_eq!(
+            creation.location.as_deref(),
+            Some("catalog/schema/events"),
+            "location must join all namespace parts with the table name",
+        );
+    }
+
+    #[test]
+    fn test_build_table_creation_explicit_location_takes_precedence() {
+        let config = IcebergTableConfigBuilder::default()
+            .namespace(vec!["db".to_string()])
+            .name("test_table".to_string())
+            .location(Some("s3://my-bucket/custom/path".to_string()))
+            .build()
+            .unwrap();
+
+        let schema = Schema::builder().with_fields(vec![]).build().unwrap();
+
+        let creation = build_table_creation(&config, schema);
+        assert_eq!(
+            creation.location.as_deref(),
+            Some("s3://my-bucket/custom/path"),
+            "explicit location must not be overridden by derived default",
+        );
     }
 
     #[test]

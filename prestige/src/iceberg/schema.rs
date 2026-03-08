@@ -124,6 +124,7 @@ pub fn build_sort_order(schema: &Schema, defs: &[SortFieldDef]) -> Result<SortOr
     sorted_defs.sort_by_key(|d| d.order);
 
     let mut builder = SortOrder::builder();
+    builder.with_order_id(1);
     for def in sorted_defs {
         let field_id = schema
             .field_by_name(def.name)
@@ -633,6 +634,10 @@ mod tests {
         assert_eq!(order.fields[0].direction, SortDirection::Ascending);
         assert_eq!(order.fields[0].null_order, NullOrder::First);
         assert_eq!(order.fields[0].transform, Transform::Identity);
+        assert_ne!(
+            order.order_id, 0,
+            "non-empty sort order must not use reserved unsorted order_id 0"
+        );
     }
 
     #[test]
@@ -661,6 +666,10 @@ mod tests {
         assert_eq!(order.fields[0].direction, SortDirection::Descending);
         assert_eq!(order.fields[1].source_id, 3); // name
         assert_eq!(order.fields[1].direction, SortDirection::Ascending);
+        assert_ne!(
+            order.order_id, 0,
+            "non-empty sort order must not use reserved unsorted order_id 0"
+        );
     }
 
     #[test]
