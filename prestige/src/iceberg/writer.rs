@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::{ArrowSchema, Error};
 use arrow::array::RecordBatch;
+use arrow::compute::cast;
 use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::table::Table;
@@ -58,10 +59,28 @@ pub async fn write_data_files_with_target_size(
     // Rebatch with the table's Arrow schema so columns carry iceberg field ID
     // metadata (PARQUET:field_id). Without this, the writer can't match batch
     // columns to the iceberg schema fields.
+    //
+    // Iceberg's type system lacks unsigned integers, so the table schema may
+    // use wider signed types (e.g. Int32) where the source data has unsigned
+    // types (e.g. UInt8). Cast columns whose types diverge.
     let table_arrow_schema = Arc::new(schema_to_arrow_schema(&schema)?);
     let batches: Vec<RecordBatch> = batches
         .into_iter()
-        .map(|b| RecordBatch::try_new(table_arrow_schema.clone(), b.columns().to_vec()))
+        .map(|b| {
+            let columns: Vec<_> = b
+                .columns()
+                .iter()
+                .zip(table_arrow_schema.fields())
+                .map(|(col, target_field)| {
+                    if col.data_type() == target_field.data_type() {
+                        Ok(col.clone())
+                    } else {
+                        cast(col, target_field.data_type()).map_err(arrow::error::ArrowError::from)
+                    }
+                })
+                .collect::<std::result::Result<_, _>>()?;
+            RecordBatch::try_new(table_arrow_schema.clone(), columns)
+        })
         .collect::<std::result::Result<_, _>>()?;
 
     let file_io = table.file_io().clone();

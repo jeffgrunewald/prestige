@@ -15,7 +15,7 @@ parquet = "57"
 quote = "1"
 proc-macro2 = "1"
 serde_arrow.workspace = true
-syn = "2"
+syn = { version = "2", features = ["full", "extra-traits"] }
 
 [features]
 chrono = ["dep:chrono"]

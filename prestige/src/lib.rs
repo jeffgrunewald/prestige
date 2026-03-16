@@ -28,6 +28,7 @@ pub mod file_source;
 pub mod file_upload;
 #[cfg(feature = "iceberg")]
 pub mod iceberg;
+pub mod serde_u8_array;
 mod settings;
 pub(crate) mod telemetry;
 pub mod traits;
@@ -45,8 +46,14 @@ pub use file_upload::{FileUpload, FileUploadServer};
 pub use settings::Settings;
 pub use traits::{ArrowSchema, ArrowSerialize, ParquetSerialize};
 
+// Re-export serde_bytes so users of #[prestige(as_binary)] don't need a direct dep.
+pub use serde_bytes;
+
 // Re-export derive macros from prestige-macros
-pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter, PrestigeSchema};
+pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter};
+
+// Re-export the attribute macro that auto-injects serde_bytes on as_binary fields.
+pub use prestige_macros::prestige_schema;
 
 /// Helper function to rebuild a parquet Type with OPTIONAL repetition and a new field name
 /// This is used by the derive macros to properly handle Option<T> fields

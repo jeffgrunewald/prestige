@@ -8,7 +8,7 @@ use iceberg::{
 };
 use iceberg_catalog_rest::CommitTableRequest;
 use std::{collections::HashMap, time::Duration};
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
     catalog::Catalog,
@@ -61,8 +61,35 @@ pub async fn create_table(
     schema: Schema,
 ) -> Result<Table> {
     let namespace = NamespaceIdent::from_strs(&config.namespace)?;
+    debug!(namespace = ?namespace, "creating namespace if not exists");
     catalog.create_namespace_if_not_exists(&namespace).await?;
+
     let creation = build_table_creation(config, schema);
+    debug!(
+        table_name = %creation.name,
+        location = ?creation.location,
+        partition_spec = ?creation.partition_spec,
+        sort_order = ?creation.sort_order,
+        properties = ?creation.properties,
+        "creating table with TableCreation"
+    );
+
+    // Serialize the equivalent CreateTableRequest to show the exact JSON that
+    // will be sent by iceberg-catalog-rest.
+    let simulated_request = serde_json::json!({
+        "name": creation.name,
+        "location": creation.location,
+        "schema": serde_json::to_value(&creation.schema).ok(),
+        "partition-spec": creation.partition_spec.as_ref().map(|s| serde_json::to_value(s).ok()),
+        "write-order": creation.sort_order.as_ref().map(|s| serde_json::to_value(s).ok()),
+        "stage-create": false,
+        "properties": &creation.properties,
+    });
+    debug!(
+        json = %serde_json::to_string_pretty(&simulated_request).unwrap_or_default(),
+        "simulated CreateTableRequest JSON"
+    );
+
     let table = catalog.create_table(&namespace, creation).await?;
     Ok(table)
 }
@@ -191,15 +218,29 @@ pub async fn ensure_table(
     identifier_field_names: &[&str],
 ) -> Result<EnsureTableResult> {
     let namespace = NamespaceIdent::from_strs(&config.namespace)?;
+    debug!(
+        ?namespace,
+        table = %config.name,
+        location = ?config.location,
+        "ensure_table: starting"
+    );
+
+    debug!(?namespace, "ensure_table: creating namespace if not exists");
     catalog.create_namespace_if_not_exists(&namespace).await?;
 
     let table_ident = TableIdent::new(namespace.clone(), config.name.clone());
 
+    debug!(table = %table_ident, "ensure_table: checking if table exists");
     if !catalog.table_exists(&table_ident).await? {
+        debug!(table = %table_ident, "ensure_table: table does not exist, creating");
         let iceberg_schema = super::schema::arrow_to_iceberg_schema_with_identifiers(
             arrow_schema,
             identifier_field_names,
         )?;
+        debug!(
+            schema = ?iceberg_schema,
+            "ensure_table: built iceberg schema from arrow"
+        );
         match create_table(catalog, config, iceberg_schema).await {
             Ok(table) => {
                 info!(
@@ -219,7 +260,13 @@ pub async fn ensure_table(
     let catalog_schema = table.metadata().current_schema();
 
     match reconcile_schema(arrow_schema, catalog_schema, identifier_field_names)? {
-        SchemaReconciliation::UpToDate => Ok(EnsureTableResult::UpToDate(table)),
+        SchemaReconciliation::UpToDate => {
+            info!(
+                table = %config.name,
+                "table schema is up to date, reusing existing table",
+            );
+            Ok(EnsureTableResult::UpToDate(table))
+        }
         SchemaReconciliation::Evolved {
             schema,
             columns_added,
@@ -292,14 +339,9 @@ fn build_table_creation(config: &IcebergTableConfig, schema: Schema) -> TableCre
         properties.insert("write.parquet.compression-codec".to_string(), codec.clone());
     }
 
-    let location = config
-        .location
-        .clone()
-        .unwrap_or_else(|| format!("{}/{}", config.namespace.join("/"), config.name));
-
     TableCreation::builder()
         .name(config.name.clone())
-        .location(location)
+        .location_opt(config.location.clone())
         .schema(schema)
         .partition_spec_opt(config.partition_spec.clone())
         .sort_order_opt(config.sort_order.clone())
@@ -324,27 +366,8 @@ mod tests {
         let creation = build_table_creation(&config, schema);
         assert_eq!(creation.name, "test_table");
         assert_eq!(
-            creation.location.as_deref(),
-            Some("db/test_table"),
-            "location must be derived from namespace/name when not explicitly set",
-        );
-    }
-
-    #[test]
-    fn test_build_table_creation_derives_location_from_nested_namespace() {
-        let config = IcebergTableConfigBuilder::default()
-            .namespace(vec!["catalog".to_string(), "schema".to_string()])
-            .name("events".to_string())
-            .build()
-            .unwrap();
-
-        let schema = Schema::builder().with_fields(vec![]).build().unwrap();
-
-        let creation = build_table_creation(&config, schema);
-        assert_eq!(
-            creation.location.as_deref(),
-            Some("catalog/schema/events"),
-            "location must join all namespace parts with the table name",
+            creation.location, None,
+            "location must be None when not explicitly set (catalog resolves from warehouse)",
         );
     }
 

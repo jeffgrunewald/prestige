@@ -1,11 +1,10 @@
 use crate::error::Result;
-use iceberg::table::Table;
-use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent, table::Table};
 use iceberg_catalog_rest::{CommitTableRequest, RestCatalog, RestCatalogBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -196,6 +195,34 @@ impl From<&crate::Settings> for CatalogConfigBuilder {
 #[derive(serde::Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// Token lifetime in seconds, used for proactive refresh.
+    expires_in: Option<u64>,
+}
+
+/// A cached OAuth2 token with its expiry instant.
+#[derive(Clone)]
+struct CachedToken {
+    access_token: String,
+    /// Proactive refresh deadline (75% of the original TTL).
+    refresh_at: Option<tokio::time::Instant>,
+}
+
+impl CachedToken {
+    fn from_response(resp: TokenResponse) -> Self {
+        let refresh_at = resp.expires_in.map(|secs| {
+            let refresh_secs = (secs as f64 * 0.75) as u64;
+            tokio::time::Instant::now() + Duration::from_secs(refresh_secs.max(1))
+        });
+        Self {
+            access_token: resp.access_token,
+            refresh_at,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.refresh_at
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -215,7 +242,7 @@ enum EndpointAuth {
         token_endpoint: String,
         credential: String,
         extra_params: HashMap<String, String>,
-        cached_token: Arc<Mutex<Option<String>>>,
+        cached_token: Arc<Mutex<Option<CachedToken>>>,
     },
 }
 
@@ -256,7 +283,7 @@ impl EndpointAuth {
         token_endpoint: &str,
         credential: &str,
         extra_params: &HashMap<String, String>,
-    ) -> Result<String> {
+    ) -> Result<CachedToken> {
         let (client_id, client_secret) = credential.split_once(':').unwrap_or((credential, ""));
 
         let mut params = vec![
@@ -285,13 +312,16 @@ impl EndpointAuth {
             )));
         }
 
-        response
-            .json::<TokenResponse>()
-            .await
-            .map(|r| r.access_token)
-            .map_err(|e| {
-                crate::Error::CatalogHttp(format!("failed to parse OAuth2 token response: {e}"))
-            })
+        let token_response: TokenResponse = response.json().await.map_err(|e| {
+            crate::Error::CatalogHttp(format!("failed to parse OAuth2 token response: {e}"))
+        })?;
+
+        debug!(
+            expires_in = ?token_response.expires_in,
+            "fetched OAuth2 token"
+        );
+
+        Ok(CachedToken::from_response(token_response))
     }
 
     async fn get_token(&self, client: &reqwest::Client) -> Result<Option<String>> {
@@ -305,13 +335,17 @@ impl EndpointAuth {
                 cached_token,
             } => {
                 let mut guard = cached_token.lock().await;
-                if let Some(ref token) = *guard {
-                    return Ok(Some(token.clone()));
+                if let Some(ref cached) = *guard {
+                    if !cached.is_expired() {
+                        return Ok(Some(cached.access_token.clone()));
+                    }
+                    debug!("OAuth2 token approaching expiry, proactively refreshing");
                 }
-                let token =
+                let cached =
                     Self::fetch_token(client, token_endpoint, credential, extra_params).await?;
-                *guard = Some(token.clone());
-                Ok(Some(token))
+                let access_token = cached.access_token.clone();
+                *guard = Some(cached);
+                Ok(Some(access_token))
             }
         }
     }
@@ -418,6 +452,7 @@ impl RestEndpoint {
 pub struct Catalog {
     inner: Arc<RestCatalog>,
     endpoint: RestEndpoint,
+    config: Arc<CatalogConfig>,
 }
 
 impl Catalog {
@@ -441,7 +476,23 @@ impl Catalog {
         Ok(Self {
             inner: Arc::new(catalog),
             endpoint,
+            config: Arc::new(config.clone()),
         })
+    }
+
+    /// Rebuild the inner `RestCatalog` with a fresh OAuth2 token.
+    ///
+    /// `iceberg-catalog-rest` 0.8.0 caches the OAuth2 token internally with no
+    /// automatic refresh. For indefinitely-running applications, call this when
+    /// catalog operations start failing with authentication errors to obtain a
+    /// new token without restarting the process.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        debug!("catalog: reconnecting with fresh credentials");
+        let fresh = Self::connect(&self.config).await?;
+        self.inner = fresh.inner;
+        self.endpoint = fresh.endpoint;
+        debug!("catalog: reconnected successfully");
+        Ok(())
     }
 
     async fn resolve_endpoint(config: &CatalogConfig) -> Result<RestEndpoint> {
@@ -490,21 +541,45 @@ impl Catalog {
     }
 
     /// Check if a table exists.
+    ///
+    /// Uses `load_table` (GET) instead of the Iceberg REST `HEAD` endpoint because
+    /// Polaris 1.3.0-incubating returns 400 for HEAD on existing tables.
     pub async fn table_exists(&self, table_ident: &TableIdent) -> Result<bool> {
-        Ok(iceberg::Catalog::table_exists(&*self.inner, table_ident).await?)
+        match iceberg::Catalog::load_table(&*self.inner, table_ident).await {
+            Ok(_) => {
+                debug!(table = %table_ident, exists = true, "catalog: table_exists result");
+                Ok(true)
+            }
+            Err(e) if is_not_found_error(&e) => {
+                debug!(table = %table_ident, exists = false, "catalog: table_exists result");
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Load a table from the catalog.
     pub async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
-        Ok(iceberg::Catalog::load_table(&*self.inner, table_ident).await?)
+        let table = iceberg::Catalog::load_table(&*self.inner, table_ident).await?;
+        debug!(table = %table_ident, "catalog: table loaded");
+        Ok(table)
     }
 
     /// Create a namespace if it doesn't exist.
     pub async fn create_namespace_if_not_exists(&self, namespace: &NamespaceIdent) -> Result<()> {
         match iceberg::Catalog::create_namespace(&*self.inner, namespace, HashMap::new()).await {
-            Ok(_) => Ok(()),
-            Err(e) if is_already_exists_error(&e) => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(_) => {
+                debug!(namespace = ?namespace, "catalog: namespace created");
+                Ok(())
+            }
+            Err(e) if is_already_exists_error(&e) => {
+                debug!(namespace = ?namespace, "catalog: namespace already exists");
+                Ok(())
+            }
+            Err(e) => {
+                debug!(namespace = ?namespace, err = %e, "catalog: namespace creation failed");
+                Err(e.into())
+            }
         }
     }
 
@@ -514,7 +589,24 @@ impl Catalog {
         namespace: &NamespaceIdent,
         creation: iceberg::TableCreation,
     ) -> Result<Table> {
-        Ok(iceberg::Catalog::create_table(&*self.inner, namespace, creation).await?)
+        debug!(
+            namespace = ?namespace,
+            table = %creation.name,
+            location = ?creation.location,
+            has_partition_spec = creation.partition_spec.is_some(),
+            has_sort_order = creation.sort_order.is_some(),
+            "catalog: creating table"
+        );
+        match iceberg::Catalog::create_table(&*self.inner, namespace, creation).await {
+            Ok(table) => {
+                debug!(namespace = ?namespace, "catalog: table created successfully");
+                Ok(table)
+            }
+            Err(e) => {
+                debug!(namespace = ?namespace, err = %e, "catalog: table creation failed");
+                Err(e.into())
+            }
+        }
     }
 
     /// Get an `Arc<dyn iceberg::Catalog>` for components that need the trait object
@@ -539,6 +631,17 @@ impl Catalog {
 /// of the semantically correct `NamespaceAlreadyExists` / `TableAlreadyExists`
 /// variants. We match the proper kind first, then fall back to detecting the
 /// `Unexpected` variant whose message contains `already exists`.
+/// Check whether an iceberg error indicates a "not found" condition.
+///
+/// Polaris may return this when the catalog knows about a table but the
+/// underlying metadata files in S3 are missing (e.g. after storage was wiped).
+/// The `NotFoundException` message is buried in the error context, so we
+/// check `to_string()` which includes the full context chain.
+fn is_not_found_error(e: &iceberg::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("does not exist") || msg.contains("NotFoundException")
+}
+
 pub(crate) fn is_already_exists_error(e: &iceberg::Error) -> bool {
     matches!(
         e.kind(),
@@ -678,7 +781,10 @@ mod tests {
         let props = auth.props();
         assert_eq!(props.get("credential"), Some(&"id:secret".to_string()));
         assert_eq!(props.get("scope"), Some(&"ADMIN".to_string()));
-        assert!(props.contains_key("token"));
+        assert!(
+            !props.contains_key("token"),
+            "token=None should not be included in props"
+        );
     }
 
     #[test]
@@ -697,5 +803,33 @@ mod tests {
         );
         assert_eq!(props.get("s3.access-key-id"), Some(&"AKID".to_string()));
         assert_eq!(props.get("s3.path-style-access"), Some(&"true".to_string()));
+    }
+
+    #[test]
+    fn test_cached_token_not_expired_when_no_ttl() {
+        let token = CachedToken::from_response(TokenResponse {
+            access_token: "tok".into(),
+            expires_in: None,
+        });
+        assert!(!token.is_expired());
+    }
+
+    #[test]
+    fn test_cached_token_not_expired_within_ttl() {
+        let token = CachedToken::from_response(TokenResponse {
+            access_token: "tok".into(),
+            expires_in: Some(3600),
+        });
+        // Just created — well within the 75% refresh window (2700s)
+        assert!(!token.is_expired());
+    }
+
+    #[test]
+    fn test_cached_token_expired_past_refresh_deadline() {
+        let token = CachedToken {
+            access_token: "tok".into(),
+            refresh_at: Some(tokio::time::Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(token.is_expired());
     }
 }

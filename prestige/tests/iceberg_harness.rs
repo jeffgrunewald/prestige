@@ -17,12 +17,10 @@
 #![cfg(feature = "iceberg-test-harness")]
 
 use futures::TryStreamExt;
-use prestige::PrestigeSchema;
 use prestige::iceberg::{
     self, IcebergTableConfigBuilder, IcebergTestHarness, Reference, scan_since_snapshot,
     scan_table, scan_with_filter, write_and_commit,
 };
-use serde::{Deserialize, Serialize};
 use std::pin::pin;
 
 /// Skip the test if ICEBERG_TEST env var is not set.
@@ -34,7 +32,8 @@ fn require_iceberg_env() -> bool {
 // Test struct — SensorReading
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, PrestigeSchema)]
+#[prestige::prestige_schema]
+#[derive(Debug, Clone, PartialEq)]
 struct SensorReading {
     #[prestige(identifier)]
     sensor_id: String,

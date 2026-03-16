@@ -554,6 +554,12 @@ impl<T: Serialize> IcebergSink<T> {
             return Ok(Vec::new());
         }
 
+        // Reload the table before writing data files to ensure the FileIO
+        // instance carries fresh vended S3 credentials from the catalog.
+        // Without this, long-running sinks would use stale credentials from
+        // the previous commit cycle.
+        self.reload_table().await?;
+
         let data_files =
             super::writer::write_data_files(&self.table, batches, Some(self.compression)).await?;
 
@@ -562,44 +568,44 @@ impl<T: Serialize> IcebergSink<T> {
             .map(|f| f.file_path().to_string())
             .collect();
 
-        if let Some(ref branch_name) = self.wap_branch {
+        if let Some(branch_name) = self.wap_branch.clone() {
             // WAP commit path: write to audit branch.
             if self
                 .table
                 .metadata()
-                .snapshot_for_ref(branch_name)
+                .snapshot_for_ref(&branch_name)
                 .is_none()
             {
-                super::branch::create_branch(&self.catalog, &self.table, branch_name).await?;
-                self.table = self.catalog.load_table(self.table.identifier()).await?;
+                super::branch::create_branch(&self.catalog, &self.table, &branch_name).await?;
+                self.reload_table().await?;
             }
 
             let wap_id = Uuid::now_v7().to_string();
             super::branch::commit_to_branch(
                 &self.catalog,
                 &self.table,
-                branch_name,
+                &branch_name,
                 data_files,
                 &wap_id,
             )
             .await?;
 
-            self.table = self.catalog.load_table(self.table.identifier()).await?;
+            self.reload_table().await?;
 
             if self.auto_publish {
-                super::branch::publish_branch(&self.catalog, &self.table, branch_name).await?;
-                self.table = self.catalog.load_table(self.table.identifier()).await?;
+                super::branch::publish_branch(&self.catalog, &self.table, &branch_name).await?;
+                self.reload_table().await?;
                 info!(
                     label = self.label,
                     files = manifest.len(),
-                    branch = branch_name,
+                    branch = %branch_name,
                     "committed and published iceberg WAP snapshot"
                 );
             } else {
                 info!(
                     label = self.label,
                     files = manifest.len(),
-                    branch = branch_name,
+                    branch = %branch_name,
                     "committed iceberg WAP snapshot (awaiting publish)"
                 );
             }
@@ -632,22 +638,41 @@ impl<T: Serialize> IcebergSink<T> {
     }
 
     async fn publish_wap(&mut self) -> Result {
-        let Some(ref branch_name) = self.wap_branch else {
-            return Err(crate::Error::Branch(
-                "cannot publish: WAP not enabled on this sink".into(),
-            ));
-        };
+        let branch_name = self.wap_branch.clone().ok_or_else(|| {
+            crate::Error::Branch("cannot publish: WAP not enabled on this sink".into())
+        })?;
 
-        super::branch::publish_branch(&self.catalog, &self.table, branch_name).await?;
-        self.table = self.catalog.load_table(self.table.identifier()).await?;
+        super::branch::publish_branch(&self.catalog, &self.table, &branch_name).await?;
+        self.reload_table().await?;
 
         info!(
             label = self.label,
-            branch = branch_name,
+            branch = %branch_name,
             "published WAP branch to main"
         );
 
         Ok(())
+    }
+
+    /// Reload the table, reconnecting the catalog if the first attempt fails
+    /// with an authentication error (expired internal OAuth2 token).
+    async fn reload_table(&mut self) -> Result {
+        match self.catalog.load_table(self.table.identifier()).await {
+            Ok(table) => {
+                self.table = table;
+                Ok(())
+            }
+            Err(first_err) => {
+                debug!(
+                    label = self.label,
+                    err = %first_err,
+                    "table reload failed, attempting catalog reconnect"
+                );
+                self.catalog.reconnect().await?;
+                self.table = self.catalog.load_table(self.table.identifier()).await?;
+                Ok(())
+            }
+        }
     }
 
     async fn rollback(&mut self) -> Result<IcebergFileManifest> {

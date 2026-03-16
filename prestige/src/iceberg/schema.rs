@@ -159,6 +159,12 @@ pub fn build_partition_spec(
     schema: &Schema,
     defs: &[PartitionFieldDef],
 ) -> Result<UnboundPartitionSpec> {
+    // Partition field IDs start at 1000 per the Iceberg spec convention
+    // (UNPARTITIONED_LAST_ASSIGNED_ID = 999, first real field = 1000).
+    // We assign them explicitly because iceberg-rust 0.8 serializes
+    // `None` as JSON `null` (missing `skip_serializing_if`), which
+    // Polaris rejects.
+    let mut next_field_id: i32 = 1000;
     let mut fields = Vec::with_capacity(defs.len());
     for def in defs {
         let source_id = schema
@@ -181,13 +187,16 @@ pub fn build_partition_spec(
         fields.push(
             UnboundPartitionField::builder()
                 .source_id(source_id)
+                .field_id(next_field_id)
                 .name(partition_name)
                 .transform(def.transform)
                 .build(),
         );
+        next_field_id += 1;
     }
 
     let spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
         .add_partition_fields(fields)?
         .build();
     Ok(spec)
@@ -708,6 +717,16 @@ mod tests {
         assert_eq!(spec.fields()[0].source_id, 4);
         assert_eq!(spec.fields()[0].name, "region");
         assert_eq!(spec.fields()[0].transform, Transform::Identity);
+        assert_eq!(
+            spec.fields()[0].field_id,
+            Some(1000),
+            "partition field IDs must start at 1000"
+        );
+        assert_eq!(
+            spec.spec_id(),
+            Some(0),
+            "initial partition spec must have spec_id 0"
+        );
     }
 
     #[test]
@@ -769,6 +788,16 @@ mod tests {
         assert_eq!(spec.fields().len(), 2);
         assert_eq!(spec.fields()[0].name, "timestamp_day");
         assert_eq!(spec.fields()[1].name, "region_bucket_8");
+        assert_eq!(
+            spec.fields()[0].field_id,
+            Some(1000),
+            "first partition field ID must be 1000"
+        );
+        assert_eq!(
+            spec.fields()[1].field_id,
+            Some(1001),
+            "second partition field ID must be 1001"
+        );
     }
 
     #[test]

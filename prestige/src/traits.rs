@@ -13,26 +13,6 @@ pub trait ArrowSchema {
     fn arrow_schema() -> arrow::datatypes::SchemaRef;
 }
 
-// Newtype wrapper for Vec<u8> to handle it as binary data
-#[derive(Clone, Debug, PartialEq)]
-pub struct BinaryData(pub Vec<u8>);
-
-impl ParquetSerialize for BinaryData {
-    fn parquet_schema_element() -> parquet::schema::types::Type {
-        use parquet::schema::types::Type;
-        Type::primitive_type_builder("field", parquet::basic::Type::BYTE_ARRAY)
-            .with_repetition(parquet::basic::Repetition::REQUIRED)
-            .build()
-            .expect("Failed to build parquet schema element")
-    }
-}
-
-impl ArrowSerialize for BinaryData {
-    fn arrow_data_type() -> arrow::datatypes::DataType {
-        arrow::datatypes::DataType::Binary
-    }
-}
-
 macro_rules! impl_parquet_serialize {
     ($rust_type:ty, $physical_type:expr, $logical_type:expr) => {
         impl ParquetSerialize for $rust_type {
@@ -140,23 +120,51 @@ impl_parquet_serialize!(
 );
 impl_arrow_serialize!(String, arrow::datatypes::DataType::Utf8);
 
-// Fixed-size byte array support - enables use as HashMap keys and in collections
-// Special handling for [u8; N] exists in macros for struct fields, but we need
-// trait implementations for use in generic contexts like HashMap<[u8; N], V>
+// Fixed-size byte array support.
+//
+// By default, [u8; N] maps to FixedSizeList(N, UInt8) — the structural
+// representation as a list of integers. Use `#[prestige(as_binary)]` on struct
+// fields to opt into FixedSizeBinary(N) encoding with automatic serde_bytes.
 impl<const N: usize> ParquetSerialize for [u8; N] {
     fn parquet_schema_element() -> parquet::schema::types::Type {
+        use parquet::basic::{LogicalType, Repetition};
         use parquet::schema::types::Type;
-        Type::primitive_type_builder("field", parquet::basic::Type::FIXED_LEN_BYTE_ARRAY)
-            .with_repetition(parquet::basic::Repetition::REQUIRED)
-            .with_length(N as i32)
+        use std::sync::Arc;
+
+        let element = Arc::new(
+            Type::primitive_type_builder("element", parquet::basic::Type::INT32)
+                .with_logical_type(Some(LogicalType::Integer {
+                    bit_width: 8,
+                    is_signed: false,
+                }))
+                .with_repetition(Repetition::OPTIONAL)
+                .build()
+                .expect("Failed to build element type"),
+        );
+
+        let list_group = Type::group_type_builder("list")
+            .with_repetition(Repetition::REPEATED)
+            .with_fields(vec![element])
             .build()
-            .expect("Failed to build parquet schema element")
+            .expect("Failed to build list wrapper group");
+
+        Type::group_type_builder("field")
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::List))
+            .with_fields(vec![Arc::new(list_group)])
+            .build()
+            .expect("Failed to build parquet LIST schema element")
     }
 }
 
 impl<const N: usize> ArrowSerialize for [u8; N] {
     fn arrow_data_type() -> arrow::datatypes::DataType {
-        arrow::datatypes::DataType::FixedSizeBinary(N as i32)
+        // Use variable-length List(UInt8) rather than FixedSizeList because serde_arrow
+        // doesn't support deserialize_tuple for FixedSizeList. serde serializes [T; N] as
+        // a tuple, and serde_arrow can map that to/from a List column.
+        arrow::datatypes::DataType::List(arrow::datatypes::FieldRef::new(
+            arrow::datatypes::Field::new("item", arrow::datatypes::DataType::UInt8, true),
+        ))
     }
 }
 

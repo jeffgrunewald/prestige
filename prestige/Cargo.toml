@@ -33,6 +33,7 @@ retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde.workspace = true
+serde_bytes = "0"
 serde_arrow.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -46,7 +47,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-serde_bytes = "0"
 tempfile.workspace = true
 tokio-util = "0"
 uuid = { version = "1", features = ["v4"] }

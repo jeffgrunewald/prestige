@@ -174,7 +174,7 @@ impl IcebergTestHarness {
 
 /// Marker trait for types that expose `identifier_field_names()`.
 ///
-/// Implemented automatically by `#[derive(PrestigeSchema)]` when any field
+/// Implemented automatically by `#[prestige::prestige_schema]` when any field
 /// is annotated with `#[prestige(identifier)]`.
 pub trait HasIdentifierFields {
     fn identifier_field_names() -> &'static [&'static str];

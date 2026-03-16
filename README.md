@@ -24,10 +24,10 @@ Prestige is organized into several key components:
 A managed actor that writes Rust types to Parquet files with automatic batching and rotation.
 
 ```rust
-use prestige::{ParquetSinkBuilder, PrestigeSchema};
-use serde::{Deserialize, Serialize};
+use prestige::ParquetSinkBuilder;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PrestigeSchema)]
+#[prestige::prestige_schema]
+#[derive(Debug, Clone)]
 struct SensorData {
     timestamp: u64,
     sensor_id: String,
@@ -115,21 +115,23 @@ while let Some(file_meta) = file_stream.recv().await {
 }
 ```
 
-### Schema Derive Macros
+### Schema Attribute Macro
 
-The `PrestigeSchema` derive macro automatically generates all necessary schema and serialization code:
+The `#[prestige::prestige_schema]` attribute macro automatically generates all necessary schema and serialization code. It also auto-injects `Serialize` and `Deserialize` derives if not already present.
 
 ```rust
-use prestige::PrestigeSchema;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PrestigeSchema)]
+#[prestige::prestige_schema]
+#[derive(Debug, Clone)]
 struct MyData {
     id: u64,
     name: String,
     value: f64,
     optional_field: Option<i32>,
-    binary_data: [u8; 16],  // Automatically mapped to FixedSizeBinary
+    raw_bytes: [u8; 16],             // Default: List(UInt8) — structural representation
+    #[prestige(as_binary)]
+    binary_data: [u8; 16],           // Opt-in: FixedSizeBinary(16)
+    #[prestige(as_binary)]
+    payload: Vec<u8>,                // Opt-in: Binary
 }
 
 // Generated methods:
@@ -139,9 +141,7 @@ struct MyData {
 // - from_arrow_reader() / write_arrow_file() / write_arrow_stream()
 ```
 
-**Important**: Types using `PrestigeSchema` **must** implement `serde::Serialize` and `serde::Deserialize` because prestige uses `serde_arrow` for data transformation between Rust types and Arrow arrays. These traits should be derived before `PrestigeSchema`.
-
-Individual derive macros are also available:
+Individual derive macros are also available for advanced use cases:
 - `#[derive(ArrowGroup)]` - Schema generation only
 - `#[derive(ArrowReader)]` - Reading from Arrow/Parquet (requires `Deserialize`)
 - `#[derive(ArrowWriter)]` - Writing to Arrow/Parquet (requires `Serialize`)
@@ -149,11 +149,11 @@ Individual derive macros are also available:
 ## Complete Example: Data Pipeline
 
 ```rust
-use prestige::{ParquetSinkBuilder, FilePollerConfigBuilder, PrestigeSchema};
-use serde::{Deserialize, Serialize};
+use prestige::{ParquetSinkBuilder, FilePollerConfigBuilder};
 use super_visor::ManagedProc;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PrestigeSchema)]
+#[prestige::prestige_schema]
+#[derive(Debug, Clone)]
 struct Event {
     timestamp: u64,
     event_type: String,
