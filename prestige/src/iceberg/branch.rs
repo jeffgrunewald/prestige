@@ -1,15 +1,19 @@
-use crate::error::Result;
-use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestFile, ManifestListWriter,
-    ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Summary,
+use std::collections::HashMap;
+
+use iceberg::{
+    TableIdent, TableRequirement, TableUpdate,
+    spec::{
+        DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestFile, ManifestListWriter,
+        ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
+        SnapshotSummaryCollector, Summary,
+    },
+    table::Table,
 };
-use iceberg::table::Table;
-use iceberg::{TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::CommitTableRequest;
 use uuid::Uuid;
 
 use super::catalog::Catalog;
+use crate::error::Result;
 
 pub(crate) const WAP_ENABLED_PROPERTY: &str = "write.wap.enabled";
 pub(crate) const WAP_ID_KEY: &str = "wap.id";
@@ -59,6 +63,7 @@ pub(crate) async fn commit_to_branch(
     branch_name: &str,
     data_files: Vec<DataFile>,
     wap_id: &str,
+    snapshot_properties: Option<HashMap<String, String>>,
 ) -> Result<()> {
     validate_branch_name(branch_name)?;
 
@@ -83,6 +88,9 @@ pub(crate) async fn commit_to_branch(
     }
     let mut additional_properties = summary_collector.build();
     additional_properties.insert(WAP_ID_KEY.to_string(), wap_id.to_string());
+    if let Some(props) = snapshot_properties {
+        additional_properties.extend(props);
+    }
     let summary = Summary {
         operation: Operation::Append,
         additional_properties,

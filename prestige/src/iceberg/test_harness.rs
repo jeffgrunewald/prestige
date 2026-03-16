@@ -1,15 +1,19 @@
-use crate::ArrowSchema;
-use crate::error::Result;
-use crate::iceberg::catalog::{AuthConfig, Catalog, CatalogConfig, S3Config};
-use crate::iceberg::sink::{BoxedDataWriter, DataWriter, IntoBoxedDataWriter};
 use async_trait::async_trait;
 use derive_builder::Builder;
-use iceberg::NamespaceIdent;
-use iceberg::table::Table;
+use iceberg::{NamespaceIdent, table::Table};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::info;
 use uuid::Uuid;
+
+use crate::{
+    ArrowSchema,
+    error::Result,
+    iceberg::{
+        catalog::{AuthConfig, Catalog, CatalogConfig, S3Config},
+        sink::{BoxedDataWriter, DataWriter, IntoBoxedDataWriter},
+    },
+};
 
 const DEFAULT_NAMESPACE: &str = "default";
 

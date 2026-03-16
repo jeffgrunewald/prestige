@@ -1,28 +1,43 @@
-use crate::error::Result;
-use arrow::array::RecordBatch;
+use std::{
+    collections::{HashMap, HashSet},
+    pin::pin,
+    sync::Arc,
+    time::Duration,
+};
+
+use arrow::{
+    array::RecordBatch,
+    compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take},
+    datatypes::SchemaRef,
+};
 use arrow_row::{RowConverter, SortField};
 use arrow_select::filter::filter_record_batch;
 use derive_builder::Builder;
 use futures::TryStreamExt;
-use iceberg::arrow::ArrowReaderBuilder;
-use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestListWriter,
-    ManifestWriterBuilder, Operation, Snapshot, SnapshotReference, SnapshotRetention,
-    SnapshotSummaryCollector, Struct, Summary,
+use iceberg::{
+    TableRequirement, TableUpdate,
+    arrow::ArrowReaderBuilder,
+    arrow::schema_to_arrow_schema,
+    spec::{
+        DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestFile, ManifestListWriter,
+        ManifestWriterBuilder, NullOrder, Operation, Snapshot, SnapshotReference,
+        SnapshotRetention, SnapshotSummaryCollector, SortDirection, Struct, Summary, Transform,
+    },
+    table::Table,
 };
-use iceberg::table::Table;
-use iceberg::{TableRequirement, TableUpdate};
 use iceberg_catalog_rest::CommitTableRequest;
 use parquet::basic::Compression;
-use std::collections::{HashMap, HashSet};
-use std::pin::pin;
-use tracing::info;
+use super_visor::{ManagedProc, ShutdownSignal};
+use tokio::time;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::catalog::Catalog;
+use crate::error::Result;
 
 const DEFAULT_TARGET_FILE_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MIN_FILES_TO_COMPACT: usize = 5;
+const MAX_COMMIT_RETRIES: usize = 3;
 
 #[derive(Builder)]
 #[builder(setter(into))]
@@ -62,10 +77,9 @@ impl IcebergCompactorConfig {
     ///
     /// The commit marks old data files as DELETED and adds new compacted files as
     /// ADDED in a single snapshot, so readers never see duplicated data.
-    pub async fn execute(self) -> Result<IcebergCompactionResult> {
-        let metadata = self.table.metadata();
-        let current_snapshot = match metadata.current_snapshot() {
-            Some(snap) => snap,
+    pub async fn execute(mut self) -> Result<IcebergCompactionResult> {
+        let current_snapshot_id = match self.table.metadata().current_snapshot() {
+            Some(snap) => snap.snapshot_id(),
             None => {
                 return Ok(IcebergCompactionResult {
                     files_read: 0,
@@ -79,6 +93,12 @@ impl IcebergCompactorConfig {
             }
         };
 
+        let current_snapshot = self
+            .table
+            .metadata()
+            .snapshot_by_id(current_snapshot_id)
+            .expect("snapshot just resolved");
+
         // Collect all alive manifest entries from the current snapshot.
         // We need the full ManifestEntry (with sequence numbers) so we can
         // mark them as DELETED in the rewrite commit.
@@ -90,7 +110,8 @@ impl IcebergCompactorConfig {
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
             for entry in manifest.entries() {
-                if entry.is_alive() {
+                if entry.is_alive() && entry.content_type() == iceberg::spec::DataContentType::Data
+                {
                     old_entries.push(OldFileEntry {
                         data_file: entry.data_file.clone(),
                         sequence_number: entry.sequence_number.unwrap_or(0),
@@ -159,7 +180,16 @@ impl IcebergCompactorConfig {
         let stream = reader.read(Box::pin(filtered_tasks))?;
         let mut pinned = pin!(stream);
 
-        let mut batches: Vec<RecordBatch> = Vec::new();
+        // Stream batches through a sorting writer instead of accumulating
+        // everything in memory. Each output file is sorted according to the
+        // table's sort order, and memory usage is bounded to roughly one
+        // target-sized file per partition at a time.
+        let mut writer = StreamingCompactionWriter::new(
+            &self.table,
+            Some(self.compression),
+            self.target_file_size_bytes,
+        )?;
+
         let mut total_records: usize = 0;
         let mut duplicates_eliminated: usize = 0;
 
@@ -170,18 +200,20 @@ impl IcebergCompactorConfig {
                 total_records += batch.num_rows();
                 let filtered = dedup.add_batch(&batch)?;
                 if filtered.num_rows() > 0 {
-                    batches.push(filtered);
+                    writer.write(filtered).await?;
                 }
             }
             duplicates_eliminated = dedup.duplicates_eliminated;
         } else {
             while let Some(batch) = pinned.try_next().await? {
                 total_records += batch.num_rows();
-                batches.push(batch);
+                writer.write(batch).await?;
             }
         }
 
-        if batches.is_empty() {
+        let new_data_files = writer.close().await?;
+
+        if new_data_files.is_empty() {
             return Ok(IcebergCompactionResult {
                 files_read,
                 files_written: 0,
@@ -193,27 +225,93 @@ impl IcebergCompactorConfig {
             });
         }
 
-        // Write new compacted data files (FanoutWriter handles partition routing).
-        let new_data_files = super::writer::write_data_files_with_target_size(
-            &self.table,
-            batches,
-            Some(self.compression),
-            Some(self.target_file_size_bytes),
-        )
-        .await?;
-
         let files_written = new_data_files.len();
         let bytes_after: u64 = new_data_files.iter().map(|f| f.file_size_in_bytes()).sum();
         let records_consolidated = total_records - duplicates_eliminated;
 
         // Commit as an atomic rewrite: delete old files + add new files.
-        // Only the qualifying partition groups are affected.
-        self.commit_rewrite(
-            current_snapshot.snapshot_id(),
-            &compact_entries,
-            new_data_files,
-        )
-        .await?;
+        // Retry on commit conflict — a concurrent write may have advanced the
+        // snapshot between our metadata read and commit. The compacted data is
+        // still valid; only the parent snapshot reference needs updating.
+        // Paths of files being compacted — used to verify presence on retry.
+        let compacted_file_paths: HashSet<String> = compact_entries
+            .iter()
+            .map(|e| e.data_file.file_path().to_string())
+            .collect();
+
+        let mut last_err = None;
+        for attempt in 0..=MAX_COMMIT_RETRIES {
+            if attempt > 0 {
+                // Reload table to get updated parent snapshot ID and fresh
+                // sequence numbers for the entries we're deleting.
+                let reloaded = self.catalog.load_table(self.table.identifier()).await?;
+                self.table = reloaded;
+
+                let Some(snap) = self.table.metadata().current_snapshot() else {
+                    return Err(crate::Error::Branch(
+                        "table has no current snapshot after reload during compaction retry".into(),
+                    ));
+                };
+
+                // Re-collect entries from the reloaded table so sequence numbers
+                // match the current manifest state.
+                let ml = snap
+                    .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+                    .await?;
+                compact_entries.clear();
+                for mf in ml.entries() {
+                    let m = mf.load_manifest(self.table.file_io()).await?;
+                    for entry in m.entries() {
+                        if entry.is_alive()
+                            && entry.content_type() == iceberg::spec::DataContentType::Data
+                            && compacted_file_paths.contains(entry.data_file.file_path())
+                        {
+                            compact_entries.push(OldFileEntry {
+                                data_file: entry.data_file.clone(),
+                                sequence_number: entry.sequence_number.unwrap_or(0),
+                                file_sequence_number: entry.file_sequence_number,
+                            });
+                        }
+                    }
+                }
+
+                if compact_entries.len() != compacted_file_paths.len() {
+                    return Err(crate::Error::Branch(
+                        "compaction files no longer present after concurrent write, aborting"
+                            .into(),
+                    ));
+                }
+            }
+
+            let parent_id = self
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|s| s.snapshot_id())
+                .unwrap_or(current_snapshot_id);
+
+            match self
+                .commit_rewrite(parent_id, &compact_entries, new_data_files.clone())
+                .await
+            {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(err) if is_commit_conflict(&err) && attempt < MAX_COMMIT_RETRIES => {
+                    warn!(
+                        attempt = attempt + 1,
+                        max = MAX_COMMIT_RETRIES,
+                        "compaction commit conflict, retrying with updated snapshot"
+                    );
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
 
         info!(
             files_read,
@@ -318,7 +416,68 @@ impl IcebergCompactorConfig {
         }
         let add_manifest = add_writer.write_manifest_file().await?;
 
-        // Write manifest list containing both manifests
+        // Carry forward surviving manifests from the parent snapshot that are
+        // not affected by this compaction. Without this, non-compacted partitions
+        // would disappear from the new snapshot's manifest list.
+        //
+        // For data manifests: drop if all alive entries are being compacted.
+        // For delete manifests: drop if all referenced data files are being
+        // compacted (the compacted output already has deletes applied via
+        // ArrowReader, so carrying forward stale delete files would be
+        // incorrect).
+        let compacted_paths: HashSet<&str> = old_entries
+            .iter()
+            .map(|e| e.data_file.file_path())
+            .collect();
+
+        let parent_snapshot = metadata
+            .snapshot_by_id(parent_snapshot_id)
+            .expect("parent snapshot just resolved");
+        let parent_manifest_list = parent_snapshot
+            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+            .await?;
+
+        let mut surviving_manifests: Vec<ManifestFile> = Vec::new();
+        for manifest_file in parent_manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+
+            let dominated_by_compaction = match manifest_file.content {
+                iceberg::spec::ManifestContentType::Data => {
+                    // A data manifest is dominated if every alive entry is
+                    // in the compacted set.
+                    manifest.entries().iter().all(|entry| {
+                        !entry.is_alive() || compacted_paths.contains(entry.data_file.file_path())
+                    })
+                }
+                iceberg::spec::ManifestContentType::Deletes => {
+                    // A delete manifest is dominated if every alive delete
+                    // file only references data files that are being
+                    // compacted. Since delete files in iceberg reference
+                    // data files by path (position deletes) or by partition
+                    // scope (equality deletes), we conservatively drop a
+                    // delete manifest only when ALL alive entries' referenced
+                    // data file paths are in the compacted set. For equality
+                    // deletes (which don't reference specific file paths),
+                    // we check whether the delete file's partition overlaps
+                    // with any compacted partition — if it does, and ALL
+                    // data files in that partition are compacted, the
+                    // equality delete is subsumed.
+                    //
+                    // As a safe simplification: drop the delete manifest
+                    // only if it has no alive entries, keeping it otherwise.
+                    // The ArrowReader will simply find no matching rows and
+                    // the delete files become no-ops. This avoids the risk
+                    // of prematurely dropping equality deletes.
+                    !manifest.entries().iter().any(|entry| entry.is_alive())
+                }
+            };
+
+            if !dominated_by_compaction {
+                surviving_manifests.push(manifest_file.clone());
+            }
+        }
+
+        // Write manifest list: surviving manifests + delete manifest + add manifest
         let manifest_list_path = format!(
             "{}/metadata/snap-{}-0-{}.{}",
             metadata.location(),
@@ -345,7 +504,11 @@ impl IcebergCompactorConfig {
                 None,
             ),
         };
-        manifest_list_writer.add_manifests([delete_manifest, add_manifest].into_iter())?;
+        manifest_list_writer.add_manifests(
+            surviving_manifests
+                .into_iter()
+                .chain([delete_manifest, add_manifest]),
+        )?;
         manifest_list_writer.close().await?;
 
         // Build snapshot
@@ -496,6 +659,212 @@ impl DeduplicatingAccumulator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// StreamingCompactionWriter — bounded-memory sorted file writer
+// ---------------------------------------------------------------------------
+
+/// Resolves the table's default sort order into Arrow column indices and
+/// sort options. Returns `None` if the table has no sort order (order_id 0)
+/// or if any sort field uses a non-identity transform.
+fn resolve_sort_columns(table: &Table) -> Option<Vec<(usize, SortOptions)>> {
+    let sort_order = table.metadata().default_sort_order();
+    if sort_order.fields.is_empty() {
+        return None;
+    }
+
+    let schema = table.metadata().current_schema();
+    let mut columns = Vec::with_capacity(sort_order.fields.len());
+
+    for field in &sort_order.fields {
+        if field.transform != Transform::Identity {
+            return None;
+        }
+
+        let iceberg_field = schema.field_by_id(field.source_id)?;
+        let col_idx = schema
+            .as_struct()
+            .fields()
+            .iter()
+            .position(|f| f.name == iceberg_field.name)?;
+
+        let options = SortOptions {
+            descending: field.direction == SortDirection::Descending,
+            nulls_first: field.null_order == NullOrder::First,
+        };
+
+        columns.push((col_idx, options));
+    }
+
+    Some(columns)
+}
+
+/// Sort a RecordBatch according to the given column indices and sort options.
+fn sort_batch(
+    batch: &RecordBatch,
+    sort_columns: &[(usize, SortOptions)],
+) -> crate::error::Result<RecordBatch> {
+    let columns: Vec<SortColumn> = sort_columns
+        .iter()
+        .map(|(idx, options)| SortColumn {
+            values: batch.column(*idx).clone(),
+            options: Some(*options),
+        })
+        .collect();
+
+    let indices = lexsort_to_indices(&columns, None)?;
+
+    let sorted_columns: Vec<_> = batch
+        .columns()
+        .iter()
+        .map(|col| take(col.as_ref(), &indices, None).map_err(crate::Error::from))
+        .collect::<crate::error::Result<_>>()?;
+
+    Ok(RecordBatch::try_new(batch.schema(), sorted_columns)?)
+}
+
+/// Streaming compaction writer that buffers batches per-partition up to the
+/// target file size, sorts each buffer according to the table's sort order,
+/// and writes sorted output files. Memory usage is bounded to approximately
+/// one target-sized file per active partition at a time.
+struct StreamingCompactionWriter {
+    table: Table,
+    compression: Option<Compression>,
+    target_file_size_bytes: usize,
+    arrow_schema: SchemaRef,
+    sort_columns: Option<Vec<(usize, SortOptions)>>,
+    is_partitioned: bool,
+    /// Per-partition buffer: partition key → (batches, approximate byte size).
+    partition_buffers: HashMap<Struct, (Vec<RecordBatch>, usize)>,
+    /// Accumulated output data files from flushed buffers.
+    data_files: Vec<DataFile>,
+}
+
+impl StreamingCompactionWriter {
+    fn new(
+        table: &Table,
+        compression: Option<Compression>,
+        target_file_size_bytes: usize,
+    ) -> crate::error::Result<Self> {
+        let metadata = table.metadata();
+        let schema = metadata.current_schema();
+        let arrow_schema = Arc::new(schema_to_arrow_schema(schema)?);
+        let sort_columns = resolve_sort_columns(table);
+        let is_partitioned = !metadata.default_partition_spec().is_unpartitioned();
+
+        Ok(Self {
+            table: table.clone(),
+            compression,
+            target_file_size_bytes,
+            arrow_schema,
+            sort_columns,
+            is_partitioned,
+            partition_buffers: HashMap::new(),
+            data_files: Vec::new(),
+        })
+    }
+
+    /// Add a batch to the writer. If any partition buffer exceeds the target
+    /// file size, that partition is flushed (sorted + written) immediately.
+    async fn write(&mut self, batch: RecordBatch) -> crate::error::Result<()> {
+        if self.is_partitioned {
+            let metadata = self.table.metadata();
+            let schema = metadata.current_schema().clone();
+            let partition_spec = metadata.default_partition_spec();
+            let splitter =
+                iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_computed_values(
+                    schema,
+                    partition_spec.clone(),
+                )?;
+
+            let partitioned = splitter.split(&batch)?;
+            for (key, partition_batch) in partitioned {
+                self.buffer_batch(key.data().clone(), partition_batch)
+                    .await?;
+            }
+        } else {
+            self.buffer_batch(Struct::empty(), batch).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn buffer_batch(
+        &mut self,
+        partition_key: Struct,
+        batch: RecordBatch,
+    ) -> crate::error::Result<()> {
+        let size = batch.get_array_memory_size();
+        let (buffers, buffered_size) = self
+            .partition_buffers
+            .entry(partition_key.clone())
+            .or_insert_with(|| (Vec::new(), 0));
+        *buffered_size += size;
+        buffers.push(batch);
+
+        if *buffered_size >= self.target_file_size_bytes {
+            self.flush_partition(partition_key).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Sort and write all buffered batches for a single partition.
+    async fn flush_partition(&mut self, partition_key: Struct) -> crate::error::Result<()> {
+        let Some((batches, _)) = self.partition_buffers.remove(&partition_key) else {
+            return Ok(());
+        };
+
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let merged = concat_batches(&self.arrow_schema, &batches)?;
+        drop(batches);
+
+        let sorted = match &self.sort_columns {
+            Some(cols) if !cols.is_empty() => sort_batch(&merged, cols)?,
+            _ => merged,
+        };
+
+        let files = super::writer::write_data_files_with_target_size(
+            &self.table,
+            vec![sorted],
+            self.compression,
+            Some(self.target_file_size_bytes),
+        )
+        .await?;
+
+        self.data_files.extend(files);
+        Ok(())
+    }
+
+    /// Flush all remaining partition buffers and return the complete set of
+    /// written data files.
+    async fn close(mut self) -> crate::error::Result<Vec<DataFile>> {
+        let keys: Vec<Struct> = self.partition_buffers.keys().cloned().collect();
+        for key in keys {
+            self.flush_partition(key).await?;
+        }
+        Ok(self.data_files)
+    }
+}
+
+/// Returns true if the error indicates a commit conflict (optimistic concurrency
+/// failure from `RefSnapshotIdMatch` or catalog-level conflict). These are
+/// retryable — the compacted data files are still valid.
+fn is_commit_conflict(err: &crate::Error) -> bool {
+    match err {
+        crate::Error::Iceberg(iceberg_err) => {
+            matches!(
+                iceberg_err.kind(),
+                iceberg::ErrorKind::CatalogCommitConflicts
+            )
+        }
+        crate::Error::CatalogHttp(msg) => msg.contains("commit conflict"),
+        _ => false,
+    }
+}
+
 /// Resolve identifier field IDs from the iceberg schema to column indices
 /// within the Arrow record batches that the scan produces.
 fn resolve_identifier_column_indices(table: &Table) -> Vec<usize> {
@@ -520,6 +889,204 @@ fn resolve_identifier_column_indices(table: &Table) -> Vec<usize> {
         .filter(|(_, f)| field_names.contains(&f.name.as_str()))
         .map(|(i, _)| i)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// CompactionScheduler — periodic compaction on a timer
+// ---------------------------------------------------------------------------
+
+const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 300; // 5 minutes
+
+pub struct CompactionSchedulerBuilder {
+    table: Table,
+    catalog: Catalog,
+    interval: Duration,
+    target_file_size_bytes: usize,
+    min_files_to_compact: usize,
+    deduplicate: bool,
+    compression: Compression,
+    label: String,
+}
+
+impl CompactionSchedulerBuilder {
+    pub fn new(table: Table, catalog: Catalog, label: impl Into<String>) -> Self {
+        Self {
+            table,
+            catalog,
+            interval: Duration::from_secs(DEFAULT_COMPACTION_INTERVAL_SECS),
+            target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
+            min_files_to_compact: DEFAULT_MIN_FILES_TO_COMPACT,
+            deduplicate: false,
+            compression: Compression::SNAPPY,
+            label: label.into(),
+        }
+    }
+
+    pub fn interval(self, interval: Duration) -> Self {
+        Self { interval, ..self }
+    }
+
+    pub fn target_file_size_bytes(self, size: usize) -> Self {
+        Self {
+            target_file_size_bytes: size,
+            ..self
+        }
+    }
+
+    pub fn min_files_to_compact(self, min: usize) -> Self {
+        Self {
+            min_files_to_compact: min,
+            ..self
+        }
+    }
+
+    pub fn deduplicate(self, deduplicate: bool) -> Self {
+        Self {
+            deduplicate,
+            ..self
+        }
+    }
+
+    pub fn compression(self, compression: Compression) -> Self {
+        Self {
+            compression,
+            ..self
+        }
+    }
+
+    pub fn build(self) -> CompactionScheduler {
+        CompactionScheduler {
+            table: self.table,
+            catalog: self.catalog,
+            interval: self.interval,
+            target_file_size_bytes: self.target_file_size_bytes,
+            min_files_to_compact: self.min_files_to_compact,
+            deduplicate: self.deduplicate,
+            compression: self.compression,
+            label: self.label,
+        }
+    }
+}
+
+/// Runs periodic compaction on a timer, checking whether any partitions
+/// exceed the file count threshold and compacting them when they do.
+///
+/// Integrates with `ManagedProc` for lifecycle management alongside
+/// sinks and pollers.
+pub struct CompactionScheduler {
+    table: Table,
+    catalog: Catalog,
+    interval: Duration,
+    target_file_size_bytes: usize,
+    min_files_to_compact: usize,
+    deduplicate: bool,
+    compression: Compression,
+    label: String,
+}
+
+impl ManagedProc for CompactionScheduler {
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> super_visor::ManagedFuture {
+        super_visor::spawn(self.run(shutdown))
+    }
+}
+
+impl CompactionScheduler {
+    pub async fn run(mut self, mut shutdown: ShutdownSignal) -> Result<()> {
+        info!(label = self.label, "starting compaction scheduler");
+
+        let mut timer = time::interval(self.interval);
+        timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => break,
+                _ = timer.tick() => {
+                    if let Err(err) = self.compact_once().await {
+                        warn!(
+                            label = self.label,
+                            ?err,
+                            "scheduled compaction failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        info!(label = self.label, "stopping compaction scheduler");
+        Ok(())
+    }
+
+    async fn compact_once(&mut self) -> Result<()> {
+        // Reload table to see latest state.
+        self.table = self.catalog.load_table(self.table.identifier()).await?;
+
+        if !self.needs_compaction().await? {
+            debug!(
+                label = self.label,
+                min = self.min_files_to_compact,
+                "no partition exceeds compaction threshold"
+            );
+            return Ok(());
+        }
+
+        let config = IcebergCompactorConfigBuilder::default()
+            .table(self.table.clone())
+            .catalog(self.catalog.clone())
+            .target_file_size_bytes(self.target_file_size_bytes)
+            .min_files_to_compact(self.min_files_to_compact)
+            .deduplicate(self.deduplicate)
+            .compression(self.compression)
+            .build()
+            .map_err(|e| crate::Error::Branch(e.to_string()))?;
+
+        let result = config.execute().await?;
+
+        if result.files_read > 0 {
+            // Update our table handle so the next check sees the post-compaction state.
+            self.table = self.catalog.load_table(self.table.identifier()).await?;
+
+            info!(
+                label = self.label,
+                files_read = result.files_read,
+                files_written = result.files_written,
+                partitions = result.partitions_compacted,
+                duplicates_eliminated = result.duplicates_eliminated,
+                "scheduled compaction complete"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Lightweight check: count files per partition and return true if any
+    /// partition meets the compaction threshold. Avoids reading file data.
+    async fn needs_compaction(&self) -> Result<bool> {
+        let Some(snapshot) = self.table.metadata().current_snapshot() else {
+            return Ok(false);
+        };
+
+        let manifest_list = snapshot
+            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+            .await?;
+
+        let mut partition_file_counts: HashMap<Struct, usize> = HashMap::new();
+
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    *partition_file_counts
+                        .entry(entry.data_file.partition().clone())
+                        .or_default() += 1;
+                }
+            }
+        }
+
+        Ok(partition_file_counts
+            .values()
+            .any(|&count| count >= self.min_files_to_compact))
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
-use crate::error::Result;
+use std::collections::HashSet;
+
 use arrow::array::RecordBatch;
 use futures::{TryStreamExt, stream::BoxStream};
 use iceberg::{
@@ -7,8 +8,9 @@ use iceberg::{
     spec::{ManifestStatus, Operation},
     table::Table,
 };
-use std::collections::HashSet;
 use tracing::debug;
+
+use crate::error::Result;
 
 /// A stream of arrow RecordBatches from an iceberg table scan.
 pub type IcebergRecordBatchStream = BoxStream<'static, iceberg::Result<RecordBatch>>;
@@ -34,19 +36,36 @@ pub async fn scan_columns(table: &Table, columns: Vec<&str>) -> Result<IcebergRe
     Ok(stream)
 }
 
-/// Scan only the data files added after a given snapshot.
+/// Scan only the data files added after a given snapshot, up to the current
+/// snapshot.
 ///
-/// Walks the current snapshot's manifest list, filters to manifest entries
-/// whose sequence number exceeds the checkpoint snapshot's sequence number,
-/// and reads only those newly added files. This enables efficient incremental
-/// streaming — on each poll, only new data since the last checkpoint is read.
-///
-/// For append-only workloads (typical streaming ingestion), this correctly
-/// returns exactly the new records. For tables with compaction, it returns
-/// the compacted output files (not the original un-compacted files).
+/// Equivalent to `scan_snapshot_range(table, after_snapshot_id, None)`.
+/// See [`scan_snapshot_range`] for details.
 pub async fn scan_since_snapshot(
     table: &Table,
     after_snapshot_id: i64,
+) -> Result<IcebergRecordBatchStream> {
+    scan_snapshot_range(table, after_snapshot_id, None).await
+}
+
+/// Scan data files added in a window between two snapshots.
+///
+/// Returns all data added **after** `after_snapshot_id` up to and including
+/// `to_snapshot_id`. When `to_snapshot_id` is `None`, the current snapshot
+/// is used as the upper bound.
+///
+/// Walks the upper-bound snapshot's manifest list, filters to manifest
+/// entries whose sequence number falls within the window, and reads only
+/// those files. Compaction (`Replace`) snapshots within the window are
+/// excluded to avoid double-processing rewritten data.
+///
+/// For append-only workloads this returns exactly the new records in the
+/// window. For tables with compaction it returns the compacted output files
+/// (not the original un-compacted files).
+pub async fn scan_snapshot_range(
+    table: &Table,
+    after_snapshot_id: i64,
+    to_snapshot_id: Option<i64>,
 ) -> Result<IcebergRecordBatchStream> {
     let after_snapshot = table
         .metadata()
@@ -59,27 +78,50 @@ pub async fn scan_since_snapshot(
         })?;
     let after_seq_num = after_snapshot.sequence_number();
 
-    let current_snapshot = table.metadata().current_snapshot().ok_or_else(|| {
-        iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
-            "table has no current snapshot",
-        )
-    })?;
+    // Resolve the upper-bound snapshot.
+    let to_snapshot = match to_snapshot_id {
+        Some(id) => table.metadata().snapshot_by_id(id).ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                format!("upper-bound snapshot {id} not found in table metadata"),
+            )
+        })?,
+        None => table.metadata().current_snapshot().ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                "table has no current snapshot",
+            )
+        })?,
+    };
+
+    let to_id = to_snapshot.snapshot_id();
+    let to_seq_num = to_snapshot.sequence_number();
+
+    if to_seq_num <= after_seq_num {
+        debug!(
+            after_snapshot_id,
+            after_seq_num,
+            to_snapshot_id = to_id,
+            to_seq_num,
+            "upper-bound snapshot is not ahead of lower-bound, returning empty stream"
+        );
+        return Ok(Box::pin(futures::stream::empty()));
+    }
 
     debug!(
         after_snapshot_id,
         after_seq_num,
-        current_snapshot_id = current_snapshot.snapshot_id(),
-        current_seq_num = current_snapshot.sequence_number(),
-        "scanning incremental data since checkpoint"
+        to_snapshot_id = to_id,
+        to_seq_num,
+        "scanning incremental data in snapshot range"
     );
 
     // Build set of sequence numbers for Replace (compaction) snapshots between
-    // the checkpoint and the current snapshot. Manifests created by these
-    // snapshots contain rewritten data files that would cause double-processing.
+    // the two bounds. Manifests created by these snapshots contain rewritten
+    // data files that would cause double-processing.
     let mut replace_seq_nums: HashSet<i64> = HashSet::new();
     {
-        let mut snap_id = Some(current_snapshot.snapshot_id());
+        let mut snap_id = Some(to_id);
         while let Some(id) = snap_id {
             if id == after_snapshot_id {
                 break;
@@ -95,16 +137,22 @@ pub async fn scan_since_snapshot(
         }
     }
 
-    // Walk the current snapshot's manifest list and collect paths of newly added files.
-    let manifest_list = current_snapshot
+    // Walk the upper-bound snapshot's manifest list and collect paths of
+    // files added within the window.
+    let manifest_list = to_snapshot
         .load_manifest_list(table.file_io(), table.metadata())
         .await?;
 
     let mut new_file_paths: HashSet<String> = HashSet::new();
 
     for manifest_file in manifest_list.entries() {
-        // Skip manifests that existed at or before the checkpoint.
+        // Skip manifests at or before the lower bound.
         if manifest_file.sequence_number <= after_seq_num {
+            continue;
+        }
+
+        // Skip manifests beyond the upper bound.
+        if manifest_file.sequence_number > to_seq_num {
             continue;
         }
 
@@ -124,9 +172,9 @@ pub async fn scan_since_snapshot(
                 continue;
             }
 
-            // Double-check entry-level sequence number when available.
+            // Double-check entry-level sequence number falls within the window.
             if let Some(entry_seq) = entry.sequence_number()
-                && entry_seq <= after_seq_num
+                && (entry_seq <= after_seq_num || entry_seq > to_seq_num)
             {
                 continue;
             }
@@ -137,16 +185,16 @@ pub async fn scan_since_snapshot(
 
     debug!(
         new_files = new_file_paths.len(),
-        "identified new data files since checkpoint"
+        "identified data files in snapshot range"
     );
 
     if new_file_paths.is_empty() {
         return Ok(Box::pin(futures::stream::empty()));
     }
 
-    // Build a regular scan on the current snapshot, get file tasks,
-    // filter to only the new file paths, then read with ArrowReader.
-    let scan = table.scan().build()?;
+    // Scope the file plan to the upper-bound snapshot so we only see files
+    // that are alive at that point — not files added after the window.
+    let scan = table.scan().snapshot_id(to_id).build()?;
     let file_tasks = scan.plan_files().await?;
     let filtered_tasks = file_tasks.try_filter(move |task| {
         futures::future::ready(new_file_paths.contains(&task.data_file_path))
@@ -155,6 +203,61 @@ pub async fn scan_since_snapshot(
     let reader = ArrowReaderBuilder::new(table.file_io().clone()).build();
     let stream = reader.read(Box::pin(filtered_tasks))?;
     Ok(stream)
+}
+
+/// Return the snapshot ID of the earliest snapshot in the table (lowest
+/// sequence number). Returns `None` if the table has no snapshots.
+///
+/// Useful as the lower bound for `scan_snapshot_range` when replaying all
+/// data from the beginning of the table's history.
+pub fn earliest_snapshot(table: &Table) -> Option<i64> {
+    table
+        .metadata()
+        .snapshots()
+        .min_by_key(|s| s.sequence_number())
+        .map(|s| s.snapshot_id())
+}
+
+/// Find the snapshot whose timestamp is the latest at or before `timestamp_ms`
+/// (epoch milliseconds).
+///
+/// Walks all snapshots in table metadata and returns the one with the largest
+/// `timestamp_ms` that does not exceed the given bound. Returns `None` if no
+/// snapshot satisfies the constraint (e.g. all snapshots are newer than `T`,
+/// or the table has no snapshots).
+pub fn snapshot_at_timestamp(table: &Table, timestamp_ms: i64) -> Option<i64> {
+    table
+        .metadata()
+        .snapshots()
+        .filter(|s| s.timestamp_ms() <= timestamp_ms)
+        .max_by_key(|s| s.timestamp_ms())
+        .map(|s| s.snapshot_id())
+}
+
+/// Scan the full table state as of a point in time.
+///
+/// Resolves the latest snapshot at or before `timestamp_ms` (epoch
+/// milliseconds), then reads all data visible at that snapshot. This is
+/// iceberg's "time travel" — the table appears exactly as it did at time `T`.
+///
+/// Returns an error if no snapshot exists at or before the given timestamp.
+pub async fn scan_at_timestamp(
+    table: &Table,
+    timestamp_ms: i64,
+) -> Result<IcebergRecordBatchStream> {
+    let snapshot_id = snapshot_at_timestamp(table, timestamp_ms).ok_or_else(|| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            format!("no snapshot found at or before timestamp {timestamp_ms}"),
+        )
+    })?;
+
+    debug!(
+        snapshot_id,
+        timestamp_ms, "time-travel scan resolved to snapshot"
+    );
+
+    scan_snapshot(table, snapshot_id).await
 }
 
 /// Scan a table with a row filter expression for predicate pushdown.

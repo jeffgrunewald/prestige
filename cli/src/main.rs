@@ -1,10 +1,10 @@
-use chrono::{DateTime, Utc};
-use clap::Parser;
-use parquet::basic::Compression;
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
+use clap::Parser;
 #[cfg(feature = "iceberg")]
 use futures::TryStreamExt;
+use parquet::basic::Compression;
 
 #[derive(Parser)]
 #[command(name = "prestige")]

@@ -1,4 +1,5 @@
-use crate::error::Result;
+use std::{collections::HashMap, time::Duration};
+
 use arrow::datatypes::SchemaRef;
 use derive_builder::Builder;
 use iceberg::{
@@ -7,13 +8,13 @@ use iceberg::{
     table::Table,
 };
 use iceberg_catalog_rest::CommitTableRequest;
-use std::{collections::HashMap, time::Duration};
 use tracing::{debug, info};
 
 use super::{
     catalog::Catalog,
     schema::{IcebergSchema, SchemaReconciliation, reconcile_schema},
 };
+use crate::error::Result;
 
 #[derive(Debug, Clone, Builder)]
 #[builder(pattern = "owned")]

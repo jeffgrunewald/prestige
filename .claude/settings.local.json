@@ -23,7 +23,8 @@
       "Bash(docker info:*)",
       "Bash(docker compose:*)",
       "Bash(docker system:*)",
-      "Bash(ICEBERG_TEST=1 cargo test:*)"
+      "Bash(ICEBERG_TEST=1 cargo test:*)",
+      "Bash(wc:*)"
     ]
   }
 }

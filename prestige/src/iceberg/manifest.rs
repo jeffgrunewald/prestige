@@ -1,15 +1,22 @@
-use crate::error::Result;
-use iceberg::ErrorKind;
-use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, PrimitiveLiteral, Struct,
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, Write},
+    path::{Path, PathBuf},
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+use iceberg::{
+    ErrorKind,
+    spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, PrimitiveLiteral,
+        Struct,
+    },
+    table::Table,
+    transaction::{ApplyTransactionAction, Transaction},
+};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
 use tracing::info;
+
+use crate::error::Result;
 
 /// Lightweight local manifest that records S3 data file paths written since
 /// the last successful catalog commit. Provides crash recovery without
@@ -41,6 +48,8 @@ enum PendingLiteral {
     Double(f64),
     String(String),
     Binary(Vec<u8>),
+    Int128(i128),
+    UInt128(u128),
 }
 
 impl PendingDataFile {
@@ -91,8 +100,9 @@ impl PendingLiteral {
             PrimitiveLiteral::Double(v) => Self::Double(v.0),
             PrimitiveLiteral::String(v) => Self::String(v),
             PrimitiveLiteral::Binary(v) => Self::Binary(v),
-            // Int128/UInt128 partition values are uncommon; store as binary fallback
-            _ => return None,
+            PrimitiveLiteral::Int128(v) => Self::Int128(v),
+            PrimitiveLiteral::UInt128(v) => Self::UInt128(v),
+            PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => return None,
         })
     }
 
@@ -105,6 +115,8 @@ impl PendingLiteral {
             Self::Double(v) => Literal::double(v),
             Self::String(v) => Literal::string(v),
             Self::Binary(v) => Literal::binary(v),
+            Self::Int128(v) => Literal::decimal(v),
+            Self::UInt128(v) => Literal::uuid(uuid::Uuid::from_u128(v)),
         }
     }
 }
@@ -165,17 +177,40 @@ impl CommitManifest {
         Ok(data_files)
     }
 
-    /// Truncate the manifest file to 0 bytes.
-    pub(crate) fn clear(&self) -> io::Result<()> {
+    /// Check if manifest file exists and is non-empty.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    }
+
+    /// Delete the manifest file entirely.
+    pub(crate) fn delete(self) -> io::Result<()> {
         if self.path.exists() {
-            File::create(&self.path)?;
+            fs::remove_file(&self.path)?;
         }
         Ok(())
     }
 
-    /// Check if manifest file exists and is non-empty.
-    pub(crate) fn has_pending(&self) -> bool {
-        self.path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    /// Find all manifest files in `dir` whose name starts with `{label}-`
+    /// and ends with `.manifest`. Used at startup to discover per-commit
+    /// manifests left behind by the pipelined commit system.
+    pub(crate) fn scan_pending(dir: &Path, label: &str) -> io::Result<Vec<Self>> {
+        let prefix = format!("{label}-");
+        let mut manifests = Vec::new();
+
+        if !dir.exists() {
+            return Ok(manifests);
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&prefix) && name_str.ends_with(".manifest") {
+                manifests.push(Self { path: entry.path() });
+            }
+        }
+
+        Ok(manifests)
     }
 }
 
@@ -214,12 +249,13 @@ pub(crate) fn is_already_committed(err: &crate::Error) -> bool {
 /// previous crash. Returns `Some(updated_table)` if recovery committed new
 /// files, `None` if nothing to recover or files were already committed.
 pub(crate) async fn recover_pending_commit(
-    manifest: &CommitManifest,
+    manifest: CommitManifest,
     table: &Table,
     catalog: &dyn iceberg::Catalog,
 ) -> Result<Option<Table>> {
     let pending_files = manifest.pending()?;
     if pending_files.is_empty() {
+        manifest.delete()?;
         return Ok(None);
     }
 
@@ -231,7 +267,7 @@ pub(crate) async fn recover_pending_commit(
 
     // Attempt commit with duplicate check disabled — files may already be
     // committed if the previous process crashed after catalog commit but
-    // before manifest clear.
+    // before manifest delete.
     let tx = Transaction::new(table);
     let action = tx
         .fast_append()
@@ -241,16 +277,16 @@ pub(crate) async fn recover_pending_commit(
 
     match tx.commit(catalog).await {
         Ok(updated_table) => {
-            manifest.clear()?;
+            manifest.delete()?;
             info!(files = file_count, "recovery commit succeeded");
             Ok(Some(updated_table))
         }
         Err(err) if is_iceberg_already_committed(&err) => {
             info!(
                 files = file_count,
-                "pending files already committed, clearing manifest"
+                "pending files already committed, deleting manifest"
             );
-            manifest.clear()?;
+            manifest.delete()?;
             Ok(None)
         }
         Err(err) => Err(err.into()),

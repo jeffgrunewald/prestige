@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub(crate) mod branch;
 mod catalog;
 mod compactor;
@@ -17,14 +16,16 @@ pub use catalog::{
     AuthConfig, Catalog, CatalogConfig, CatalogConfigBuilder, S3Config, connect_catalog,
 };
 pub use compactor::{
-    IcebergCompactionResult, IcebergCompactorConfig, IcebergCompactorConfigBuilder,
+    CompactionScheduler, CompactionSchedulerBuilder, IcebergCompactionResult,
+    IcebergCompactorConfig, IcebergCompactorConfigBuilder,
 };
 pub use poller::{
     IcebergFileStream, IcebergPollerConfigBuilder, IcebergPollerServer, IcebergStreamReceiver,
 };
 pub use scanner::{
-    IcebergRecordBatchStream, scan_columns, scan_since_snapshot, scan_snapshot, scan_table,
-    scan_with_filter,
+    IcebergRecordBatchStream, earliest_snapshot, scan_at_timestamp, scan_columns,
+    scan_since_snapshot, scan_snapshot, scan_snapshot_range, scan_table, scan_with_filter,
+    snapshot_at_timestamp,
 };
 pub use schema::{
     IcebergSchema, PartitionFieldDef, SchemaReconciliation, SortFieldDef, arrow_to_iceberg_schema,

@@ -1,13 +1,13 @@
-use crate::error::Result;
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
 use iceberg::table::Table;
 use parquet::basic::Compression;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use super::branch;
-use super::catalog::Catalog;
+use super::{branch, catalog::Catalog};
+use crate::error::Result;
 
 // ---------------------------------------------------------------------------
 // WAP state detection
@@ -197,6 +197,7 @@ impl WapTransaction {
                     &state.branch_name,
                     data_files,
                     &state.branch_name,
+                    None,
                 )
                 .await?;
                 drop(table_guard);

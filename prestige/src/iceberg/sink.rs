@@ -1,3 +1,32 @@
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use iceberg::table::Table;
+use parquet::basic::Compression;
+use serde::Serialize;
+use super_visor::{ManagedProc, ShutdownSignal};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::{JoinError, JoinSet},
+    time,
+};
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use super::{
+    catalog::Catalog,
+    manifest::CommitManifest,
+    schema::IcebergSchema,
+    table::{IcebergTableConfigBuilder, ensure_table_for, ensure_table_for_with},
+};
 use crate::{
     ArrowSchema, Error, Result,
     error::ChannelError,
@@ -9,27 +38,14 @@ use crate::{
         telemetry_labels,
     },
 };
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use iceberg::table::Table;
-use parquet::basic::Compression;
-use serde::Serialize;
-use std::{collections::HashMap, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
-use super_visor::{ManagedProc, ShutdownSignal};
-use tokio::{
-    sync::{mpsc, oneshot},
-    time,
-};
-use tracing::{debug, info, warn};
-use uuid::Uuid;
 
-use super::{
-    catalog::Catalog,
-    manifest::CommitManifest,
-    schema::IcebergSchema,
-    table::{IcebergTableConfigBuilder, ensure_table_for, ensure_table_for_with},
-};
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const SINK_CHECK_MILLIS: u64 = 60_000;
+const DEFAULT_MAX_PENDING_COMMITS: usize = 3;
 
 // ---------------------------------------------------------------------------
 // DataWriter trait — generic write abstraction for iceberg sinks
@@ -61,8 +77,9 @@ pub trait IntoBoxedDataWriter<T: Send + 'static>: DataWriter<T> + Sized + 'stati
 
 impl<T: Send + 'static, W: DataWriter<T> + 'static> IntoBoxedDataWriter<T> for W {}
 
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const SINK_CHECK_MILLIS: u64 = 60_000;
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 pub type IcebergFileManifest = Vec<String>;
 
@@ -88,6 +105,7 @@ pub struct IcebergSinkBuilder<T> {
     wap_branch: Option<String>,
     auto_publish: bool,
     manifest_dir: Option<PathBuf>,
+    max_pending_commits: usize,
     _phantom: PhantomData<T>,
 }
 
@@ -130,6 +148,7 @@ impl<T> IcebergSinkBuilder<T> {
             wap_branch: None,
             auto_publish: true,
             manifest_dir: None,
+            max_pending_commits: DEFAULT_MAX_PENDING_COMMITS,
             _phantom: PhantomData,
         }
     }
@@ -209,25 +228,21 @@ impl<T> IcebergSinkBuilder<T> {
         }
     }
 
+    /// Maximum number of catalog commits that may be in-flight simultaneously.
+    /// When the limit is reached, the next commit blocks until a slot opens.
+    /// Defaults to 3.
+    pub fn max_pending_commits(self, max: usize) -> Self {
+        Self {
+            max_pending_commits: max.max(1),
+            ..self
+        }
+    }
+
     pub fn create(self) -> (IcebergSinkClient<T>, IcebergSink<T>)
     where
         T: ArrowSchema + Serialize,
     {
         let (tx, rx) = mpsc::channel(50);
-
-        let manifest = self.manifest_dir.as_ref().and_then(|dir| {
-            match CommitManifest::new(dir, &self.label) {
-                Ok(m) => Some(m),
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        label = self.label,
-                        "failed to create commit manifest, running without crash recovery"
-                    );
-                    None
-                }
-            }
-        });
 
         (
             IcebergSinkClient::new(tx, self.label.clone()),
@@ -251,7 +266,8 @@ impl<T> IcebergSinkBuilder<T> {
                 snapshot_properties: self.snapshot_properties,
                 wap_branch: self.wap_branch,
                 auto_publish: self.auto_publish,
-                manifest,
+                manifest_dir: self.manifest_dir,
+                pipeline: CommitPipeline::new(self.max_pending_commits),
                 _phantom: PhantomData,
             },
         )
@@ -409,7 +425,8 @@ pub struct IcebergSink<T> {
     snapshot_properties: HashMap<String, String>,
     wap_branch: Option<String>,
     auto_publish: bool,
-    manifest: Option<CommitManifest>,
+    manifest_dir: Option<PathBuf>,
+    pipeline: CommitPipeline,
     _phantom: PhantomData<T>,
 }
 
@@ -423,34 +440,26 @@ impl<T: Serialize> IcebergSink<T> {
     pub async fn run(mut self, mut shutdown: ShutdownSignal) -> Result {
         info!(label = self.label, "starting iceberg sink");
 
-        // Recover any pending commit from a previous crash.
-        if let Some(ref manifest) = self.manifest {
-            match super::manifest::recover_pending_commit(
-                manifest,
-                &self.table,
-                self.catalog.as_iceberg_catalog().as_ref(),
-            )
-            .await
-            {
-                Ok(Some(updated_table)) => {
-                    self.table = updated_table;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(
-                        label = self.label,
-                        ?err,
-                        "manifest recovery failed, continuing"
-                    );
-                }
-            }
+        // Recover any pending commits from a previous crash.
+        if self.manifest_dir.is_some() {
+            let dir = self.manifest_dir.clone().unwrap();
+            self.recover_pending_manifests(&dir).await;
         }
 
         let mut rollover_timer = time::interval(Duration::from_millis(SINK_CHECK_MILLIS));
         rollover_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
+            // Drain completed background commits before processing messages.
+            self.pipeline.drain_completed(&mut self.table, &self.label);
+
             tokio::select! {
+                biased;
+                _ = &mut shutdown => break,
+                // Poll for background commit completions alongside messages.
+                Some(result) = self.pipeline.join_next() => {
+                    self.pipeline.handle_completion(result, &mut self.table, &self.label);
+                }
                 _ = rollover_timer.tick() => self.maybe_roll().await?,
                 msg = self.messages.recv() => match msg {
                     Some(IcebergMessage::Data(on_write_tx, item)) => {
@@ -475,19 +484,76 @@ impl<T: Serialize> IcebergSink<T> {
                     }
                     None => break,
                 },
-                _ = &mut shutdown => break,
             }
         }
 
-        // Flush remaining data on shutdown
+        // Flush remaining data on shutdown.
         if (!self.buffer.is_empty() || !self.staged_batches.is_empty())
-            && let Err(err) = self.commit().await
+            && let Err(err) = self.prepare_and_enqueue().await
         {
-            warn!(label = self.label, ?err, "failed to commit on shutdown");
+            warn!(
+                label = self.label,
+                ?err,
+                "failed to prepare final commit on shutdown"
+            );
         }
+
+        // Drain all in-flight commits before stopping.
+        self.pipeline.drain_all(&mut self.table, &self.label).await;
 
         info!(label = self.label, "stopping iceberg sink");
         Ok(())
+    }
+
+    /// Recover per-commit manifest files left by the pipeline from a prior crash.
+    async fn recover_pending_manifests(&mut self, dir: &Path) {
+        let manifests = match CommitManifest::scan_pending(dir, &self.label) {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(
+                    label = self.label,
+                    ?err,
+                    "failed to scan for pending manifests"
+                );
+                return;
+            }
+        };
+
+        let mut recovered_any = false;
+        for manifest in manifests {
+            match super::manifest::recover_pending_commit(
+                manifest,
+                &self.table,
+                self.catalog.as_iceberg_catalog().as_ref(),
+            )
+            .await
+            {
+                Ok(Some(updated_table)) => {
+                    self.table = updated_table;
+                    recovered_any = true;
+                }
+                Ok(None) => {
+                    recovered_any = true;
+                }
+                Err(err) => {
+                    warn!(
+                        label = self.label,
+                        ?err,
+                        "manifest recovery failed, continuing"
+                    );
+                }
+            }
+        }
+
+        // Ensure the table handle reflects the latest catalog state after
+        // recovery, even when all manifests were already committed (Ok(None)).
+        if recovered_any && let Err(err) = self.reload_table().await {
+            warn!(
+                label = self.label,
+                ?err,
+                "failed to reload table after recovery"
+            );
+        }
     }
 
     async fn write_items(&mut self, items: Vec<T>) -> Result {
@@ -589,12 +655,29 @@ impl<T: Serialize> IcebergSink<T> {
         );
 
         if self.auto_commit {
-            self.commit().await?;
+            self.prepare_and_enqueue().await?;
         }
         Ok(())
     }
 
+    /// Explicit commit: prepare, enqueue, then wait for all in-flight commits
+    /// (including this one) to complete before returning.
     async fn commit(&mut self) -> Result<IcebergFileManifest> {
+        let file_paths = self.prepare_and_enqueue().await?;
+        if file_paths.is_empty() {
+            return Ok(file_paths);
+        }
+        // Wait for all in-flight commits so the caller knows the data is durable.
+        self.pipeline.drain_all(&mut self.table, &self.label).await;
+        Ok(file_paths)
+    }
+
+    /// Prepare phase: flush buffer → reload table → write to S3 → record manifest.
+    /// Then enqueue the catalog commit as a background task.
+    ///
+    /// Returns the file paths immediately. The catalog commit runs in the
+    /// background — new writes can flow in while it's in-flight.
+    async fn prepare_and_enqueue(&mut self) -> Result<IcebergFileManifest> {
         self.flush_buffer()?;
 
         let batches = std::mem::take(&mut self.staged_batches);
@@ -603,15 +686,25 @@ impl<T: Serialize> IcebergSink<T> {
             return Ok(Vec::new());
         }
 
+        // Save counters so they can be restored if prepare fails and
+        // batches are re-queued.
+        let saved_row_count = self.row_count;
+        let saved_size = self.approximate_size;
+        let saved_created_at = self.created_at;
+        self.row_count = 0;
+        self.approximate_size = 0;
+        self.created_at = None;
+
         // Reload table metadata before writing to get current schema/partition info.
         if let Err(err) = self.reload_table().await {
-            // Restore batches so data isn't lost.
             self.staged_batches = batches;
+            self.row_count = saved_row_count;
+            self.approximate_size = saved_size;
+            self.created_at = saved_created_at;
             return Err(err);
         }
 
-        // Write data files to S3. RecordBatch clone is cheap (Arc column
-        // refs), so we keep the originals to restore on failure.
+        // Write data files to S3.
         let data_files = match super::writer::write_data_files(
             &self.table,
             batches.clone(),
@@ -620,13 +713,15 @@ impl<T: Serialize> IcebergSink<T> {
         .await
         {
             Ok(files) => {
-                // Drop the backup — data is durable in S3.
                 drop(batches);
                 files
             }
             Err(err) => {
                 warn!(label = self.label, ?err, "failed to write data files to S3");
                 self.staged_batches = batches;
+                self.row_count = saved_row_count;
+                self.approximate_size = saved_size;
+                self.created_at = saved_created_at;
                 return Err(err);
             }
         };
@@ -636,65 +731,53 @@ impl<T: Serialize> IcebergSink<T> {
             .map(|f| f.file_path().to_string())
             .collect();
 
-        // Record to local manifest before catalog commit (crash recovery).
-        // If this fails we still attempt the catalog commit — a successful
-        // commit makes the data durable regardless. We only lose crash
-        // recovery protection for this specific commit window.
-        let manifest_recorded = if let Some(ref manifest) = self.manifest {
+        // Record to per-commit manifest for crash recovery.
+        let commit_id = Uuid::now_v7().to_string();
+        let manifest = if let Some(ref dir) = self.manifest_dir {
             let partition_spec_id = self.table.metadata().default_partition_spec_id();
-            match manifest.record_files(&data_files, partition_spec_id) {
-                Ok(()) => true,
+            match CommitManifest::new(dir, &format!("{}-{}", self.label, commit_id)) {
+                Ok(m) => match m.record_files(&data_files, partition_spec_id) {
+                    Ok(()) => Some(m),
+                    Err(err) => {
+                        warn!(
+                            label = self.label,
+                            ?err,
+                            "failed to write local manifest, crash recovery unavailable for this commit"
+                        );
+                        None
+                    }
+                },
                 Err(err) => {
-                    warn!(
-                        label = self.label,
-                        ?err,
-                        "failed to write local manifest, crash recovery unavailable for this commit"
-                    );
-                    false
+                    warn!(label = self.label, ?err, "failed to create commit manifest");
+                    None
                 }
             }
         } else {
-            false
+            None
         };
 
-        // Catalog commit (Transaction handles retry internally).
-        let commit_result = if let Some(ref branch_name) = self.wap_branch {
-            self.commit_wap(branch_name.clone(), data_files).await
-        } else {
-            self.commit_direct(data_files).await
+        // Apply backpressure: if the pipeline is full, wait for the oldest
+        // commit to complete before enqueuing a new one.
+        self.pipeline
+            .ensure_capacity(&mut self.table, &self.label)
+            .await;
+
+        // Spawn the catalog commit as a background task.
+        let task_ctx = CommitTaskContext {
+            table: self.table.clone(),
+            catalog: self.catalog.clone(),
+            data_files,
+            snapshot_properties: self.snapshot_properties.clone(),
+            wap_branch: self.wap_branch.clone(),
+            auto_publish: self.auto_publish,
+            manifest,
+            label: self.label.clone(),
+            file_paths: file_paths.clone(),
         };
 
-        match commit_result {
-            Ok(()) => {
-                // Clear manifest and reset counters only on success.
-                if manifest_recorded
-                    && let Some(ref manifest) = self.manifest
-                    && let Err(err) = manifest.clear()
-                {
-                    warn!(label = self.label, ?err, "failed to clear local manifest");
-                }
-                self.row_count = 0;
-                self.approximate_size = 0;
-                self.created_at = None;
+        self.pipeline.enqueue(task_ctx);
 
-                info!(
-                    label = self.label,
-                    files = file_paths.len(),
-                    "committed iceberg snapshot"
-                );
-                Ok(file_paths)
-            }
-            Err(err) => {
-                // Data files are in S3. If the manifest was written, recovery
-                // on restart will re-attempt the catalog commit. If the
-                // manifest write also failed, the S3 files are orphaned —
-                // this is logged above at warn level.
-                self.row_count = 0;
-                self.approximate_size = 0;
-                self.created_at = None;
-                Err(err)
-            }
-        }
+        Ok(file_paths)
     }
 
     /// Reload the table, reconnecting the catalog if the first attempt fails
@@ -716,87 +799,6 @@ impl<T: Serialize> IcebergSink<T> {
                 Ok(())
             }
         }
-    }
-
-    async fn commit_direct(&mut self, data_files: Vec<iceberg::spec::DataFile>) -> Result<()> {
-        let snapshot_props = if self.snapshot_properties.is_empty() {
-            None
-        } else {
-            Some(self.snapshot_properties.clone())
-        };
-
-        // Transaction::commit internally reloads the table, rebases on
-        // conflict, and retries with exponential backoff — no outer retry
-        // needed.
-        match super::writer::commit_data_files(
-            &self.table,
-            self.catalog.as_iceberg_catalog().as_ref(),
-            data_files,
-            snapshot_props,
-        )
-        .await
-        {
-            Ok(updated_table) => {
-                self.table = updated_table;
-                Ok(())
-            }
-            Err(err) if super::manifest::is_already_committed(&err) => {
-                info!(
-                    label = self.label,
-                    "data files already committed, treating as success"
-                );
-                // Refresh table to pick up the snapshot that contains our files.
-                self.reload_table().await?;
-                Ok(())
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn commit_wap(
-        &mut self,
-        branch_name: String,
-        data_files: Vec<iceberg::spec::DataFile>,
-    ) -> Result<()> {
-        if self
-            .table
-            .metadata()
-            .snapshot_for_ref(&branch_name)
-            .is_none()
-        {
-            super::branch::create_branch(&self.catalog, &self.table, &branch_name).await?;
-            self.table = self.catalog.load_table(self.table.identifier()).await?;
-        }
-
-        let wap_id = Uuid::now_v7().to_string();
-        match super::branch::commit_to_branch(
-            &self.catalog,
-            &self.table,
-            &branch_name,
-            data_files,
-            &wap_id,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(err) if super::manifest::is_already_committed(&err) => {
-                info!(
-                    label = self.label,
-                    branch = branch_name,
-                    "WAP data files already committed, treating as success"
-                );
-            }
-            Err(err) => return Err(err),
-        }
-
-        self.table = self.catalog.load_table(self.table.identifier()).await?;
-
-        if self.auto_publish {
-            super::branch::publish_branch(&self.catalog, &self.table, &branch_name).await?;
-            self.table = self.catalog.load_table(self.table.identifier()).await?;
-        }
-
-        Ok(())
     }
 
     async fn publish_wap(&mut self) -> Result {
@@ -834,4 +836,256 @@ impl<T: Serialize> IcebergSink<T> {
 
         Ok(Vec::new())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Commit pipeline — bounded queue of background catalog commits
+// ---------------------------------------------------------------------------
+
+/// Context needed to execute a catalog commit in the background.
+struct CommitTaskContext {
+    table: Table,
+    catalog: Catalog,
+    data_files: Vec<iceberg::spec::DataFile>,
+    snapshot_properties: HashMap<String, String>,
+    wap_branch: Option<String>,
+    auto_publish: bool,
+    manifest: Option<CommitManifest>,
+    label: String,
+    file_paths: Vec<String>,
+}
+
+/// Result of a background catalog commit task.
+struct CommitTaskResult {
+    /// Updated table on success, or error.
+    outcome: Result<Table>,
+    /// Per-commit manifest to clean up on success.
+    manifest: Option<CommitManifest>,
+    /// File paths for logging.
+    file_paths: Vec<String>,
+    label: String,
+}
+
+struct CommitPipeline {
+    tasks: JoinSet<CommitTaskResult>,
+    max_pending: usize,
+}
+
+impl CommitPipeline {
+    fn new(max_pending: usize) -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            max_pending,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// Spawn a catalog commit as a background task.
+    fn enqueue(&mut self, ctx: CommitTaskContext) {
+        self.tasks.spawn(execute_catalog_commit(ctx));
+    }
+
+    /// Non-blocking: process any already-completed tasks.
+    fn drain_completed(&mut self, table: &mut Table, label: &str) {
+        while let Some(result) = self.tasks.try_join_next() {
+            self.handle_completion(result, table, label);
+        }
+    }
+
+    /// Blocking: wait for ALL in-flight tasks to complete.
+    async fn drain_all(&mut self, table: &mut Table, label: &str) {
+        while let Some(result) = self.tasks.join_next().await {
+            self.handle_completion(result, table, label);
+        }
+    }
+
+    /// If the pipeline is at capacity, wait for one task to complete.
+    async fn ensure_capacity(&mut self, table: &mut Table, label: &str) {
+        // First try non-blocking drain of completed tasks.
+        self.drain_completed(table, label);
+
+        // If still at capacity, block until one completes.
+        if self.len() >= self.max_pending
+            && let Some(result) = self.tasks.join_next().await
+        {
+            self.handle_completion(result, table, label);
+        }
+    }
+
+    /// Wrapper to poll JoinSet — returns None if empty.
+    async fn join_next(&mut self) -> Option<std::result::Result<CommitTaskResult, JoinError>> {
+        self.tasks.join_next().await
+    }
+
+    fn handle_completion(
+        &self,
+        result: std::result::Result<CommitTaskResult, JoinError>,
+        table: &mut Table,
+        sink_label: &str,
+    ) {
+        let task_result = match result {
+            Ok(r) => r,
+            Err(join_err) => {
+                error!(label = sink_label, ?join_err, "commit task panicked");
+                return;
+            }
+        };
+
+        match task_result.outcome {
+            Ok(updated_table) => {
+                *table = updated_table;
+
+                // Clean up per-commit manifest on success.
+                if let Some(manifest) = task_result.manifest
+                    && let Err(err) = manifest.delete()
+                {
+                    warn!(label = sink_label, ?err, "failed to delete commit manifest");
+                }
+
+                info!(
+                    label = task_result.label,
+                    files = task_result.file_paths.len(),
+                    "committed iceberg snapshot"
+                );
+            }
+            Err(err) => {
+                // Data files are in S3. If manifest was written, recovery on
+                // restart will re-attempt. If not, files are orphaned.
+                if task_result.manifest.is_none() {
+                    error!(
+                        label = task_result.label,
+                        files = ?task_result.file_paths,
+                        "catalog commit failed and no local manifest recorded — \
+                         data files are orphaned in S3 with no recovery path"
+                    );
+                }
+                warn!(
+                    label = task_result.label,
+                    ?err,
+                    "background catalog commit failed"
+                );
+            }
+        }
+    }
+}
+
+/// Execute a catalog commit in a background task.
+///
+/// This is the "execute" half of the prepare/execute pipeline split.
+/// Runs independently from the sink's event loop.
+async fn execute_catalog_commit(ctx: CommitTaskContext) -> CommitTaskResult {
+    let outcome = if let Some(ref branch_name) = ctx.wap_branch {
+        execute_wap_commit(
+            &ctx.table,
+            &ctx.catalog,
+            branch_name,
+            ctx.data_files,
+            ctx.snapshot_properties,
+            ctx.auto_publish,
+            &ctx.label,
+        )
+        .await
+    } else {
+        execute_direct_commit(
+            &ctx.table,
+            &ctx.catalog,
+            ctx.data_files,
+            &ctx.snapshot_properties,
+            &ctx.label,
+        )
+        .await
+    };
+
+    CommitTaskResult {
+        outcome,
+        manifest: ctx.manifest,
+        file_paths: ctx.file_paths,
+        label: ctx.label,
+    }
+}
+
+async fn execute_direct_commit(
+    table: &Table,
+    catalog: &Catalog,
+    data_files: Vec<iceberg::spec::DataFile>,
+    snapshot_properties: &HashMap<String, String>,
+    label: &str,
+) -> Result<Table> {
+    let snapshot_props = if snapshot_properties.is_empty() {
+        None
+    } else {
+        Some(snapshot_properties.clone())
+    };
+
+    match super::writer::commit_data_files(
+        table,
+        catalog.as_iceberg_catalog().as_ref(),
+        data_files,
+        snapshot_props,
+    )
+    .await
+    {
+        Ok(updated_table) => Ok(updated_table),
+        Err(err) if super::manifest::is_already_committed(&err) => {
+            info!(label, "data files already committed, treating as success");
+            catalog.load_table(table.identifier()).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn execute_wap_commit(
+    table: &Table,
+    catalog: &Catalog,
+    branch_name: &str,
+    data_files: Vec<iceberg::spec::DataFile>,
+    snapshot_properties: HashMap<String, String>,
+    auto_publish: bool,
+    label: &str,
+) -> Result<Table> {
+    // Ensure branch exists.
+    if table.metadata().snapshot_for_ref(branch_name).is_none() {
+        super::branch::create_branch(catalog, table, branch_name).await?;
+    }
+
+    let mut table = catalog.load_table(table.identifier()).await?;
+
+    let wap_id = Uuid::now_v7().to_string();
+    let snapshot_props = if snapshot_properties.is_empty() {
+        None
+    } else {
+        Some(snapshot_properties)
+    };
+    match super::branch::commit_to_branch(
+        catalog,
+        &table,
+        branch_name,
+        data_files,
+        &wap_id,
+        snapshot_props,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(err) if super::manifest::is_already_committed(&err) => {
+            info!(
+                label,
+                branch = branch_name,
+                "WAP data files already committed, treating as success"
+            );
+        }
+        Err(err) => return Err(err),
+    }
+
+    table = catalog.load_table(table.identifier()).await?;
+
+    if auto_publish {
+        super::branch::publish_branch(catalog, &table, branch_name).await?;
+        table = catalog.load_table(table.identifier()).await?;
+    }
+
+    Ok(table)
 }

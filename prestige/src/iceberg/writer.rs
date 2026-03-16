@@ -1,24 +1,26 @@
-use crate::error::Result;
-use crate::{ArrowSchema, Error};
-use arrow::array::RecordBatch;
-use arrow::compute::cast;
-use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
-use iceberg::spec::{DataFile, DataFileFormat};
-use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+use std::{collections::HashMap, sync::Arc};
+
+use arrow::{array::RecordBatch, compute::cast};
+use iceberg::{
+    arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema},
+    spec::{DataFile, DataFileFormat},
+    table::Table,
+    transaction::{ApplyTransactionAction, Transaction},
+    writer::{
+        IcebergWriter, IcebergWriterBuilder,
+        base_writer::data_file_writer::DataFileWriterBuilder,
+        file_writer::{
+            ParquetWriterBuilder,
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+            rolling_writer::RollingFileWriterBuilder,
+        },
+        partitioning::{PartitioningWriter, fanout_writer::FanoutWriter},
+    },
 };
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::partitioning::PartitioningWriter;
-use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::basic::Compression;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::Arc;
+
+use crate::{ArrowSchema, Error, error::Result};
 
 /// Concrete builder type alias used throughout the writer pipeline.
 type WriterBuilder =
