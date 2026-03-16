@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:iceberg.apache.org)",
+      "WebFetch(domain:rust.iceberg.apache.org)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo info:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(gh search:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo check:*)",
+      "Bash(docker info:*)",
+      "Bash(docker compose:*)",
+      "Bash(docker system:*)",
+      "Bash(ICEBERG_TEST=1 cargo test:*)",
+      "Bash(wc:*)"
+    ]
+  }
+}

@@ -1,7 +1,10 @@
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use clap::Parser;
+#[cfg(feature = "iceberg")]
+use futures::TryStreamExt;
 use parquet::basic::Compression;
-use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "prestige")]
@@ -15,6 +18,18 @@ struct Cli {
 enum Commands {
     /// Compact parquet files in S3
     Compact(CompactArgs),
+
+    /// Compact an iceberg table (scan, deduplicate, rewrite)
+    #[cfg(feature = "iceberg")]
+    IcebergCompact(IcebergCompactArgs),
+
+    /// Scan and display records from an iceberg table
+    #[cfg(feature = "iceberg")]
+    IcebergScan(IcebergScanArgs),
+
+    /// Display iceberg table metadata (schema, snapshots, properties)
+    #[cfg(feature = "iceberg")]
+    IcebergInfo(IcebergInfoArgs),
 }
 
 #[derive(Parser)]
@@ -93,6 +108,12 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Compact(args) => compact_command(args).await,
+        #[cfg(feature = "iceberg")]
+        Commands::IcebergCompact(args) => iceberg_compact_command(args).await,
+        #[cfg(feature = "iceberg")]
+        Commands::IcebergScan(args) => iceberg_scan_command(args).await,
+        #[cfg(feature = "iceberg")]
+        Commands::IcebergInfo(args) => iceberg_info_command(args).await,
     }
 }
 
@@ -197,5 +218,356 @@ async fn execute_plan(
     let result = builder.plan_schema_agnostic().await?;
 
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Iceberg CLI subcommands
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "iceberg")]
+#[derive(Parser)]
+struct IcebergCatalogArgs {
+    /// REST catalog URI (e.g. http://localhost:8181)
+    #[arg(long, env = "ICEBERG_CATALOG_URI")]
+    catalog_uri: String,
+
+    /// Catalog name
+    #[arg(long, default_value = "default")]
+    catalog_name: String,
+
+    /// Warehouse identifier
+    #[arg(long, env = "ICEBERG_WAREHOUSE")]
+    warehouse: String,
+
+    /// S3 endpoint override
+    #[arg(long, env = "AWS_ENDPOINT_URL")]
+    s3_endpoint: Option<String>,
+
+    /// S3 region
+    #[arg(long, env = "AWS_REGION")]
+    s3_region: Option<String>,
+
+    /// S3 access key
+    #[arg(long, env = "AWS_ACCESS_KEY_ID")]
+    s3_access_key: Option<String>,
+
+    /// S3 secret key
+    #[arg(long, env = "AWS_SECRET_ACCESS_KEY")]
+    s3_secret_key: Option<String>,
+}
+
+#[cfg(feature = "iceberg")]
+#[derive(Parser)]
+struct IcebergTableArgs {
+    /// Iceberg namespace (e.g. "db" or "db.schema")
+    #[arg(long)]
+    namespace: String,
+
+    /// Table name
+    #[arg(long)]
+    table: String,
+}
+
+#[cfg(feature = "iceberg")]
+#[derive(Parser)]
+struct IcebergCompactArgs {
+    #[command(flatten)]
+    catalog: IcebergCatalogArgs,
+    #[command(flatten)]
+    table: IcebergTableArgs,
+
+    /// Target file size in bytes (default: 100MB)
+    #[arg(long, default_value = "104857600")]
+    target_bytes: usize,
+
+    /// Enable row-level deduplication
+    #[arg(long, default_value_t = false)]
+    deduplicate: bool,
+
+    /// Compression codec
+    #[arg(long)]
+    compression: Option<CompressionArg>,
+
+    /// Minimum number of files before compaction triggers
+    #[arg(long, default_value = "5")]
+    min_files: usize,
+}
+
+#[cfg(feature = "iceberg")]
+#[derive(Parser)]
+struct IcebergScanArgs {
+    #[command(flatten)]
+    catalog: IcebergCatalogArgs,
+    #[command(flatten)]
+    table: IcebergTableArgs,
+
+    /// Maximum number of records to display
+    #[arg(long, default_value = "20")]
+    limit: usize,
+
+    /// Specific snapshot ID to scan
+    #[arg(long)]
+    snapshot_id: Option<i64>,
+
+    /// Row filter expression (repeatable, ANDed together).
+    /// Format: "column op value" where op is =, !=, >, >=, <, or <=.
+    /// Values are auto-typed: integers, floats, booleans, or strings.
+    /// Quote string values with ' or " if they could parse as numbers.
+    #[arg(long)]
+    filter: Vec<String>,
+}
+
+#[cfg(feature = "iceberg")]
+#[derive(Parser)]
+struct IcebergInfoArgs {
+    #[command(flatten)]
+    catalog: IcebergCatalogArgs,
+    #[command(flatten)]
+    table: IcebergTableArgs,
+}
+
+#[cfg(feature = "iceberg")]
+async fn connect_iceberg(args: &IcebergCatalogArgs) -> anyhow::Result<prestige::iceberg::Catalog> {
+    let s3 = prestige::iceberg::S3Config {
+        endpoint: args.s3_endpoint.clone(),
+        access_key_id: args.s3_access_key.clone(),
+        secret_access_key: args.s3_secret_key.clone(),
+        region: args.s3_region.clone(),
+        path_style_access: None,
+    };
+
+    let config = prestige::iceberg::CatalogConfig::builder(
+        args.catalog_uri.clone(),
+        args.catalog_name.clone(),
+    )
+    .warehouse(args.warehouse.clone())
+    .s3(s3)
+    .build();
+
+    let catalog = prestige::iceberg::connect_catalog(&config).await?;
+    Ok(catalog)
+}
+
+#[cfg(feature = "iceberg")]
+async fn load_iceberg_table(
+    catalog: &prestige::iceberg::Catalog,
+    args: &IcebergTableArgs,
+) -> anyhow::Result<iceberg::table::Table> {
+    let ns_parts: Vec<String> = args.namespace.split('.').map(String::from).collect();
+    let table = prestige::iceberg::load_table(catalog, &ns_parts, &args.table).await?;
+    Ok(table)
+}
+
+#[cfg(feature = "iceberg")]
+async fn iceberg_compact_command(args: IcebergCompactArgs) -> anyhow::Result<()> {
+    let catalog = connect_iceberg(&args.catalog).await?;
+    let table = load_iceberg_table(&catalog, &args.table).await?;
+
+    let compression = args
+        .compression
+        .as_ref()
+        .map(|c| c.0)
+        .unwrap_or(Compression::SNAPPY);
+
+    let config = prestige::iceberg::IcebergCompactorConfigBuilder::default()
+        .table(table)
+        .catalog(catalog.clone())
+        .target_file_size_bytes(args.target_bytes)
+        .min_files_to_compact(args.min_files)
+        .deduplicate(args.deduplicate)
+        .compression(compression)
+        .build()?;
+
+    let result = config.execute().await?;
+
+    let output = serde_json::json!({
+        "status": "success",
+        "files_read": result.files_read,
+        "files_written": result.files_written,
+        "records_consolidated": result.records_consolidated,
+        "bytes_before": result.bytes_before,
+        "bytes_after": result.bytes_after,
+        "duplicates_eliminated": result.duplicates_eliminated,
+        "partitions_compacted": result.partitions_compacted,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+#[cfg(feature = "iceberg")]
+async fn iceberg_scan_command(args: IcebergScanArgs) -> anyhow::Result<()> {
+    let catalog = connect_iceberg(&args.catalog).await?;
+    let table = load_iceberg_table(&catalog, &args.table).await?;
+
+    let stream = if let Some(sid) = args.snapshot_id {
+        prestige::iceberg::scan_snapshot(&table, sid).await?
+    } else if !args.filter.is_empty() {
+        let predicate = args
+            .filter
+            .iter()
+            .map(|f| parse_filter(f))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .reduce(|a, b| a.and(b))
+            .ok_or_else(|| anyhow::anyhow!("filter list must not be empty"))?;
+        prestige::iceberg::scan_with_filter(&table, predicate).await?
+    } else {
+        prestige::iceberg::scan_table(&table).await?
+    };
+
+    let mut pinned = std::pin::pin!(stream);
+    let mut total_rows = 0usize;
+
+    while let Some(batch) = pinned.try_next().await? {
+        let remaining = args.limit.saturating_sub(total_rows);
+        if remaining == 0 {
+            break;
+        }
+
+        let num_rows = batch.num_rows();
+        let display_batch = if num_rows > remaining {
+            batch.slice(0, remaining)
+        } else {
+            batch
+        };
+
+        println!(
+            "{}",
+            arrow::util::pretty::pretty_format_batches(&[display_batch])?
+        );
+
+        total_rows += num_rows;
+    }
+
+    println!(
+        "\n({total_rows} rows scanned, limit {limit})",
+        limit = args.limit
+    );
+    Ok(())
+}
+
+#[cfg(feature = "iceberg")]
+fn parse_filter(filter: &str) -> anyhow::Result<iceberg::expr::Predicate> {
+    // Try operators longest-first to avoid ">" matching before ">="
+    let operators = [">=", "<=", "!=", "=", ">", "<"];
+    for op in operators {
+        if let Some(pos) = filter.find(op) {
+            let column = filter[..pos].trim();
+            let value_str = filter[pos + op.len()..].trim();
+            if column.is_empty() || value_str.is_empty() {
+                anyhow::bail!("invalid filter: '{filter}' (column and value must be non-empty)");
+            }
+
+            let reference = iceberg::expr::Reference::new(column);
+            let datum = parse_datum(value_str);
+
+            return Ok(match op {
+                "=" => reference.equal_to(datum),
+                "!=" => reference.not_equal_to(datum),
+                ">" => reference.greater_than(datum),
+                ">=" => reference.greater_than_or_equal_to(datum),
+                "<" => reference.less_than(datum),
+                "<=" => reference.less_than_or_equal_to(datum),
+                _ => unreachable!(),
+            });
+        }
+    }
+    anyhow::bail!(
+        "invalid filter: '{filter}' (expected: column op value, where op is =, !=, >, >=, <, <=)"
+    )
+}
+
+#[cfg(feature = "iceberg")]
+fn parse_datum(value: &str) -> iceberg::spec::Datum {
+    // Strip surrounding quotes → string literal
+    let stripped = value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')));
+    if let Some(s) = stripped {
+        return iceberg::spec::Datum::string(s);
+    }
+
+    if value.eq_ignore_ascii_case("true") {
+        return iceberg::spec::Datum::bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return iceberg::spec::Datum::bool(false);
+    }
+
+    if let Ok(v) = value.parse::<i64>() {
+        return iceberg::spec::Datum::long(v);
+    }
+
+    if let Ok(v) = value.parse::<f64>() {
+        return iceberg::spec::Datum::double(v);
+    }
+
+    iceberg::spec::Datum::string(value)
+}
+
+#[cfg(feature = "iceberg")]
+async fn iceberg_info_command(args: IcebergInfoArgs) -> anyhow::Result<()> {
+    let catalog = connect_iceberg(&args.catalog).await?;
+    let table = load_iceberg_table(&catalog, &args.table).await?;
+
+    let metadata = table.metadata();
+
+    // Schema
+    let schema = metadata.current_schema();
+    println!("Table: {}", table.identifier());
+    println!("Location: {}", metadata.location());
+    println!("Format version: {:?}", metadata.format_version());
+    println!();
+
+    println!("Schema (id={}):", schema.schema_id());
+    for field in schema.as_struct().fields() {
+        let nullable = if field.required { "NOT NULL" } else { "NULL" };
+        println!("  {} {} {}", field.name, field.field_type, nullable);
+    }
+    println!();
+
+    // Partition spec
+    let partition_spec = metadata.default_partition_spec();
+    if partition_spec.is_unpartitioned() {
+        println!("Partition spec: unpartitioned");
+    } else {
+        println!("Partition spec:");
+        for field in partition_spec.fields() {
+            println!(
+                "  {} ({:?}, source_id={})",
+                field.name, field.transform, field.source_id
+            );
+        }
+    }
+    println!();
+
+    // Snapshots
+    let snapshots: Vec<_> = metadata.snapshots().collect();
+    println!("Snapshots ({}):", snapshots.len());
+    for snap in &snapshots {
+        let ts = chrono::DateTime::from_timestamp_millis(snap.timestamp_ms())
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "  id={} timestamp={} parent={:?}",
+            snap.snapshot_id(),
+            ts,
+            snap.parent_snapshot_id()
+        );
+    }
+    println!();
+
+    // Properties
+    let props = metadata.properties();
+    if !props.is_empty() {
+        println!("Properties ({}):", props.len());
+        for (k, v) in props {
+            println!("  {k} = {v}");
+        }
+    }
+
     Ok(())
 }

@@ -9,13 +9,18 @@ description = "CLI interface for manually fetching and reading Prestige-parquet 
 name = "prestige"
 path = "src/main.rs"
 
+[features]
+iceberg = ["prestige/iceberg", "dep:iceberg", "dep:arrow"]
+
 [dependencies]
 anyhow.workspace = true
+arrow = { version = "57", optional = true, features = ["prettyprint"] }
 chrono.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 futures.workspace = true
+iceberg = { workspace = true, optional = true }
 parquet.workspace = true
-prestige = { version = "0.2.6", path = "../prestige" }
+prestige = { version = "0.3.0", path = "../prestige" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

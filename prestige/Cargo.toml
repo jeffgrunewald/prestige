@@ -6,30 +6,34 @@ license.workspace = true
 description = "Prestige file reading and writing utilities and tools"
 
 [dependencies]
-anyhow.workspace = true
-arrow = { version = "55", features = ["ipc"] }
-arrow-row = "55"
-arrow-select = "55"
+arrow = { version = "57", features = ["ipc"] }
+arrow-row = "57"
+arrow-select = "57"
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
 aws-smithy-types-convert.workspace = true
-blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 config.workspace = true
 derive_builder.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+iceberg = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
+iceberg-catalog-sql = { workspace = true, optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+uuid = { version = "1", features = ["v4", "v7"], optional = true }
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet.workspace = true
-prestige-macros = { version = "0.2.6", path = "../macros" }
+prestige-macros = { version = "0.3.0", path = "../macros" }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde.workspace = true
+serde_bytes = "0"
 serde_arrow.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -42,13 +46,17 @@ tokio-stream.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-serde_bytes = "0"
+futures.workspace = true
 tempfile.workspace = true
 tokio-util = "0"
+uuid = { version = "1", features = ["v4"] }
 
 [features]
 default = []
 decimal = ["dep:rust_decimal"]
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:reqwest", "dep:uuid"]
+iceberg-sql-catalog = ["iceberg", "dep:iceberg-catalog-sql"]
+iceberg-test-harness = ["iceberg"]
 metrics = ["dep:metrics"]
 opentelemetry = ["dep:opentelemetry"]
 sqlx-postgres = ["sqlx/postgres"]

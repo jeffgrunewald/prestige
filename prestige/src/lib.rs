@@ -26,6 +26,9 @@ pub mod file_poller;
 pub mod file_sink;
 pub mod file_source;
 pub mod file_upload;
+#[cfg(feature = "iceberg")]
+pub mod iceberg;
+pub mod serde_u8_array;
 mod settings;
 pub(crate) mod telemetry;
 pub mod traits;
@@ -43,8 +46,14 @@ pub use file_upload::{FileUpload, FileUploadServer};
 pub use settings::Settings;
 pub use traits::{ArrowSchema, ArrowSerialize, ParquetSerialize};
 
+// Re-export serde_bytes so users of #[prestige(as_binary)] don't need a direct dep.
+pub use serde_bytes;
+
 // Re-export derive macros from prestige-macros
-pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter, PrestigeSchema};
+pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter};
+
+// Re-export the attribute macro that auto-injects serde_bytes on as_binary fields.
+pub use prestige_macros::prestige_schema;
 
 /// Helper function to rebuild a parquet Type with OPTIONAL repetition and a new field name
 /// This is used by the derive macros to properly handle Option<T> fields
@@ -60,7 +69,7 @@ pub fn rebuild_type_with_optional(base_type: Type, field_name: &str) -> Type {
             let mut builder = Type::primitive_type_builder(field_name, physical_type)
                 .with_repetition(Repetition::OPTIONAL);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
@@ -82,7 +91,7 @@ pub fn rebuild_type_with_optional(base_type: Type, field_name: &str) -> Type {
             let mut builder =
                 Type::group_type_builder(field_name).with_repetition(Repetition::OPTIONAL);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
@@ -108,7 +117,7 @@ pub fn rebuild_type_as_required(base_type: Type, field_name: &str) -> Type {
             let mut builder = Type::primitive_type_builder(field_name, physical_type)
                 .with_repetition(Repetition::REQUIRED);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
@@ -130,7 +139,7 @@ pub fn rebuild_type_as_required(base_type: Type, field_name: &str) -> Type {
             let mut builder =
                 Type::group_type_builder(field_name).with_repetition(Repetition::REQUIRED);
 
-            if let Some(logical_type) = basic_info.logical_type() {
+            if let Some(logical_type) = basic_info.logical_type_ref() {
                 builder = builder.with_logical_type(Some(logical_type.clone()));
             }
 
@@ -273,7 +282,13 @@ pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -
     client
         .put_object()
         .bucket(bucket)
-        .key(file.file_name().map(|name| name.to_string_lossy()).unwrap())
+        .key(
+            file.file_name()
+                .map(|name| name.to_string_lossy())
+                .ok_or_else(|| {
+                    Error::Internal(format!("path has no file name: {}", file.display()))
+                })?,
+        )
         .body(byte_stream)
         .content_type("application/vnd.apache.parquet")
         .send()
@@ -324,7 +339,8 @@ pub async fn remove_file(
         }
     }
 
-    let err = last_error.expect("last_error must be set after 3 failed attempts");
+    let err = last_error
+        .ok_or_else(|| Error::Internal("retry loop exited without capturing an error".into()))?;
     error!(
         %bucket,
         %key,

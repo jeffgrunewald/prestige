@@ -1,6 +1,6 @@
 # Prestige
 
-A high-performance Rust library for working with Parquet files and S3 storage, built on Apache Arrow. Prestige provides a complete toolkit for streaming data to/from Parquet format with automatic batching, file rotation, and S3 integration.
+A high-performance Rust library for working with Parquet files and S3 storage, built on Apache Arrow. Prestige provides a complete toolkit for streaming data to/from Parquet format with automatic batching, file rotation, and S3 integration — plus optional Apache Iceberg table format support for catalog-managed lakehouse workloads.
 
 Side note: the name "Prestige" is a reference to the "PrestoDB" query engine (since rebranded "Trino") for providing a relational SQL interface to columnar data files, including Parquet, in S3-compatible block storage.
 
@@ -8,12 +8,13 @@ Side note: the name "Prestige" is a reference to the "PrestoDB" query engine (si
 
 - **Type-safe Parquet I/O**: Derive macros for automatic schema generation and serialization
 - **Streaming Architecture**: Process large datasets without loading everything into memory
-- **Automatic File Rotation**: Configure rotation based on row count or time intervals
+- **Automatic File Rotation**: Configure rotation based on row count, byte size, or time intervals
 - **S3 Integration**: Native support for reading from and writing to S3
 - **Crash Recovery**: Automatic recovery and cleanup of incomplete files
 - **File Monitoring**: Poll S3 buckets for new files with configurable lookback
 - **Batching & Buffering**: Configurable batch sizes for optimal performance
-- **Metrics Support**: Built-in metrics using the `metrics` crate
+- **Metrics Support**: Built-in metrics via `metrics` or `opentelemetry` crates
+- **Apache Iceberg**: Catalog-managed tables with streaming writes, incremental reads, time travel, and automatic compaction
 
 ## Architecture
 
@@ -24,10 +25,10 @@ Prestige is organized into several key components:
 A managed actor that writes Rust types to Parquet files with automatic batching and rotation.
 
 ```rust
-use prestige::{ParquetSinkBuilder, PrestigeSchema};
-use serde::{Deserialize, Serialize};
+use prestige::ParquetSinkBuilder;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PrestigeSchema)]
+#[prestige::prestige_schema]
+#[derive(Debug, Clone)]
 struct SensorData {
     timestamp: u64,
     sensor_id: String,
@@ -115,21 +116,23 @@ while let Some(file_meta) = file_stream.recv().await {
 }
 ```
 
-### Schema Derive Macros
+### Schema Attribute Macro
 
-The `PrestigeSchema` derive macro automatically generates all necessary schema and serialization code:
+The `#[prestige::prestige_schema]` attribute macro automatically generates all necessary schema and serialization code. It also auto-injects `Serialize` and `Deserialize` derives if not already present.
 
 ```rust
-use prestige::PrestigeSchema;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PrestigeSchema)]
+#[prestige::prestige_schema]
+#[derive(Debug, Clone)]
 struct MyData {
     id: u64,
     name: String,
     value: f64,
     optional_field: Option<i32>,
-    binary_data: [u8; 16],  // Automatically mapped to FixedSizeBinary
+    raw_bytes: [u8; 16],             // Default: List(UInt8) — structural representation
+    #[prestige(as_binary)]
+    binary_data: [u8; 16],           // Opt-in: FixedSizeBinary(16)
+    #[prestige(as_binary)]
+    payload: Vec<u8>,                // Opt-in: Binary
 }
 
 // Generated methods:
@@ -139,23 +142,272 @@ struct MyData {
 // - from_arrow_reader() / write_arrow_file() / write_arrow_stream()
 ```
 
-**Important**: Types using `PrestigeSchema` **must** implement `serde::Serialize` and `serde::Deserialize` because prestige uses `serde_arrow` for data transformation between Rust types and Arrow arrays. These traits should be derived before `PrestigeSchema`.
-
-Individual derive macros are also available:
+Individual derive macros are also available for advanced use cases:
 - `#[derive(ArrowGroup)]` - Schema generation only
 - `#[derive(ArrowReader)]` - Reading from Arrow/Parquet (requires `Deserialize`)
 - `#[derive(ArrowWriter)]` - Writing to Arrow/Parquet (requires `Serialize`)
 
-## Complete Example: Data Pipeline
+## Apache Iceberg
+
+Enable with the `iceberg` feature:
+
+```toml
+[dependencies]
+prestige = { version = "0.3", features = ["iceberg"] }
+```
+
+Prestige targets **Iceberg V2 and V3 table formats only**. V1 tables are not supported.
+
+### Schema Definition with Iceberg Annotations
+
+The `prestige_schema` macro supports iceberg-specific annotations for table name, namespace, partition spec, sort order, and identifier fields:
 
 ```rust
-use prestige::{ParquetSinkBuilder, FilePollerConfigBuilder, PrestigeSchema};
-use serde::{Deserialize, Serialize};
-use super_visor::ManagedProc;
+#[prestige::prestige_schema]
+#[prestige(table = "sensor_readings", namespace = "telemetry")]
+#[derive(Debug, Clone)]
+struct SensorReading {
+    #[prestige(identifier)]                    // Identifier field (used for dedup)
+    sensor_id: String,
 
-#[derive(Debug, Clone, Serialize, Deserialize, PrestigeSchema)]
+    #[prestige(partition(day), sort_key(order = 1))]  // Partition by day, sort first
+    timestamp: i64,
+
+    #[prestige(sort_key(order = 2))]           // Sort second (ascending by default)
+    temperature: f64,
+
+    humidity: Option<f64>,
+
+    #[prestige(partition)]                     // Identity partition
+    location: String,
+}
+```
+
+**Partition transforms**: `identity` (default), `year`, `month`, `day`, `hour`, `bucket(n)`, `truncate(n)`
+
+**Sort key options**: `sort_key` (ascending), `sort_key(desc)`, `sort_key(order = N)` for explicit ordering, `sort_key(desc, order = N)` for descending with order
+
+### Catalog Connection
+
+Connect to an Iceberg REST catalog:
+
+```rust
+use prestige::iceberg::{CatalogConfigBuilder, connect_catalog};
+
+let config = CatalogConfigBuilder::default()
+    .catalog_uri("http://localhost:8181")
+    .catalog_name("my_catalog")
+    .warehouse("s3://my-warehouse")
+    .s3(S3Config {
+        region: "us-east-1".into(),
+        endpoint: Some("http://localhost:9000".into()),  // MinIO/LocalStack
+        access_key: Some("minioadmin".into()),
+        secret_key: Some("minioadmin".into()),
+    })
+    .build()?;
+
+let catalog = connect_catalog(&config).await?;
+```
+
+### Streaming Writes (IcebergSink)
+
+The iceberg sink provides pipelined writes to catalog-managed tables with crash recovery:
+
+```rust
+use prestige::iceberg::IcebergSinkBuilder;
+use std::time::Duration;
+
+let (client, sink) = IcebergSinkBuilder::<SensorReading>::for_type(
+    catalog.clone(),
+    "sensor_readings",
+).await?
+.max_rows(500_000)
+.max_size_bytes(64 * 1024 * 1024)     // 64 MB
+.roll_time(Duration::from_secs(60))    // Commit every 60s
+.auto_commit(true)                     // Auto-commit on rotation
+.manifest_dir("/tmp/prestige/manifests") // Enable crash recovery
+.max_pending_commits(3)                // Pipeline up to 3 catalog commits
+.create();
+
+// Run the sink (typically via a supervisor)
+tokio::spawn(sink.run(shutdown_signal));
+
+// Write records — returns immediately, batching happens internally
+client.write(reading).await?;
+
+// Explicit commit returns file paths after all in-flight commits complete
+let file_paths = client.commit().await?;
+```
+
+The sink pipelines S3 writes with catalog commits: while commit N is landing in the catalog, new data can be written to S3 for commit N+1. Per-commit manifest files on local disk ensure crash recovery — on restart, orphaned manifests are detected and re-committed.
+
+### Incremental Reads (IcebergPoller)
+
+Stream new data as it arrives via incremental snapshot scanning:
+
+```rust
+use prestige::iceberg::IcebergPollerConfigBuilder;
+use std::sync::Arc;
+
+let (mut receiver, poller) = IcebergPollerConfigBuilder::new(
+    table,
+    Arc::new(catalog) as Arc<dyn iceberg::Catalog>,
+    "sensor-consumer",
+)
+.poll_interval(Duration::from_secs(10))  // Check every 10s
+.channel_size(5)                          // Buffer up to 5 snapshots
+.send_timeout(Duration::from_secs(30))   // Backpressure timeout
+.start_after_snapshot(last_checkpoint)    // Resume from checkpoint
+.create();
+
+// Run the poller
+tokio::spawn(poller.run(shutdown_signal));
+
+// Consume incremental data
+while let Some(file_stream) = receiver.recv().await {
+    println!("snapshot {} from {}", file_stream.snapshot_id, file_stream.table_name);
+
+    // Process all batches in the stream
+    let mut stream = file_stream.batches;
+    while let Some(batch) = stream.try_next().await? {
+        // Process RecordBatch...
+    }
+
+    // Acknowledge after processing — poller won't advance until acked
+    file_stream.ack();
+}
+```
+
+The poller is compaction-aware: when the compactor rewrites files, the incremental scan correctly filters out `Replace` snapshots to avoid double-delivering data that was already consumed.
+
+### Scan API — Windowed Reads and Time Travel
+
+Prestige provides composable scan functions for arbitrary access patterns:
+
+```rust
+use prestige::iceberg::{
+    scan_table, scan_snapshot, scan_since_snapshot, scan_snapshot_range,
+    scan_at_timestamp, snapshot_at_timestamp, earliest_snapshot,
+    scan_with_filter, scan_columns,
+};
+
+// Full table scan (current state)
+let stream = scan_table(&table).await?;
+
+// Point-in-time snapshot read
+let stream = scan_snapshot(&table, snapshot_id).await?;
+
+// Incremental: all data added after a checkpoint snapshot
+let stream = scan_since_snapshot(&table, after_snapshot_id).await?;
+
+// Windowed: data added between two arbitrary snapshots
+let stream = scan_snapshot_range(&table, from_snapshot, Some(to_snapshot)).await?;
+
+// Time travel: table state as of a timestamp (epoch millis)
+let stream = scan_at_timestamp(&table, 1710547200000).await?;
+
+// Resolve snapshots by timestamp
+let snap_id = snapshot_at_timestamp(&table, timestamp_ms);
+
+// Discover the earliest snapshot for full replay
+let first = earliest_snapshot(&table);
+
+// Predicate pushdown (partition pruning + row-group filtering)
+use prestige::iceberg::{Reference, Datum};
+let filter = Reference::new("temperature").greater_than(Datum::double(100.0));
+let stream = scan_with_filter(&table, filter).await?;
+
+// Column projection
+let stream = scan_columns(&table, vec!["sensor_id", "temperature"]).await?;
+```
+
+### Compaction
+
+The compactor consolidates small files into larger, sorted files:
+
+```rust
+use prestige::iceberg::IcebergCompactorConfigBuilder;
+
+let result = IcebergCompactorConfigBuilder::default()
+    .table(table.clone())
+    .catalog(catalog.clone())
+    .target_file_size_bytes(128 * 1024 * 1024)  // 128 MB target
+    .min_files_to_compact(5_usize)               // Compact when >= 5 files/partition
+    .deduplicate(true)                            // Remove duplicate rows by identifier fields
+    .compression(Compression::ZSTD(Default::default()))
+    .build()?
+    .execute()
+    .await?;
+
+println!(
+    "Compacted {} files into {}, eliminated {} duplicates",
+    result.files_read, result.files_written, result.duplicates_eliminated
+);
+```
+
+Compaction produces `Operation::Replace` snapshots that atomically swap old files for new ones. Output files are sorted according to the table's sort order for optimal query performance. The compactor handles concurrent writes via optimistic concurrency with automatic retry, and correctly applies delete files so that deleted rows are not resurrected in compacted output.
+
+### Automatic Compaction Scheduling
+
+For streaming workloads with frequent small commits, run compaction on a timer:
+
+```rust
+use prestige::iceberg::CompactionSchedulerBuilder;
+
+let scheduler = CompactionSchedulerBuilder::new(
+    table.clone(),
+    catalog.clone(),
+    "sensor_readings",
+)
+.interval(Duration::from_secs(300))       // Check every 5 minutes
+.min_files_to_compact(5)                  // Threshold per partition
+.target_file_size_bytes(128 * 1024 * 1024)
+.deduplicate(true)
+.build();
+
+// Run as a managed process alongside sinks and pollers
+tokio::spawn(scheduler.run(shutdown_signal));
+```
+
+The scheduler performs a lightweight file-count check per partition each cycle, only invoking the full compaction when thresholds are exceeded.
+
+### Write-Audit-Publish (WAP)
+
+For workflows requiring validation before data becomes visible:
+
+```rust
+let (client, sink) = IcebergSinkBuilder::<SensorReading>::for_type(catalog, "sensor_readings")
+    .await?
+    .wap_enabled("audit-branch")   // Write to audit branch
+    .auto_publish(false)           // Don't auto-publish to main
+    .create();
+
+// Write data to audit branch
+client.write(reading).await?;
+client.commit().await?;
+
+// Validate, then publish to main
+client.publish().await?;
+```
+
+### Complete Iceberg Pipeline Example
+
+```rust
+use prestige::iceberg::{
+    CatalogConfigBuilder, IcebergSinkBuilder, IcebergPollerConfigBuilder,
+    CompactionSchedulerBuilder, connect_catalog,
+};
+use std::time::Duration;
+
+#[prestige::prestige_schema]
+#[prestige(table = "events", namespace = "analytics")]
+#[derive(Debug, Clone)]
 struct Event {
-    timestamp: u64,
+    #[prestige(identifier)]
+    event_id: String,
+    #[prestige(partition(day), sort_key(order = 1))]
+    timestamp: i64,
+    #[prestige(partition)]
     event_type: String,
     user_id: String,
     payload: String,
@@ -163,44 +415,44 @@ struct Event {
 
 #[tokio::main]
 async fn main() -> prestige::Result<()> {
-    // Setup S3 client
-    let client = prestige::new_client(None, None, None, None).await;
+    let catalog = connect_catalog(&config).await?;
 
-    // Create file upload service
-    let (uploader, upload_server) = prestige::FileUpload::new(
-        client.clone(),
-        "events-bucket".to_string(),
-    ).await;
+    // --- Writer ---
+    let (sink_client, sink) = IcebergSinkBuilder::<Event>::for_type(catalog.clone(), "events")
+        .await?
+        .auto_commit(true)
+        .roll_time(Duration::from_secs(30))
+        .manifest_dir("/tmp/prestige/manifests")
+        .create();
+    tokio::spawn(sink.run(shutdown.clone()));
 
-    // Create parquet sink
-    let (sink_client, sink) = ParquetSinkBuilder::<Event>::new(
-        "events",
-        "./output",
-        uploader,
-        "event_metrics",
+    // --- Compaction scheduler ---
+    let table = prestige::iceberg::load_table(&catalog, "analytics", "events").await?;
+    let scheduler = CompactionSchedulerBuilder::new(table.clone(), catalog.clone(), "events")
+        .interval(Duration::from_secs(120))
+        .min_files_to_compact(3)
+        .deduplicate(true)
+        .build();
+    tokio::spawn(scheduler.run(shutdown.clone()));
+
+    // --- Consumer ---
+    let (mut rx, poller) = IcebergPollerConfigBuilder::new(
+        table,
+        catalog.as_iceberg_catalog(),
+        "events-consumer",
     )
-    .batch_size(10_000)
-    .max_rows(1_000_000)
-    .rotation_interval(3600)
-    .auto_commit(true)
-    .create()
-    .await?;
+    .poll_interval(Duration::from_secs(5))
+    .create();
+    tokio::spawn(poller.run(shutdown.clone()));
 
     // Write events
-    for i in 0..100_000 {
-        let event = Event {
-            timestamp: chrono::Utc::now().timestamp() as u64,
-            event_type: "click".to_string(),
-            user_id: format!("user_{}", i % 1000),
-            payload: format!("{{\"page\": \"home\", \"index\": {}}}", i),
-        };
+    sink_client.write(Event { /* ... */ }).await?;
 
-        sink_client.write(event, &[]).await?;
+    // Consume events
+    while let Some(stream) = rx.recv().await {
+        // Process stream.batches...
+        stream.ack();
     }
-
-    // Commit and get uploaded file paths
-    let manifest = sink_client.commit().await?;
-    println!("Uploaded {} files", manifest.len());
 
     Ok(())
 }
@@ -239,7 +491,11 @@ ParquetSink includes automatic crash recovery:
 - **Auto-commit disabled**: Incomplete files are deleted on restart
 - **Completed files**: Automatically re-uploaded if found in output directory
 
-This ensures data consistency even if your process crashes during file writing.
+IcebergSink uses per-commit manifest files for crash recovery:
+
+- Data file paths are recorded to local disk before each catalog commit
+- On restart, orphaned manifests are discovered and their data files re-committed
+- Files already committed are detected and manifests cleaned up automatically
 
 ## Optional Features
 
@@ -247,11 +503,13 @@ Enable additional functionality via Cargo features:
 
 ```toml
 [dependencies]
-prestige = { version = "0.1", features = ["chrono", "decimal", "sqlx-postgres"] }
+prestige = { version = "0.3", features = ["iceberg"] }
 ```
 
 - `chrono` (default): Support for `chrono::DateTime` types
 - `decimal`: Support for `rust_decimal::Decimal` types
+- `iceberg`: Apache Iceberg table format support (REST catalog, streaming sink, poller, compactor, scanner)
+- `iceberg-test-harness`: Test utilities for iceberg integration tests
 - `sqlx`: Enable SQLx integration
 - `sqlx-postgres`: PostgreSQL support via SQLx
 - `metrics`: Instrument with performance metrics compatible with the `metrics` crate
@@ -264,66 +522,27 @@ Prestige supports optional metrics collection via two backends:
 ### Using metrics-rs
 ```toml
 [dependencies]
-prestige = { version = "0.1", features = ["metrics"] }
+prestige = { version = "0.3", features = ["metrics"] }
 metrics-exporter-prometheus = "0.16" # or your preferred exporter library
 ```
 
 ### Using OpenTelemetry
 ```toml
 [dependencies]
-prestige = { version = "0.1", features = ["opentelemetry"] }
+prestige = { version = "0.3", features = ["opentelemetry"] }
 opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
 opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
 ```
 
-Configure the meter provider in your application
-\```rust
-use opentelemetry::global;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::metrics::{MeterProviderBuilder, PeriodicReader};
-
-fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint("http://localhost:4317")
-        .build()?;
-
-    let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_interval(std::time::Duration::from_secs(60))
-        .build();
-
-    let provider = MeterProviderBuilder::default()
-        .with_reader(reader)
-        .build();
-
-    global::set_meter_provider(provider);
-    Ok(())
-}
-\```
-
-### Available Metrics
-
-| Metric Name | Type | Description | Labels |
-|-------------|------|-------------|--------|
-| `prestige.file_poller.latency_ms` | Histogram | File processing latency | process_name, file_type |
-| `prestige.file_poller.latest_timestamp_ms` | Gauge | Latest processed file timestamp | process_name, file_type |
-| `prestige.file_poller.files_processed` | Counter | Files processed count | process_name, file_type, status |
-| `prestige.file_upload.duration_ms` | Histogram | S3 upload duration | bucket |
-| `prestige.file_upload.count` | Counter | Files uploaded count | bucket, status |
-| `prestige.file_upload.size_bytes` | Histogram | Uploaded file sizes | bucket |
-| `prestige.file_sink.records_written` | Counter | Records written to parquet | sink |
-| `prestige.file_sink.files_created` | Counter | Parquet files created | sink |
-| `prestige.file_sink.write_duration_ms` | Histogram | Batch write duration | sink |
-
 ### Disabling Metrics
 
 To compile without any metrics overhead, simply don't enable either feature:
 
-\```
+```toml
 [dependencies]
-prestige = "0.1"  # No features = no-op metrics impl
-\```
+prestige = "0.3"  # No features = no-op metrics impl
+```
 
 ## Performance Considerations
 
@@ -331,6 +550,8 @@ prestige = "0.1"  # No features = no-op metrics impl
 - **File Rotation**: Balance between number of files and file size (default: no rotation)
 - **Buffering**: File source reads up to 2 files concurrently by default
 - **Parallel S3 Reads**: Use `source_s3_files_unordered()` for maximum throughput when order doesn't matter
+- **Iceberg Commit Pipeline**: The sink pipelines S3 writes with catalog commits — tune `max_pending_commits` based on commit latency vs memory
+- **Compaction Interval**: More frequent compaction keeps file counts low for query performance, but each compaction cycle has I/O cost
 
 ## License
 

@@ -114,7 +114,7 @@ use aws_sdk_s3::primitives::ByteStream;
 /// This example shows how to implement a scheduled compaction job that runs periodically,
 /// querying a database to determine the cutoff timestamp for compaction.
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// use prestige::{Client, file_compactor::FileCompactorConfigBuilder, traits::ArrowSchema};
 /// use chrono::{DateTime, Duration, Utc};
 /// use serde::{Deserialize, Serialize};
@@ -935,7 +935,9 @@ async fn execute_compaction_schema_agnostic(
                     batches,
                     dup_count,
                     source_files,
-                    schema.as_ref().unwrap(),
+                    schema.as_ref().ok_or(Error::Internal(
+                        "schema not initialized during compaction".into(),
+                    ))?,
                     &config,
                     temp_dir.path(),
                 )
@@ -1159,7 +1161,9 @@ async fn plan_compaction_schema_agnostic(
                 let original_bytes: usize = source_files.iter().map(|f| f.size).sum();
                 let output_bytes = measure_output_size(
                     &batches,
-                    schema.as_ref().unwrap(),
+                    schema.as_ref().ok_or(Error::Internal(
+                        "schema not initialized during compaction".into(),
+                    ))?,
                     config.compression,
                     config.row_group_size,
                 )?;

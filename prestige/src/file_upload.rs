@@ -1,3 +1,14 @@
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use futures::StreamExt;
+use super_visor::{ManagedProc, ShutdownSignal};
+use tokio::{fs, sync::mpsc, time::sleep};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::{debug, error, info, warn};
+
 use crate::{
     Client, Result,
     error::ChannelError,
@@ -6,15 +17,6 @@ use crate::{
         self, FILE_UPLOAD_COUNT, FILE_UPLOAD_DURATION_MS, FILE_UPLOAD_SIZE_BYTES, telemetry_labels,
     },
 };
-use futures::StreamExt;
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
-use super_visor::{ManagedProc, ShutdownSignal};
-use tokio::{fs, sync::mpsc, time::sleep};
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, warn};
 
 pub type MessageSender = mpsc::UnboundedSender<PathBuf>;
 pub type MessageReceiver = mpsc::UnboundedReceiver<PathBuf>;

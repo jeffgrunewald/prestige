@@ -1,5 +1,7 @@
 use crate::{
-    Client, FileMeta, RecordBatchStream, Result, file_source, list_all_files,
+    Client, FileMeta, RecordBatchStream, Result,
+    error::Error,
+    file_source, list_all_files,
     telemetry::{
         self, FILE_POLLER_FILES_PROCESSED, FILE_POLLER_LATENCY_MS, FILE_POLLER_LATEST_TIMESTAMP_MS,
         telemetry_labels,
@@ -227,30 +229,37 @@ where
         self.config.poll_duration
     }
 
-    fn after(&self, latest_file_timestamp: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    fn after(&self, latest_file_timestamp: Option<DateTime<Utc>>) -> Result<Option<DateTime<Utc>>> {
         let offset = self.config.offset;
+        let chrono_offset = chrono::Duration::from_std(offset).map_err(|_| {
+            Error::Internal(format!(
+                "offset duration {offset:?} out of range for chrono"
+            ))
+        })?;
         match self.config.lookback {
             LookbackBehavior::StartAfter(start_after) => {
-                let latest_with_offset = latest_file_timestamp
-                    .map(|ts| ts - chrono::Duration::from_std(offset).unwrap());
+                let latest_with_offset = latest_file_timestamp.map(|ts| ts - chrono_offset);
 
                 match (latest_with_offset, Some(start_after)) {
-                    (Some(latest), Some(start)) if latest > start => Some(latest),
-                    (Some(_), Some(start)) => Some(start),
-                    (Some(latest), None) => Some(latest),
-                    (None, Some(start)) => Some(start),
-                    (None, None) => None,
+                    (Some(latest), Some(start)) if latest > start => Ok(Some(latest)),
+                    (Some(_), Some(start)) => Ok(Some(start)),
+                    (Some(latest), None) => Ok(Some(latest)),
+                    (None, Some(start)) => Ok(Some(start)),
+                    (None, None) => Ok(None),
                 }
             }
             LookbackBehavior::Max(max_lookback) => {
-                let max_lookback_time =
-                    Utc::now() - chrono::Duration::from_std(max_lookback).unwrap();
-                let latest_with_offset = latest_file_timestamp
-                    .map(|ts| ts - chrono::Duration::from_std(offset).unwrap());
+                let chrono_max = chrono::Duration::from_std(max_lookback).map_err(|_| {
+                    Error::Internal(format!(
+                        "max_lookback duration {max_lookback:?} out of range for chrono"
+                    ))
+                })?;
+                let max_lookback_time = Utc::now() - chrono_max;
+                let latest_with_offset = latest_file_timestamp.map(|ts| ts - chrono_offset);
 
                 match latest_with_offset {
-                    Some(latest) if latest > max_lookback_time => Some(latest),
-                    _ => Some(max_lookback_time),
+                    Some(latest) if latest > max_lookback_time => Ok(Some(latest)),
+                    _ => Ok(Some(max_lookback_time)),
                 }
             }
         }
@@ -285,7 +294,7 @@ where
                 return Ok(file_meta);
             }
 
-            let after = self.after(self.latest_file_timestamp);
+            let after = self.after(self.latest_file_timestamp)?;
             let before = Utc::now();
             let files = list_all_files(
                 &self.config.client,
@@ -333,8 +342,10 @@ where
                     break Ok(());
                 }
                 _ = cleanup_trigger.tick() => {
-                    let offset = self.after(self.latest_file_timestamp)
-                        .unwrap_or_else(|| Utc::now() - chrono::Duration::from_std(CLEAN_DURATION).unwrap());
+                    let clean_duration = chrono::Duration::from_std(CLEAN_DURATION)
+                        .map_err(|_| Error::Internal(format!("CLEAN_DURATION {CLEAN_DURATION:?} out of range for chrono")))?;
+                    let offset = self.after(self.latest_file_timestamp)?
+                        .unwrap_or_else(|| Utc::now() - clean_duration);
                     match self.config.state.clean(process_name.as_str(), &prefix, offset).await {
                         Ok(count) => {
                             debug!(

@@ -1,11 +1,11 @@
-use crate::{
-    ArrowSchema, Error, FileMeta, FileUpload, Result,
-    error::ChannelError,
-    telemetry::{
-        self, SINK_BATCH_SIZE, SINK_FILES_ROTATED, SINK_RECORDS_WRITTEN, SINK_WRITE_ERRORS,
-        telemetry_labels,
-    },
+use std::{
+    fs::File,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::Duration,
 };
+
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use chrono::{DateTime, Utc};
 use parquet::{
@@ -14,13 +14,6 @@ use parquet::{
     file::properties::{EnabledStatistics, WriterProperties},
 };
 use serde::Serialize;
-use std::{
-    fs::File,
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    sync::Mutex,
-    time::Duration,
-};
 use super_visor::{ManagedProc, ShutdownSignal};
 use tokio::{
     fs,
@@ -31,6 +24,15 @@ use tokio::{
     time,
 };
 use tracing::{debug, error, info, warn};
+
+use crate::{
+    ArrowSchema, Error, FileMeta, FileUpload, Result,
+    error::ChannelError,
+    telemetry::{
+        self, SINK_BATCH_SIZE, SINK_FILES_ROTATED, SINK_RECORDS_WRITTEN, SINK_WRITE_ERRORS,
+        telemetry_labels,
+    },
+};
 
 // Configuration constants
 pub const DEFAULT_SINK_ROLL_SECS: u64 = 3 * 60; // 3 minutes
