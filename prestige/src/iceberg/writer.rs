@@ -75,7 +75,7 @@ pub async fn write_data_files_with_target_size(
                     if col.data_type() == target_field.data_type() {
                         Ok(col.clone())
                     } else {
-                        cast(col, target_field.data_type()).map_err(arrow::error::ArrowError::from)
+                        cast(col, target_field.data_type())
                     }
                 })
                 .collect::<std::result::Result<_, _>>()?;
