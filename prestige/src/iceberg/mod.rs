@@ -2,6 +2,7 @@
 pub(crate) mod branch;
 mod catalog;
 mod compactor;
+mod manifest;
 mod poller;
 mod scanner;
 mod schema;

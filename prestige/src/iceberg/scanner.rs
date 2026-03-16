@@ -1,11 +1,12 @@
 use crate::error::Result;
 use arrow::array::RecordBatch;
-use futures::TryStreamExt;
-use futures::stream::BoxStream;
-use iceberg::arrow::ArrowReaderBuilder;
-use iceberg::expr::Predicate;
-use iceberg::spec::ManifestStatus;
-use iceberg::table::Table;
+use futures::{TryStreamExt, stream::BoxStream};
+use iceberg::{
+    arrow::ArrowReaderBuilder,
+    expr::Predicate,
+    spec::{ManifestStatus, Operation},
+    table::Table,
+};
 use std::collections::HashSet;
 use tracing::debug;
 
@@ -73,6 +74,27 @@ pub async fn scan_since_snapshot(
         "scanning incremental data since checkpoint"
     );
 
+    // Build set of sequence numbers for Replace (compaction) snapshots between
+    // the checkpoint and the current snapshot. Manifests created by these
+    // snapshots contain rewritten data files that would cause double-processing.
+    let mut replace_seq_nums: HashSet<i64> = HashSet::new();
+    {
+        let mut snap_id = Some(current_snapshot.snapshot_id());
+        while let Some(id) = snap_id {
+            if id == after_snapshot_id {
+                break;
+            }
+            if let Some(snapshot) = table.metadata().snapshot_by_id(id) {
+                if snapshot.summary().operation == Operation::Replace {
+                    replace_seq_nums.insert(snapshot.sequence_number());
+                }
+                snap_id = snapshot.parent_snapshot_id();
+            } else {
+                break;
+            }
+        }
+    }
+
     // Walk the current snapshot's manifest list and collect paths of newly added files.
     let manifest_list = current_snapshot
         .load_manifest_list(table.file_io(), table.metadata())
@@ -83,6 +105,15 @@ pub async fn scan_since_snapshot(
     for manifest_file in manifest_list.entries() {
         // Skip manifests that existed at or before the checkpoint.
         if manifest_file.sequence_number <= after_seq_num {
+            continue;
+        }
+
+        // Skip manifests created by compaction (Replace) snapshots.
+        if replace_seq_nums.contains(&manifest_file.sequence_number) {
+            debug!(
+                seq = manifest_file.sequence_number,
+                "skipping compaction manifest"
+            );
             continue;
         }
 

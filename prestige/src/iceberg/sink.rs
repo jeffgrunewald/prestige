@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use iceberg::table::Table;
 use parquet::basic::Compression;
 use serde::Serialize;
-use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{collections::HashMap, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
 use super_visor::{ManagedProc, ShutdownSignal};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::{
     catalog::Catalog,
+    manifest::CommitManifest,
     schema::IcebergSchema,
     table::{IcebergTableConfigBuilder, ensure_table_for, ensure_table_for_with},
 };
@@ -86,6 +87,7 @@ pub struct IcebergSinkBuilder<T> {
     snapshot_properties: HashMap<String, String>,
     wap_branch: Option<String>,
     auto_publish: bool,
+    manifest_dir: Option<PathBuf>,
     _phantom: PhantomData<T>,
 }
 
@@ -127,6 +129,7 @@ impl<T> IcebergSinkBuilder<T> {
             snapshot_properties: HashMap::new(),
             wap_branch: None,
             auto_publish: true,
+            manifest_dir: None,
             _phantom: PhantomData,
         }
     }
@@ -196,11 +199,35 @@ impl<T> IcebergSinkBuilder<T> {
         }
     }
 
+    /// Enable local write-ahead manifest for crash recovery. Data file paths
+    /// are recorded to disk before catalog commit so they can be re-committed
+    /// on restart if the process crashes mid-commit.
+    pub fn manifest_dir(self, dir: impl Into<PathBuf>) -> Self {
+        Self {
+            manifest_dir: Some(dir.into()),
+            ..self
+        }
+    }
+
     pub fn create(self) -> (IcebergSinkClient<T>, IcebergSink<T>)
     where
         T: ArrowSchema + Serialize,
     {
         let (tx, rx) = mpsc::channel(50);
+
+        let manifest = self.manifest_dir.as_ref().and_then(|dir| {
+            match CommitManifest::new(dir, &self.label) {
+                Ok(m) => Some(m),
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        label = self.label,
+                        "failed to create commit manifest, running without crash recovery"
+                    );
+                    None
+                }
+            }
+        });
 
         (
             IcebergSinkClient::new(tx, self.label.clone()),
@@ -224,6 +251,7 @@ impl<T> IcebergSinkBuilder<T> {
                 snapshot_properties: self.snapshot_properties,
                 wap_branch: self.wap_branch,
                 auto_publish: self.auto_publish,
+                manifest,
                 _phantom: PhantomData,
             },
         )
@@ -381,6 +409,7 @@ pub struct IcebergSink<T> {
     snapshot_properties: HashMap<String, String>,
     wap_branch: Option<String>,
     auto_publish: bool,
+    manifest: Option<CommitManifest>,
     _phantom: PhantomData<T>,
 }
 
@@ -393,6 +422,29 @@ impl<T: Send + Sync + Serialize + 'static> ManagedProc for IcebergSink<T> {
 impl<T: Serialize> IcebergSink<T> {
     pub async fn run(mut self, mut shutdown: ShutdownSignal) -> Result {
         info!(label = self.label, "starting iceberg sink");
+
+        // Recover any pending commit from a previous crash.
+        if let Some(ref manifest) = self.manifest {
+            match super::manifest::recover_pending_commit(
+                manifest,
+                &self.table,
+                self.catalog.as_iceberg_catalog().as_ref(),
+            )
+            .await
+            {
+                Ok(Some(updated_table)) => {
+                    self.table = updated_table;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        label = self.label,
+                        ?err,
+                        "manifest recovery failed, continuing"
+                    );
+                }
+            }
+        }
 
         let mut rollover_timer = time::interval(Duration::from_millis(SINK_CHECK_MILLIS));
         rollover_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -546,117 +598,108 @@ impl<T: Serialize> IcebergSink<T> {
         self.flush_buffer()?;
 
         let batches = std::mem::take(&mut self.staged_batches);
-        self.row_count = 0;
-        self.approximate_size = 0;
-        self.created_at = None;
 
         if batches.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Reload the table before writing data files to ensure the FileIO
-        // instance carries fresh vended S3 credentials from the catalog.
-        // Without this, long-running sinks would use stale credentials from
-        // the previous commit cycle.
-        self.reload_table().await?;
+        // Reload table metadata before writing to get current schema/partition info.
+        if let Err(err) = self.reload_table().await {
+            // Restore batches so data isn't lost.
+            self.staged_batches = batches;
+            return Err(err);
+        }
 
-        let data_files =
-            super::writer::write_data_files(&self.table, batches, Some(self.compression)).await?;
+        // Write data files to S3. RecordBatch clone is cheap (Arc column
+        // refs), so we keep the originals to restore on failure.
+        let data_files = match super::writer::write_data_files(
+            &self.table,
+            batches.clone(),
+            Some(self.compression),
+        )
+        .await
+        {
+            Ok(files) => {
+                // Drop the backup — data is durable in S3.
+                drop(batches);
+                files
+            }
+            Err(err) => {
+                warn!(label = self.label, ?err, "failed to write data files to S3");
+                self.staged_batches = batches;
+                return Err(err);
+            }
+        };
 
-        let manifest: Vec<String> = data_files
+        let file_paths: Vec<String> = data_files
             .iter()
             .map(|f| f.file_path().to_string())
             .collect();
 
-        if let Some(branch_name) = self.wap_branch.clone() {
-            // WAP commit path: write to audit branch.
-            if self
-                .table
-                .metadata()
-                .snapshot_for_ref(&branch_name)
-                .is_none()
-            {
-                super::branch::create_branch(&self.catalog, &self.table, &branch_name).await?;
-                self.reload_table().await?;
-            }
-
-            let wap_id = Uuid::now_v7().to_string();
-            super::branch::commit_to_branch(
-                &self.catalog,
-                &self.table,
-                &branch_name,
-                data_files,
-                &wap_id,
-            )
-            .await?;
-
-            self.reload_table().await?;
-
-            if self.auto_publish {
-                super::branch::publish_branch(&self.catalog, &self.table, &branch_name).await?;
-                self.reload_table().await?;
-                info!(
-                    label = self.label,
-                    files = manifest.len(),
-                    branch = %branch_name,
-                    "committed and published iceberg WAP snapshot"
-                );
-            } else {
-                info!(
-                    label = self.label,
-                    files = manifest.len(),
-                    branch = %branch_name,
-                    "committed iceberg WAP snapshot (awaiting publish)"
-                );
+        // Record to local manifest before catalog commit (crash recovery).
+        // If this fails we still attempt the catalog commit — a successful
+        // commit makes the data durable regardless. We only lose crash
+        // recovery protection for this specific commit window.
+        let manifest_recorded = if let Some(ref manifest) = self.manifest {
+            let partition_spec_id = self.table.metadata().default_partition_spec_id();
+            match manifest.record_files(&data_files, partition_spec_id) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(
+                        label = self.label,
+                        ?err,
+                        "failed to write local manifest, crash recovery unavailable for this commit"
+                    );
+                    false
+                }
             }
         } else {
-            // Direct commit path: fast_append to main.
-            let snapshot_props = if self.snapshot_properties.is_empty() {
-                None
-            } else {
-                Some(self.snapshot_properties.clone())
-            };
+            false
+        };
 
-            let updated_table = super::writer::commit_data_files(
-                &self.table,
-                self.catalog.as_iceberg_catalog().as_ref(),
-                data_files,
-                snapshot_props,
-            )
-            .await?;
+        // Catalog commit (Transaction handles retry internally).
+        let commit_result = if let Some(ref branch_name) = self.wap_branch {
+            self.commit_wap(branch_name.clone(), data_files).await
+        } else {
+            self.commit_direct(data_files).await
+        };
 
-            self.table = updated_table;
+        match commit_result {
+            Ok(()) => {
+                // Clear manifest and reset counters only on success.
+                if manifest_recorded
+                    && let Some(ref manifest) = self.manifest
+                    && let Err(err) = manifest.clear()
+                {
+                    warn!(label = self.label, ?err, "failed to clear local manifest");
+                }
+                self.row_count = 0;
+                self.approximate_size = 0;
+                self.created_at = None;
 
-            info!(
-                label = self.label,
-                files = manifest.len(),
-                "committed iceberg snapshot"
-            );
+                info!(
+                    label = self.label,
+                    files = file_paths.len(),
+                    "committed iceberg snapshot"
+                );
+                Ok(file_paths)
+            }
+            Err(err) => {
+                // Data files are in S3. If the manifest was written, recovery
+                // on restart will re-attempt the catalog commit. If the
+                // manifest write also failed, the S3 files are orphaned —
+                // this is logged above at warn level.
+                self.row_count = 0;
+                self.approximate_size = 0;
+                self.created_at = None;
+                Err(err)
+            }
         }
-
-        Ok(manifest)
-    }
-
-    async fn publish_wap(&mut self) -> Result {
-        let branch_name = self.wap_branch.clone().ok_or_else(|| {
-            crate::Error::Branch("cannot publish: WAP not enabled on this sink".into())
-        })?;
-
-        super::branch::publish_branch(&self.catalog, &self.table, &branch_name).await?;
-        self.reload_table().await?;
-
-        info!(
-            label = self.label,
-            branch = %branch_name,
-            "published WAP branch to main"
-        );
-
-        Ok(())
     }
 
     /// Reload the table, reconnecting the catalog if the first attempt fails
     /// with an authentication error (expired internal OAuth2 token).
-    async fn reload_table(&mut self) -> Result {
+    async fn reload_table(&mut self) -> Result<()> {
         match self.catalog.load_table(self.table.identifier()).await {
             Ok(table) => {
                 self.table = table;
@@ -673,6 +716,106 @@ impl<T: Serialize> IcebergSink<T> {
                 Ok(())
             }
         }
+    }
+
+    async fn commit_direct(&mut self, data_files: Vec<iceberg::spec::DataFile>) -> Result<()> {
+        let snapshot_props = if self.snapshot_properties.is_empty() {
+            None
+        } else {
+            Some(self.snapshot_properties.clone())
+        };
+
+        // Transaction::commit internally reloads the table, rebases on
+        // conflict, and retries with exponential backoff — no outer retry
+        // needed.
+        match super::writer::commit_data_files(
+            &self.table,
+            self.catalog.as_iceberg_catalog().as_ref(),
+            data_files,
+            snapshot_props,
+        )
+        .await
+        {
+            Ok(updated_table) => {
+                self.table = updated_table;
+                Ok(())
+            }
+            Err(err) if super::manifest::is_already_committed(&err) => {
+                info!(
+                    label = self.label,
+                    "data files already committed, treating as success"
+                );
+                // Refresh table to pick up the snapshot that contains our files.
+                self.reload_table().await?;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn commit_wap(
+        &mut self,
+        branch_name: String,
+        data_files: Vec<iceberg::spec::DataFile>,
+    ) -> Result<()> {
+        if self
+            .table
+            .metadata()
+            .snapshot_for_ref(&branch_name)
+            .is_none()
+        {
+            super::branch::create_branch(&self.catalog, &self.table, &branch_name).await?;
+            self.table = self.catalog.load_table(self.table.identifier()).await?;
+        }
+
+        let wap_id = Uuid::now_v7().to_string();
+        match super::branch::commit_to_branch(
+            &self.catalog,
+            &self.table,
+            &branch_name,
+            data_files,
+            &wap_id,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(err) if super::manifest::is_already_committed(&err) => {
+                info!(
+                    label = self.label,
+                    branch = branch_name,
+                    "WAP data files already committed, treating as success"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+
+        self.table = self.catalog.load_table(self.table.identifier()).await?;
+
+        if self.auto_publish {
+            super::branch::publish_branch(&self.catalog, &self.table, &branch_name).await?;
+            self.table = self.catalog.load_table(self.table.identifier()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn publish_wap(&mut self) -> Result {
+        let Some(ref branch_name) = self.wap_branch else {
+            return Err(crate::Error::Branch(
+                "cannot publish: WAP not enabled on this sink".into(),
+            ));
+        };
+
+        super::branch::publish_branch(&self.catalog, &self.table, branch_name).await?;
+        self.table = self.catalog.load_table(self.table.identifier()).await?;
+
+        info!(
+            label = self.label,
+            branch = branch_name,
+            "published WAP branch to main"
+        );
+
+        Ok(())
     }
 
     async fn rollback(&mut self) -> Result<IcebergFileManifest> {
