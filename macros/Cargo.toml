@@ -3,7 +3,12 @@ name = "prestige-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 description = "Proc macro for deriving Prestige parquet trait implementations"
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 proc-macro = true

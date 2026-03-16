@@ -4,13 +4,14 @@ members = ["prestige", "cli", "macros"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Jeff Grunewald <jeff@grunewalddesign.com>"]
 readme = "README.md"
-description = "Library for creating streaming sources and sinks for efficient parquet files in S3-compatible object storage"
+description = "Library for creating streaming sources and sinks for efficient iceberg tables and parquet files in S3-compatible object storage"
+homepage = "https://github.com/jeffgrunewald/prestige"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/jeffgrunewald/prestige-rs"
-keywords = ["database", "async", "file", "s3", "object-storage", "parquet", "sink", "streaming", "storage", "analytics"]
+repository = "https://github.com/jeffgrunewald/prestige"
+keywords = ["database", "async", "file", "s3", "object-storage", "parquet", "sink", "streaming", "storage", "analytics", "iceberg"]
 categories = ["asynchronous", "encoding", "filesystem"]
 edition = "2024"
 

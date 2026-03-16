@@ -134,6 +134,95 @@ prestige compact \
   --region us-east-1
 ```
 
+### iceberg-compact
+
+Compact an Iceberg table by rewriting small files into larger, sorted files. Requires the `iceberg` feature flag.
+
+```bash
+cargo build --release --package prestige-cli --features iceberg
+```
+
+#### Basic Usage
+
+```bash
+prestige iceberg-compact \
+  --catalog-uri http://localhost:8181 \
+  --warehouse s3://my-warehouse \
+  --namespace telemetry \
+  --table sensor_readings \
+  --target-bytes 134217728 \
+  --min-files 5
+```
+
+#### Options
+
+- `--catalog-uri <URI>` - REST catalog URI (env: `ICEBERG_CATALOG_URI`) (required)
+- `--catalog-name <NAME>` - Catalog name (default: "default")
+- `--warehouse <WAREHOUSE>` - Warehouse identifier (env: `ICEBERG_WAREHOUSE`) (required)
+- `--namespace <NAMESPACE>` - Iceberg namespace, dot-separated (required)
+- `--table <TABLE>` - Table name (required)
+- `--target-bytes <BYTES>` - Target file size in bytes (default: 104857600 = 100MB)
+- `--deduplicate` - Enable row-level deduplication by identifier fields (default: false)
+- `--min-files <N>` - Minimum number of files before compaction triggers (default: 5)
+- `--compression <TYPE>` - Compression algorithm: snappy, gzip, lzo, brotli, lz4, zstd, uncompressed
+- `--s3-endpoint <URL>` - S3 endpoint override (env: `AWS_ENDPOINT_URL`)
+- `--s3-region <REGION>` - S3 region (env: `AWS_REGION`)
+- `--s3-access-key <KEY>` - S3 access key (env: `AWS_ACCESS_KEY_ID`)
+- `--s3-secret-key <KEY>` - S3 secret key (env: `AWS_SECRET_ACCESS_KEY`)
+
+### iceberg-scan
+
+Scan and display records from an Iceberg table.
+
+#### Basic Usage
+
+```bash
+prestige iceberg-scan \
+  --catalog-uri http://localhost:8181 \
+  --warehouse s3://my-warehouse \
+  --namespace telemetry \
+  --table sensor_readings \
+  --limit 50
+```
+
+#### Options
+
+- `--catalog-uri <URI>` - REST catalog URI (env: `ICEBERG_CATALOG_URI`) (required)
+- `--catalog-name <NAME>` - Catalog name (default: "default")
+- `--warehouse <WAREHOUSE>` - Warehouse identifier (env: `ICEBERG_WAREHOUSE`) (required)
+- `--namespace <NAMESPACE>` - Iceberg namespace, dot-separated (required)
+- `--table <TABLE>` - Table name (required)
+- `--limit <N>` - Maximum number of records to display (default: 20)
+- `--snapshot-id <ID>` - Scan a specific snapshot (time travel)
+- `--filter <EXPR>` - Row filter expression (repeatable, ANDed together). Format: `"column op value"` where op is `=`, `!=`, `>`, `>=`, `<`, or `<=`
+- S3/catalog connection options (same as iceberg-compact)
+
+#### Filter Examples
+
+```bash
+prestige iceberg-scan \
+  --catalog-uri http://localhost:8181 \
+  --warehouse s3://my-warehouse \
+  --namespace telemetry \
+  --table sensor_readings \
+  --filter "temperature > 100.0" \
+  --filter "location = us-east-1"
+```
+
+### iceberg-info
+
+Display Iceberg table metadata including schema, partition spec, snapshots, and properties.
+
+```bash
+prestige iceberg-info \
+  --catalog-uri http://localhost:8181 \
+  --warehouse s3://my-warehouse \
+  --namespace telemetry \
+  --table sensor_readings
+```
+
+Connection options are the same as iceberg-compact and iceberg-scan.
+
 ## Examples
 
 ### Compact last hour of data
