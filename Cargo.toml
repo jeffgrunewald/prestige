@@ -4,7 +4,7 @@ members = ["prestige", "cli", "macros"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 authors = ["Jeff Grunewald <jeff@grunewalddesign.com>"]
 readme = "README.md"
 description = "Library for creating streaming sources and sinks for efficient iceberg tables and parquet files in S3-compatible object storage"
@@ -18,8 +18,8 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0"
-aws-config = "1"
-aws-sdk-s3 = "1"
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-types-convert = { version = "0", features = ["convert-streams"] }
 blake3 = "1"
 bytes = "1"
