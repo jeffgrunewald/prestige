@@ -431,6 +431,7 @@ fn generate_iceberg_schema_impl(
     let identifier_impl = quote! { &[#(#identifier_names),*] };
 
     Ok(quote! {
+        #[allow(unexpected_cfgs)]
         #[cfg(feature = "iceberg")]
         impl ::prestige::iceberg::IcebergSchema for #name {
             fn iceberg_schema() -> ::prestige::iceberg::Schema {
@@ -523,6 +524,7 @@ fn generate_sort_and_partition_impl(
         .collect();
 
     Ok(quote! {
+        #[allow(unexpected_cfgs)]
         #[cfg(feature = "iceberg")]
         impl #name {
             pub fn sort_field_definitions() -> &'static [::prestige::iceberg::SortFieldDef] {

@@ -32,7 +32,7 @@ uuid = { version = "1", features = ["v4", "v7"], optional = true }
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet.workspace = true
-prestige-macros = { version = "0.3.2", path = "../macros" }
+prestige-macros = { version = "0.3.3", path = "../macros" }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
