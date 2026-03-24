@@ -8,7 +8,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     time,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::error::Result;
 
@@ -234,7 +234,7 @@ impl IcebergPollerServer {
 
         // Already processed this snapshot
         if self.last_snapshot_id == Some(current_id) {
-            debug!(
+            trace!(
                 label = self.config.label,
                 snapshot_id = current_id,
                 "no new snapshot"
