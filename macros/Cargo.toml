@@ -24,3 +24,4 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 
 [features]
 chrono = ["dep:chrono"]
+iceberg = []

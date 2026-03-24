@@ -166,6 +166,7 @@ fn validate_identifier_fields(
     Ok(())
 }
 
+#[cfg(feature = "iceberg")]
 /// Parsed sort key metadata from `#[prestige(sort_key)]` or `#[prestige(sort_key(desc, order = 2))]`.
 #[derive(Debug)]
 struct SortKeyAttr {
@@ -173,6 +174,7 @@ struct SortKeyAttr {
     explicit_order: Option<u32>,
 }
 
+#[cfg(feature = "iceberg")]
 /// Parsed partition metadata from `#[prestige(partition)]` or `#[prestige(partition(day))]`.
 #[derive(Debug)]
 enum PartitionTransform {
@@ -185,6 +187,7 @@ enum PartitionTransform {
     Truncate(u32),
 }
 
+#[cfg(feature = "iceberg")]
 /// Extract sort_key attribute from a field's `#[prestige(...)]` attributes.
 fn extract_sort_key_attr(field: &syn::Field) -> Option<SortKeyAttr> {
     for attr in &field.attrs {
@@ -228,6 +231,7 @@ fn extract_sort_key_attr(field: &syn::Field) -> Option<SortKeyAttr> {
     None
 }
 
+#[cfg(feature = "iceberg")]
 /// Extract partition attribute from a field's `#[prestige(...)]` attributes.
 fn extract_partition_attr(field: &syn::Field) -> Result<Option<PartitionTransform>, Error> {
     for attr in &field.attrs {
@@ -289,6 +293,7 @@ fn extract_partition_attr(field: &syn::Field) -> Result<Option<PartitionTransfor
     Ok(None)
 }
 
+#[cfg(feature = "iceberg")]
 /// Collect sort field definitions from struct fields.
 fn collect_sort_field_defs(
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
@@ -302,6 +307,7 @@ fn collect_sort_field_defs(
         .collect()
 }
 
+#[cfg(feature = "iceberg")]
 /// Collect partition field definitions from struct fields.
 fn collect_partition_field_defs(
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
@@ -315,6 +321,7 @@ fn collect_partition_field_defs(
     Ok(result)
 }
 
+#[cfg(feature = "iceberg")]
 /// Parsed struct-level `#[prestige(...)]` attributes.
 #[derive(Debug, Default)]
 struct StructPrestigeAttrs {
@@ -322,7 +329,8 @@ struct StructPrestigeAttrs {
     namespace: Option<Vec<String>>,
 }
 
-/// Generate the `impl IcebergSchema for T` block (gated by `#[cfg(feature = "iceberg")]`).
+#[cfg(feature = "iceberg")]
+/// Generate the `impl IcebergSchema for T` block.
 fn generate_iceberg_schema_impl(
     name: &syn::Ident,
     struct_attrs: &StructPrestigeAttrs,
@@ -431,7 +439,6 @@ fn generate_iceberg_schema_impl(
     let identifier_impl = quote! { &[#(#identifier_names),*] };
 
     Ok(quote! {
-        #[allow(unexpected_cfgs)]
         #[cfg(feature = "iceberg")]
         impl ::prestige::iceberg::IcebergSchema for #name {
             fn iceberg_schema() -> ::prestige::iceberg::Schema {
@@ -464,7 +471,8 @@ fn generate_iceberg_schema_impl(
     })
 }
 
-/// Generate the sort_field_definitions() and partition_field_defs() methods.
+#[cfg(feature = "iceberg")]
+/// Generate the sort_field_definitions() and partition_field_definitions() methods.
 fn generate_sort_and_partition_impl(
     name: &syn::Ident,
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
@@ -524,7 +532,6 @@ fn generate_sort_and_partition_impl(
         .collect();
 
     Ok(quote! {
-        #[allow(unexpected_cfgs)]
         #[cfg(feature = "iceberg")]
         impl #name {
             pub fn sort_field_definitions() -> &'static [::prestige::iceberg::SortFieldDef] {
@@ -789,6 +796,8 @@ pub fn prestige_schema(args: TokenStream, input: TokenStream) -> TokenStream {
     let mut item = parse_macro_input!(input as ItemStruct);
 
     // Parse struct-level args from the attribute: #[prestige_schema(table = "...", namespace = "...")]
+    // The table and namespace args are only used for iceberg schema generation.
+    #[cfg(feature = "iceberg")]
     let struct_attrs = match syn::parse::Parser::parse(
         |input: syn::parse::ParseStream| {
             let mut result = StructPrestigeAttrs::default();
@@ -818,6 +827,8 @@ pub fn prestige_schema(args: TokenStream, input: TokenStream) -> TokenStream {
         Ok(attrs) => attrs,
         Err(err) => return err.to_compile_error().into(),
     };
+    #[cfg(not(feature = "iceberg"))]
+    let _ = args;
 
     // Extract named fields (must be a struct with named fields).
     let fields = match &mut item.fields {
@@ -932,16 +943,22 @@ pub fn prestige_schema(args: TokenStream, input: TokenStream) -> TokenStream {
     let identifier_names = collect_identifier_field_names(&fields.named);
     let name = &item.ident;
 
+    #[cfg(feature = "iceberg")]
     let sort_and_partition = match generate_sort_and_partition_impl(name, &fields.named) {
         Ok(tokens) => tokens,
         Err(err) => return err.to_compile_error().into(),
     };
+    #[cfg(not(feature = "iceberg"))]
+    let sort_and_partition = proc_macro2::TokenStream::new();
 
+    #[cfg(feature = "iceberg")]
     let iceberg_schema_impl =
         match generate_iceberg_schema_impl(name, &struct_attrs, &identifier_names, &fields.named) {
             Ok(tokens) => tokens,
             Err(err) => return err.to_compile_error().into(),
         };
+    #[cfg(not(feature = "iceberg"))]
+    let iceberg_schema_impl = proc_macro2::TokenStream::new();
 
     let arrow_group = generate_arrow_group_impl(name, &fields.named);
     let arrow_reader = generate_arrow_reader_impl(name);

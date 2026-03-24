@@ -32,7 +32,7 @@ uuid = { version = "1", features = ["v4", "v7"], optional = true }
 metrics = { version = "0.24", optional = true }
 opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
 parquet.workspace = true
-prestige-macros = { version = "0.3.3", path = "../macros" }
+prestige-macros = { version = "0.3.4", path = "../macros" }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
@@ -59,7 +59,7 @@ uuid = { version = "1", features = ["v4"] }
 [features]
 default = []
 decimal = ["dep:rust_decimal"]
-iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:reqwest", "dep:uuid"]
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:reqwest", "dep:uuid", "prestige-macros/iceberg"]
 iceberg-sql-catalog = ["iceberg", "dep:iceberg-catalog-sql"]
 iceberg-test-harness = ["iceberg"]
 metrics = ["dep:metrics"]
