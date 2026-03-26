@@ -10,7 +10,13 @@ use parquet::{
     file::properties::{EnabledStatistics, WriterProperties},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, marker::PhantomData, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    marker::PhantomData,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -724,7 +730,15 @@ async fn finalize_and_upload_schema_agnostic(
     writer.close()?;
 
     // 4. Upload to S3 with retry
-    info!("Uploading {} to S3", compacted_meta.key);
+    let compressed_bytes = local_path.metadata()?.len();
+    let uncompressed_bytes: usize = source_files.iter().map(|f| f.size).sum();
+    info!(
+        file_key = %compacted_meta.key,
+        compressed_bytes,
+        uncompressed_bytes,
+        total_records,
+        "Uploading compacted file to S3",
+    );
     let upload_delays = [
         Some(Duration::from_secs(1)),
         Some(Duration::from_secs(2)),
@@ -818,6 +832,8 @@ async fn execute_compaction_schema_agnostic(
 
     // 1. Stream files and filter out compacted ones
     let mut uncompacted_files = Vec::new();
+    let mut total_files_seen: usize = 0;
+    let listing_start = Instant::now();
     let mut file_stream = list_files(
         &config.client,
         &config.bucket,
@@ -827,20 +843,31 @@ async fn execute_compaction_schema_agnostic(
     );
 
     while let Some(file) = file_stream.try_next().await? {
+        total_files_seen += 1;
+        if total_files_seen.is_multiple_of(10_000) {
+            info!(
+                total_files_seen,
+                uncompacted = uncompacted_files.len(),
+                elapsed_secs = listing_start.elapsed().as_secs(),
+                "File listing in progress",
+            );
+        }
         if !file.compacted {
             uncompacted_files.push(file);
         }
     }
 
+    info!(
+        total_files_seen,
+        uncompacted = uncompacted_files.len(),
+        elapsed_secs = listing_start.elapsed().as_secs(),
+        "File listing complete",
+    );
+
     if uncompacted_files.is_empty() {
         info!("No uncompacted files found");
         return Ok(CompactionResult::empty());
     }
-
-    info!(
-        "Found {} uncompacted files to process",
-        uncompacted_files.len()
-    );
 
     // 2. Sort by timestamp for deterministic ordering
     uncompacted_files.sort_by_key(|f| f.timestamp);
