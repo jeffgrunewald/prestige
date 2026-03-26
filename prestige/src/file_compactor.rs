@@ -10,7 +10,7 @@ use parquet::{
     file::properties::{EnabledStatistics, WriterProperties},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, marker::PhantomData, path::Path, sync::Arc};
+use std::{collections::HashSet, marker::PhantomData, path::Path, sync::Arc, time::Duration};
 use tracing::{info, warn};
 
 use crate::{
@@ -723,13 +723,41 @@ async fn finalize_and_upload_schema_agnostic(
     }
     writer.close()?;
 
-    // 4. Upload to S3
+    // 4. Upload to S3 with retry
     info!("Uploading {} to S3", compacted_meta.key);
-    put_file(&config.client, &config.bucket, &local_path)
-        .await
-        .map_err(|_| CompactionError::UploadFailed {
+    let upload_delays = [
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(2)),
+        None,
+    ];
+
+    let mut last_upload_error = None;
+    for (attempt, delay) in upload_delays.iter().enumerate() {
+        match put_file(&config.client, &config.bucket, &local_path).await {
+            Ok(()) => break,
+            Err(err) => {
+                warn!(
+                    file_key = %compacted_meta.key,
+                    attempt = attempt + 1,
+                    error = %err,
+                    "Compaction upload failed, {}",
+                    if delay.is_some() { "retrying" } else { "giving up" }
+                );
+                last_upload_error = Some(err);
+                if let Some(d) = delay {
+                    tokio::time::sleep(*d).await;
+                }
+            }
+        }
+    }
+
+    if let Some(err) = last_upload_error {
+        return Err(CompactionError::UploadFailed {
             file_key: compacted_meta.key.clone(),
-        })?;
+            source: Box::new(err),
+        }
+        .into());
+    }
 
     info!("Uploaded {} successfully", compacted_meta.key);
 
