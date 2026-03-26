@@ -3,7 +3,7 @@ use arrow_row::{RowConverter, SortField};
 use arrow_select::filter::filter_record_batch;
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
-use futures::{TryStreamExt, future};
+use futures::{StreamExt, TryStreamExt, future};
 use parquet::{
     arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder},
     basic::Compression,
@@ -711,26 +711,35 @@ async fn finalize_and_upload_schema_agnostic(
         compacted_meta.key
     );
 
-    // 3. Write to local temp file
+    // 3. Write to local temp file (offloaded to blocking pool to avoid starving the async runtime)
     let local_path = temp_dir.join(&compacted_meta.key);
+    let compression = config.compression;
+    let row_group_size = config.row_group_size;
+    let schema_clone = schema.clone();
+    let write_path = local_path.clone();
 
-    let std_file = std::fs::File::create(&local_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(config.compression)
-        .set_max_row_group_size(config.row_group_size)
-        .set_write_batch_size(1024)
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_created_by(format!("prestige/{}", env!("CARGO_PKG_VERSION")))
-        .build();
+    let compressed_bytes = tokio::task::spawn_blocking(move || -> Result<u64> {
+        let std_file = std::fs::File::create(&write_path)?;
+        let props = WriterProperties::builder()
+            .set_compression(compression)
+            .set_max_row_group_size(row_group_size)
+            .set_write_batch_size(1024)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_created_by(format!("prestige/{}", env!("CARGO_PKG_VERSION")))
+            .build();
 
-    let mut writer = ArrowWriter::try_new(std_file, schema.clone(), Some(props))?;
-    for batch in batches {
-        writer.write(&batch)?;
-    }
-    writer.close()?;
+        let mut writer = ArrowWriter::try_new(std_file, schema_clone, Some(props))?;
+        for batch in &batches {
+            writer.write(batch)?;
+        }
+        writer.close()?;
+
+        Ok(write_path.metadata()?.len())
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("parquet write task panicked: {e}")))??;
 
     // 4. Upload to S3 with retry
-    let compressed_bytes = local_path.metadata()?.len();
     let uncompressed_bytes: usize = source_files.iter().map(|f| f.size).sum();
     info!(
         file_key = %compacted_meta.key,
@@ -872,53 +881,105 @@ async fn execute_compaction_schema_agnostic(
     // 2. Sort by timestamp for deterministic ordering
     uncompacted_files.sort_by_key(|f| f.timestamp);
 
-    // 3. Create temp directory
+    // 3. Batch marker checks concurrently to filter already-processed files
+    let marker_start = Instant::now();
+    let marker_futures: Vec<_> = uncompacted_files
+        .iter()
+        .map(|f| {
+            let client = &config.client;
+            let bucket = &config.bucket;
+            let key = f.key.clone();
+            async move {
+                let has_marker = has_processed_marker(client, bucket, &key).await;
+                (key, has_marker)
+            }
+        })
+        .collect();
+
+    let marker_results = future::join_all(marker_futures).await;
+    let already_processed: HashSet<String> = marker_results
+        .into_iter()
+        .filter_map(|(key, has_marker)| has_marker.then_some(key))
+        .collect();
+
+    info!(
+        already_processed = already_processed.len(),
+        total = uncompacted_files.len(),
+        elapsed_secs = marker_start.elapsed().as_secs(),
+        "Marker check complete"
+    );
+
+    // 4. Create temp directory
     let temp_dir = tempfile::tempdir()?;
     info!("Using temporary directory: {}", temp_dir.path().display());
 
-    // 4. Process files with streaming accumulation
+    // 5. Separate already-processed files from files to download
+    let mut files_processed = already_processed.len();
+    let mut last_processed_timestamp: Option<DateTime<Utc>> = None;
+
+    let files_to_process: Vec<FileMeta> = uncompacted_files
+        .into_iter()
+        .filter(|f| {
+            if already_processed.contains(&f.key) {
+                last_processed_timestamp = Some(f.timestamp);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    info!(
+        files_to_download = files_to_process.len(),
+        already_skipped = files_processed,
+        "Starting file downloads with prefetch"
+    );
+
+    // 6. Prefetch downloads with bounded concurrency, consume sequentially for accumulation
+    const DOWNLOAD_CONCURRENCY: usize = 10;
+
+    let mut download_stream =
+        futures::stream::iter(files_to_process.into_iter().map(|file_meta| {
+            let client = config.client.clone();
+            let bucket = config.bucket.clone();
+            async move {
+                let result = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&file_meta.key)
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(content) => {
+                        let bytes = content
+                            .body
+                            .collect()
+                            .await
+                            .map(|b| b.into_bytes())
+                            .map_err(|e| Error::Io(std::io::Error::other(e)));
+                        (file_meta, bytes)
+                    }
+                    Err(e) => (file_meta, Err(Error::from(aws_sdk_s3::Error::from(e)))),
+                }
+            }
+        }))
+        .buffered(DOWNLOAD_CONCURRENCY);
+
     let mut accumulator = DeduplicatingAccumulator::new();
     let mut source_files: Vec<FileMeta> = Vec::new();
     let mut schema: Option<Arc<arrow::datatypes::Schema>> = None;
 
-    let mut files_processed = 0;
     let mut files_created = 0;
     let mut records_consolidated = 0;
     let mut bytes_saved = 0;
     let mut duplicate_records_eliminated = 0;
-    let mut last_processed_timestamp: Option<DateTime<Utc>> = None;
     let mut deletion_failures: Vec<String> = Vec::new();
 
-    for file_meta in uncompacted_files {
+    while let Some((file_meta, download_result)) = download_stream.next().await {
+        let bytes = download_result?;
+
         info!("Processing file: {}", file_meta.key);
-
-        // Skip if already processed (idempotency check)
-        if has_processed_marker(&config.client, &config.bucket, &file_meta.key).await {
-            info!(
-                "Skipping already-processed file: {} (marker exists)",
-                file_meta.key
-            );
-            files_processed += 1;
-            last_processed_timestamp = Some(file_meta.timestamp);
-            continue;
-        }
-
-        // Download and stream RecordBatches from parquet
-        let file_content = config
-            .client
-            .get_object()
-            .bucket(&config.bucket)
-            .key(&file_meta.key)
-            .send()
-            .await
-            .map_err(|e| Error::from(aws_sdk_s3::Error::from(e)))?;
-
-        let bytes = file_content
-            .body
-            .collect()
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?
-            .into_bytes();
 
         // Handle empty or invalid files
         if bytes.is_empty() {

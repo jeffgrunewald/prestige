@@ -16,10 +16,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::{
-    fs::{File, metadata},
-    sync::Mutex,
-};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 mod error;
@@ -280,13 +277,19 @@ where
 
 const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 
-/// Multipart upload threshold/minimum file size (S3 minimum part size): 5 MB
+/// File size threshold for switching from single PUT to multipart upload
+const MULTIPART_THRESHOLD: usize = 25 * 1024 * 1024;
+
+/// Part size for multipart uploads (S3 minimum: 5 MB)
 const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 
 /// Upload a parquet file to S3
 ///
-/// Uses multipart upload for files >= 5 MB to avoid idle socket timeouts
-/// on large uploads. Files under the threshold use a single PUT.
+/// Reads the file into memory first to avoid per-chunk spawn_blocking overhead
+/// from `ByteStream::from_path`, which can stall under tokio runtime contention
+/// and trigger S3 idle socket timeouts.
+///
+/// Uses multipart upload for files >= 5 MB.
 pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -> Result {
     let bucket = bucket.into();
     let key = file
@@ -294,10 +297,13 @@ pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| Error::Internal(format!("path has no file name: {}", file.display())))?;
 
-    let file_size = metadata(file).await.map_err(Error::Io)?.len() as usize;
+    // Read entire file into memory in a single spawn_blocking call,
+    // avoiding per-chunk dispatch overhead during upload body streaming.
+    let bytes = tokio::fs::read(file).await.map_err(Error::Io)?;
+    let file_size = bytes.len();
 
-    if file_size < MULTIPART_PART_SIZE {
-        let byte_stream = primitives::ByteStream::from_path(file).await?;
+    if file_size < MULTIPART_THRESHOLD {
+        let byte_stream = primitives::ByteStream::from(bytes);
 
         client
             .put_object()
@@ -310,20 +316,15 @@ pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -
             .map_err(AwsError::s3_error)
             .await
     } else {
-        put_file_multipart(client, &bucket, &key, file, file_size).await
+        put_file_multipart(client, &bucket, &key, bytes).await
     }
 }
 
-/// Upload a file to S3 using multipart upload with 5 MB parts
-async fn put_file_multipart(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    file: &Path,
-    file_size: usize,
-) -> Result {
+/// Upload to S3 using multipart upload with 5 MB parts from in-memory bytes
+async fn put_file_multipart(client: &Client, bucket: &str, key: &str, data: Vec<u8>) -> Result {
+    let file_size = data.len();
     let total_parts = file_size.div_ceil(MULTIPART_PART_SIZE);
-    info!(key, file_size, total_parts, "Starting multipart upload",);
+    info!(key, file_size, total_parts, "Starting multipart upload");
 
     let create_resp = client
         .create_multipart_upload()
@@ -339,7 +340,7 @@ async fn put_file_multipart(
         .ok_or_else(|| Error::Internal("multipart upload response missing upload_id".into()))?
         .to_string();
 
-    let result = upload_parts(client, bucket, key, &upload_id, file, total_parts).await;
+    let result = upload_parts(client, bucket, key, &upload_id, &data, total_parts).await;
 
     match result {
         Ok(completed_parts) => {
@@ -377,39 +378,20 @@ async fn put_file_multipart(
     }
 }
 
-/// Read file in chunks and upload each part sequentially
+/// Upload in-memory bytes as multipart parts sequentially
 async fn upload_parts(
     client: &Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
-    file: &Path,
+    data: &[u8],
     total_parts: usize,
 ) -> Result<Vec<types::CompletedPart>> {
-    use tokio::io::AsyncReadExt;
-
-    let mut file_handle = File::open(file).await.map_err(Error::Io)?;
-
     let mut completed_parts = Vec::with_capacity(total_parts);
-    let mut part_number: i32 = 1;
-    let mut buf = vec![0u8; MULTIPART_PART_SIZE];
 
-    loop {
-        let mut bytes_read = 0;
-        // Fill the buffer completely (or until EOF)
-        while bytes_read < MULTIPART_PART_SIZE {
-            match file_handle.read(&mut buf[bytes_read..]).await {
-                Ok(0) => break,
-                Ok(n) => bytes_read += n,
-                Err(e) => return Err(Error::Io(e)),
-            }
-        }
-
-        if bytes_read == 0 {
-            break;
-        }
-
-        let body = primitives::ByteStream::from(buf[..bytes_read].to_vec());
+    for (i, chunk) in data.chunks(MULTIPART_PART_SIZE).enumerate() {
+        let part_number = (i + 1) as i32;
+        let body = primitives::ByteStream::from(chunk.to_vec());
 
         let upload_resp = client
             .upload_part()
@@ -427,7 +409,7 @@ async fn upload_parts(
         debug!(
             key,
             part_number,
-            bytes = bytes_read,
+            bytes = chunk.len(),
             "Uploaded part {}/{}",
             part_number,
             total_parts,
@@ -439,8 +421,6 @@ async fn upload_parts(
                 .part_number(part_number)
                 .build(),
         );
-
-        part_number += 1;
     }
 
     Ok(completed_parts)
