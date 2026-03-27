@@ -3,7 +3,7 @@ use arrow_row::{RowConverter, SortField};
 use arrow_select::filter::filter_record_batch;
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
-use futures::{StreamExt, TryStreamExt, future};
+use futures::{StreamExt, TryStreamExt};
 use parquet::{
     arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder},
     basic::Compression,
@@ -19,6 +19,9 @@ use std::{
 };
 use tracing::{info, warn};
 
+/// Default bounded concurrency for S3 batch operations (marker checks, deletions, etc.)
+const S3_BATCH_CONCURRENCY: usize = 50;
+
 use crate::{
     Client,
     error::{CompactionError, Error, Result},
@@ -28,6 +31,49 @@ use crate::{
     traits::ArrowSchema,
 };
 use aws_sdk_s3::primitives::ByteStream;
+
+/// Run an async operation on each item with bounded concurrency and progress logging.
+///
+/// Returns a vec of `(key, result)` pairs preserving input order.
+async fn run_batched<T, Fut>(
+    items: Vec<String>,
+    op: impl FnMut(String) -> Fut,
+    label: &str,
+    progress_interval: usize,
+) -> Vec<(String, T)>
+where
+    Fut: Future<Output = (String, T)>,
+{
+    let total = items.len();
+    let start = Instant::now();
+    let mut results = Vec::with_capacity(total);
+    let mut completed: usize = 0;
+
+    let mut stream =
+        futures::stream::iter(items.into_iter().map(op)).buffered(S3_BATCH_CONCURRENCY);
+
+    while let Some(result) = stream.next().await {
+        completed += 1;
+        results.push(result);
+        if completed.is_multiple_of(progress_interval) {
+            info!(
+                completed,
+                total,
+                elapsed_secs = start.elapsed().as_secs(),
+                "{label} in progress"
+            );
+        }
+    }
+
+    info!(
+        completed,
+        total,
+        elapsed_secs = start.elapsed().as_secs(),
+        "{label} complete"
+    );
+
+    results
+}
 
 /// File Compactor Module
 ///
@@ -588,47 +634,34 @@ async fn delete_processed_marker(client: &Client, bucket: &str, source_key: &str
 
 /// Delete original files and their markers from S3 after successful consolidation
 /// Returns a vector of file keys that failed to delete
-async fn delete_original_files(client: &Client, bucket: &str, files: &[FileMeta]) -> Vec<String> {
-    info!("Deleting {} original files and markers", files.len());
+async fn delete_original_files(client: Client, bucket: String, files: Vec<String>) -> Vec<String> {
+    let results = run_batched(
+        files,
+        |key| {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            async move {
+                let result = remove_file(&client, &bucket, &key).await;
+                let _ = delete_processed_marker(&client, &bucket, &key).await;
+                (key, result)
+            }
+        },
+        "Deletion",
+        1_000,
+    )
+    .await;
 
-    // Delete both source files and markers in parallel
-    let delete_futures: Vec<_> = files
-        .iter()
-        .map(|file| async move {
-            let key = &file.key;
-            // Try to delete both source and marker (marker may not exist, that's OK)
-            let source_result = remove_file(client, bucket, key).await;
-            let _ = delete_processed_marker(client, bucket, key).await; // Best effort
-            source_result
+    results
+        .into_iter()
+        .filter_map(|(key, result)| {
+            if let Err(e) = result {
+                warn!(key, error = ?e, "Failed to delete original file");
+                Some(key)
+            } else {
+                None
+            }
         })
-        .collect();
-
-    let results = future::join_all(delete_futures).await;
-
-    // Collect failures and log warnings
-    let mut failed_keys = Vec::new();
-    for (idx, result) in results.iter().enumerate() {
-        if let Err(e) = result {
-            let key = &files[idx].key;
-            warn!("Failed to delete original file {}: {}", key, e);
-            failed_keys.push(key.clone());
-        }
-    }
-
-    if !failed_keys.is_empty() {
-        warn!(
-            "Failed to delete {} out of {} original files",
-            failed_keys.len(),
-            files.len()
-        );
-    } else {
-        info!(
-            "Successfully deleted all {} original files and markers",
-            files.len()
-        );
-    }
-
-    failed_keys
+        .collect()
 }
 
 impl FileCompactorConfigBuilder<()> {
@@ -636,7 +669,7 @@ impl FileCompactorConfigBuilder<()> {
     pub async fn execute_schema_agnostic(self) -> Result<CompactionResult> {
         let config = self
             .build()
-            .map_err(|e| crate::error::Error::SerdeArrow(format!("Config builder error: {}", e)))?;
+            .map_err(|e| Error::SerdeArrow(format!("Config builder error: {}", e)))?;
         execute_compaction_schema_agnostic(config).await
     }
 
@@ -647,7 +680,7 @@ impl FileCompactorConfigBuilder<()> {
     pub async fn plan_schema_agnostic(self) -> Result<CompactionResult> {
         let config = self
             .build()
-            .map_err(|e| crate::error::Error::SerdeArrow(format!("Config builder error: {}", e)))?;
+            .map_err(|e| Error::SerdeArrow(format!("Config builder error: {}", e)))?;
         plan_compaction_schema_agnostic(config).await
     }
 }
@@ -663,7 +696,7 @@ where
     pub async fn execute(self) -> Result<CompactionResult> {
         let config = self
             .build()
-            .map_err(|e| crate::error::Error::SerdeArrow(format!("Config builder error: {}", e)))?;
+            .map_err(|e| Error::SerdeArrow(format!("Config builder error: {}", e)))?;
 
         // Delegate to schema-agnostic implementation
         let schema_agnostic_config = FileCompactorConfig {
@@ -757,12 +790,15 @@ async fn finalize_and_upload_schema_agnostic(
     let mut last_upload_error = None;
     for (attempt, delay) in upload_delays.iter().enumerate() {
         match put_file(&config.client, &config.bucket, &local_path).await {
-            Ok(()) => break,
+            Ok(()) => {
+                last_upload_error = None;
+                break;
+            }
             Err(err) => {
                 warn!(
                     file_key = %compacted_meta.key,
                     attempt = attempt + 1,
-                    error = %err,
+                    error = ?err,
                     "Compaction upload failed, {}",
                     if delay.is_some() { "retrying" } else { "giving up" }
                 );
@@ -784,25 +820,30 @@ async fn finalize_and_upload_schema_agnostic(
 
     info!("Uploaded {} successfully", compacted_meta.key);
 
-    // 5. Create processed markers for source files
-    info!(
-        "Creating processed markers for {} source files",
-        source_files.len()
-    );
-    let marker_futures: Vec<_> = source_files
-        .iter()
-        .map(|file| create_processed_marker(&config.client, &config.bucket, &file.key))
-        .collect();
+    // 5. Create processed markers for source files with bounded concurrency
+    let marker_keys: Vec<String> = source_files.iter().map(|f| f.key.clone()).collect();
+    let marker_results = {
+        let client = config.client.clone();
+        let bucket = config.bucket.clone();
+        run_batched(
+            marker_keys,
+            |key| {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                async move {
+                    let result = create_processed_marker(&client, &bucket, &key).await;
+                    (key, result)
+                }
+            },
+            "Marker creation",
+            1_000,
+        )
+        .await
+    };
 
-    let marker_results = future::join_all(marker_futures).await;
-
-    // Log marker creation failures but don't fail the operation
-    for (idx, result) in marker_results.iter().enumerate() {
+    for (key, result) in &marker_results {
         if let Err(e) = result {
-            warn!(
-                "Failed to create marker for {}: {}",
-                source_files[idx].key, e
-            );
+            warn!(key, error = ?e, "Failed to create processed marker");
         }
     }
 
@@ -813,7 +854,8 @@ async fn finalize_and_upload_schema_agnostic(
 
     // 7. Delete source files if upload successful
     let deletion_failures = if config.delete_originals {
-        delete_original_files(&config.client, &config.bucket, &source_files).await
+        let keys: Vec<String> = source_files.iter().map(|f| f.key.clone()).collect();
+        delete_original_files(config.client.clone(), config.bucket.clone(), keys).await
     } else {
         Vec::new()
     };
@@ -881,33 +923,29 @@ async fn execute_compaction_schema_agnostic(
     // 2. Sort by timestamp for deterministic ordering
     uncompacted_files.sort_by_key(|f| f.timestamp);
 
-    // 3. Batch marker checks concurrently to filter already-processed files
-    let marker_start = Instant::now();
-    let marker_futures: Vec<_> = uncompacted_files
-        .iter()
-        .map(|f| {
-            let client = &config.client;
-            let bucket = &config.bucket;
-            let key = f.key.clone();
-            async move {
-                let has_marker = has_processed_marker(client, bucket, &key).await;
-                (key, has_marker)
-            }
-        })
-        .collect();
+    // 3. Batch marker checks with bounded concurrency to filter already-processed files
+    let already_processed = {
+        let marker_keys: Vec<String> = uncompacted_files.iter().map(|f| f.key.clone()).collect();
+        let results = run_batched(
+            marker_keys,
+            |key| {
+                let client = config.client.clone();
+                let bucket = config.bucket.clone();
+                async move {
+                    let has_marker = has_processed_marker(&client, &bucket, &key).await;
+                    (key, has_marker)
+                }
+            },
+            "Marker check",
+            10_000,
+        )
+        .await;
 
-    let marker_results = future::join_all(marker_futures).await;
-    let already_processed: HashSet<String> = marker_results
-        .into_iter()
-        .filter_map(|(key, has_marker)| has_marker.then_some(key))
-        .collect();
-
-    info!(
-        already_processed = already_processed.len(),
-        total = uncompacted_files.len(),
-        elapsed_secs = marker_start.elapsed().as_secs(),
-        "Marker check complete"
-    );
+        results
+            .into_iter()
+            .filter_map(|(key, has_marker)| has_marker.then_some(key))
+            .collect::<HashSet<_>>()
+    };
 
     // 4. Create temp directory
     let temp_dir = tempfile::tempdir()?;
@@ -932,39 +970,17 @@ async fn execute_compaction_schema_agnostic(
     info!(
         files_to_download = files_to_process.len(),
         already_skipped = files_processed,
-        "Starting file downloads with prefetch"
+        "Starting compaction"
     );
 
-    // 6. Prefetch downloads with bounded concurrency, consume sequentially for accumulation
+    // 6. Download-accumulate-upload loop
+    //
+    // Downloads and uploads must not compete for bandwidth. The loop processes
+    // files in download phases: a buffered download stream runs until the
+    // accumulator hits the size limit, then the stream is dropped (releasing
+    // all in-flight connections) before the upload begins. After the upload,
+    // a new download stream is created for the remaining files.
     const DOWNLOAD_CONCURRENCY: usize = 10;
-
-    let mut download_stream =
-        futures::stream::iter(files_to_process.into_iter().map(|file_meta| {
-            let client = config.client.clone();
-            let bucket = config.bucket.clone();
-            async move {
-                let result = client
-                    .get_object()
-                    .bucket(&bucket)
-                    .key(&file_meta.key)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(content) => {
-                        let bytes = content
-                            .body
-                            .collect()
-                            .await
-                            .map(|b| b.into_bytes())
-                            .map_err(|e| Error::Io(std::io::Error::other(e)));
-                        (file_meta, bytes)
-                    }
-                    Err(e) => (file_meta, Err(Error::from(aws_sdk_s3::Error::from(e)))),
-                }
-            }
-        }))
-        .buffered(DOWNLOAD_CONCURRENCY);
 
     let mut accumulator = DeduplicatingAccumulator::new();
     let mut source_files: Vec<FileMeta> = Vec::new();
@@ -976,110 +992,167 @@ async fn execute_compaction_schema_agnostic(
     let mut duplicate_records_eliminated = 0;
     let mut deletion_failures: Vec<String> = Vec::new();
 
-    while let Some((file_meta, download_result)) = download_stream.next().await {
-        let bytes = download_result?;
+    let mut remaining_files: &[FileMeta] = &files_to_process;
 
-        info!("Processing file: {}", file_meta.key);
+    while !remaining_files.is_empty() {
+        // Start a download phase -- collect keys to avoid lifetime issues with the slice
+        let download_keys: Vec<(usize, String)> = remaining_files
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| (idx, f.key.clone()))
+            .collect();
 
-        // Handle empty or invalid files
-        if bytes.is_empty() {
-            info!("Skipping empty file: {}", file_meta.key);
-            files_processed += 1;
-            last_processed_timestamp = Some(file_meta.timestamp);
-            source_files.push(file_meta.clone());
-            continue;
-        }
+        let mut download_stream =
+            futures::stream::iter(download_keys.into_iter().map(|(idx, key)| {
+                let client = config.client.clone();
+                let bucket = config.bucket.clone();
+                async move {
+                    let result = client.get_object().bucket(&bucket).key(&key).send().await;
 
-        // Create parquet reader - wrap bytes in Cursor for AsyncFileReader
-        let cursor = std::io::Cursor::new(bytes);
-        let builder = match ParquetRecordBatchStreamBuilder::new(cursor).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("Failed to read parquet file {}: {}", file_meta.key, e);
+                    match result {
+                        Ok(content) => {
+                            let bytes = content
+                                .body
+                                .collect()
+                                .await
+                                .map(|b| b.into_bytes())
+                                .map_err(|e| Error::Io(std::io::Error::other(e)));
+                            (idx, bytes)
+                        }
+                        Err(e) => (idx, Err(Error::from(aws_sdk_s3::Error::from(e)))),
+                    }
+                }
+            }))
+            .buffered(DOWNLOAD_CONCURRENCY);
+
+        let mut need_upload = false;
+        let mut files_consumed_this_phase = 0;
+
+        while let Some((idx, download_result)) = download_stream.next().await {
+            let file_meta = &remaining_files[idx];
+            let bytes = download_result?;
+
+            info!("Processing file: {}", file_meta.key);
+            files_consumed_this_phase = idx + 1;
+
+            // Handle empty or invalid files
+            if bytes.is_empty() {
+                info!("Skipping empty file: {}", file_meta.key);
                 files_processed += 1;
                 last_processed_timestamp = Some(file_meta.timestamp);
-                continue;
-            }
-        };
-
-        // Get schema from first file
-        if let Some(ref current_schema) = schema {
-            if current_schema != builder.schema() {
-                warn!("Schema mismatch in file {}, skipping", file_meta.key);
-                files_processed += 1;
-                last_processed_timestamp = Some(file_meta.timestamp);
-                continue;
-            }
-        } else {
-            let new_schema = builder.schema().clone();
-            info!("Detected schema with {} fields", new_schema.fields().len());
-            schema = Some(new_schema);
-        }
-
-        let mut stream = builder.build()?;
-
-        // Stream RecordBatches and accumulate
-        let mut file_had_records = false;
-        while let Some(batch_result) = stream.try_next().await? {
-            if batch_result.num_rows() == 0 {
+                source_files.push(file_meta.clone());
                 continue;
             }
 
-            file_had_records = true;
-            let batch_size = batch_result.get_array_memory_size();
+            // Create parquet reader
+            let cursor = std::io::Cursor::new(bytes);
+            let builder = match ParquetRecordBatchStreamBuilder::new(cursor).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("Failed to read parquet file {}: {}", file_meta.key, e);
+                    files_processed += 1;
+                    last_processed_timestamp = Some(file_meta.timestamp);
+                    continue;
+                }
+            };
 
-            info!(
-                "Loaded batch with {} records ({} bytes) from {}",
-                batch_result.num_rows(),
-                batch_size,
-                file_meta.key
-            );
+            // Get schema from first file
+            if let Some(ref current_schema) = schema {
+                if current_schema != builder.schema() {
+                    warn!("Schema mismatch in file {}, skipping", file_meta.key);
+                    files_processed += 1;
+                    last_processed_timestamp = Some(file_meta.timestamp);
+                    continue;
+                }
+            } else {
+                let new_schema = builder.schema().clone();
+                info!("Detected schema with {} fields", new_schema.fields().len());
+                schema = Some(new_schema);
+            }
 
-            // Check if adding this batch would exceed limit (soft limit)
-            if !accumulator.is_empty()
-                && (accumulator.estimated_size() + batch_size) > config.max_bytes_per_file
-            {
+            let mut stream = builder.build()?;
+
+            // Stream RecordBatches and accumulate
+            let mut file_had_records = false;
+            while let Some(batch_result) = stream.try_next().await? {
+                if batch_result.num_rows() == 0 {
+                    continue;
+                }
+
+                file_had_records = true;
+                let batch_size = batch_result.get_array_memory_size();
+
                 info!(
-                    "Size limit reached, finalizing current batch ({} bytes, {} records)",
-                    accumulator.estimated_size(),
-                    accumulator.total_records()
+                    "Loaded batch with {} records ({} bytes) from {}",
+                    batch_result.num_rows(),
+                    batch_size,
+                    file_meta.key
                 );
 
-                // Finalize current accumulation
-                let (batches, dup_count) = accumulator.take_batches();
-                let finalize_result = finalize_and_upload_schema_agnostic(
-                    batches,
-                    dup_count,
-                    source_files,
-                    schema.as_ref().ok_or(Error::Internal(
-                        "schema not initialized during compaction".into(),
-                    ))?,
-                    &config,
-                    temp_dir.path(),
-                )
-                .await?;
+                // Check if adding this batch would exceed limit (soft limit)
+                if !accumulator.is_empty()
+                    && (accumulator.estimated_size() + batch_size) > config.max_bytes_per_file
+                {
+                    info!(
+                        "Size limit reached, finalizing current batch ({} bytes, {} records)",
+                        accumulator.estimated_size(),
+                        accumulator.total_records()
+                    );
+                    need_upload = true;
+                    // Add the batch that triggered the limit before breaking
+                    accumulator.add_batch(batch_result, config.enable_deduplication)?;
+                    break;
+                }
 
-                files_created += 1;
-                records_consolidated += finalize_result.records_count;
-                bytes_saved += finalize_result.bytes_saved;
-                duplicate_records_eliminated += finalize_result.duplicate_count;
-                deletion_failures.extend(finalize_result.deletion_failures);
-
-                // Reset accumulator
-                source_files = Vec::new();
+                // Add batch to accumulator (with optional deduplication)
+                accumulator.add_batch(batch_result, config.enable_deduplication)?;
             }
 
-            // Add batch to accumulator (with optional deduplication)
-            accumulator.add_batch(batch_result, config.enable_deduplication)?;
+            if !file_had_records {
+                info!("Skipping file with no records: {}", file_meta.key);
+            }
+
+            source_files.push(file_meta.clone());
+            files_processed += 1;
+            last_processed_timestamp = Some(file_meta.timestamp);
+
+            if need_upload {
+                break;
+            }
         }
 
-        if !file_had_records {
-            info!("Skipping file with no records: {}", file_meta.key);
-        }
+        // Advance past consumed files
+        remaining_files = &remaining_files[files_consumed_this_phase..];
 
-        source_files.push(file_meta.clone());
-        files_processed += 1;
-        last_processed_timestamp = Some(file_meta.timestamp);
+        // Drop download stream to release all in-flight connections before uploading
+        drop(download_stream);
+
+        if need_upload {
+            let (batches, dup_count) = accumulator.take_batches();
+            let finalize_result = finalize_and_upload_schema_agnostic(
+                batches,
+                dup_count,
+                source_files,
+                schema.as_ref().ok_or(Error::Internal(
+                    "schema not initialized during compaction".into(),
+                ))?,
+                &config,
+                temp_dir.path(),
+            )
+            .await?;
+
+            files_created += 1;
+            records_consolidated += finalize_result.records_count;
+            bytes_saved += finalize_result.bytes_saved;
+            duplicate_records_eliminated += finalize_result.duplicate_count;
+            deletion_failures.extend(finalize_result.deletion_failures);
+
+            // Reset for next batch
+            source_files = Vec::new();
+        } else {
+            // Download phase exhausted all remaining files without hitting size limit
+            break;
+        }
     }
 
     // Finalize any remaining records
