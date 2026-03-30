@@ -1,5 +1,5 @@
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{config, primitives};
+use aws_sdk_s3::{config, primitives, types};
 use aws_smithy_types_convert::stream::PaginationStreamExt;
 use chrono::{DateTime, Utc};
 use futures::{
@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 mod error;
 pub mod file_compactor;
@@ -275,26 +275,155 @@ where
         .await
 }
 
-/// Upload a parquet file to S3
-pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -> Result {
-    let byte_stream = primitives::ByteStream::from_path(&file).await?;
+const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 
-    client
-        .put_object()
+/// File size threshold for switching from single PUT to multipart upload
+const MULTIPART_THRESHOLD: usize = 25 * 1024 * 1024;
+
+/// Part size for multipart uploads (S3 minimum: 5 MB)
+const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// Upload a parquet file to S3
+///
+/// Reads the file into memory first to avoid per-chunk spawn_blocking overhead
+/// from `ByteStream::from_path`, which can stall under tokio runtime contention
+/// and trigger S3 idle socket timeouts.
+///
+/// Uses multipart upload for files >= 5 MB.
+pub async fn put_file(client: &Client, bucket: impl Into<String>, file: &Path) -> Result {
+    let bucket = bucket.into();
+    let key = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| Error::Internal(format!("path has no file name: {}", file.display())))?;
+
+    // Read entire file into memory in a single spawn_blocking call,
+    // avoiding per-chunk dispatch overhead during upload body streaming.
+    let bytes = tokio::fs::read(file).await.map_err(Error::Io)?;
+    let file_size = bytes.len();
+
+    if file_size < MULTIPART_THRESHOLD {
+        let byte_stream = primitives::ByteStream::from(bytes);
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(byte_stream)
+            .content_type(PARQUET_CONTENT_TYPE)
+            .send()
+            .map_ok(|_| ())
+            .map_err(AwsError::s3_error)
+            .await
+    } else {
+        put_file_multipart(client, &bucket, &key, bytes).await
+    }
+}
+
+/// Upload to S3 using multipart upload with 5 MB parts from in-memory bytes
+async fn put_file_multipart(client: &Client, bucket: &str, key: &str, data: Vec<u8>) -> Result {
+    let file_size = data.len();
+    let total_parts = file_size.div_ceil(MULTIPART_PART_SIZE);
+    info!(key, file_size, total_parts, "Starting multipart upload");
+
+    let create_resp = client
+        .create_multipart_upload()
         .bucket(bucket)
-        .key(
-            file.file_name()
-                .map(|name| name.to_string_lossy())
-                .ok_or_else(|| {
-                    Error::Internal(format!("path has no file name: {}", file.display()))
-                })?,
-        )
-        .body(byte_stream)
-        .content_type("application/vnd.apache.parquet")
+        .key(key)
+        .content_type(PARQUET_CONTENT_TYPE)
         .send()
-        .map_ok(|_| ())
-        .map_err(AwsError::s3_error)
         .await
+        .map_err(AwsError::s3_error)?;
+
+    let upload_id = create_resp
+        .upload_id()
+        .ok_or_else(|| Error::Internal("multipart upload response missing upload_id".into()))?
+        .to_string();
+
+    let result = upload_parts(client, bucket, key, &upload_id, &data, total_parts).await;
+
+    match result {
+        Ok(completed_parts) => {
+            let completed_upload = types::CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build();
+
+            client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(completed_upload)
+                .send()
+                .await
+                .map_err(AwsError::s3_error)?;
+
+            info!(key, "Multipart upload completed");
+            Ok(())
+        }
+        Err(e) => {
+            warn!(key, upload_id, err = %e, "Multipart upload failed, aborting");
+            if let Err(abort_err) = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await
+            {
+                warn!(key, upload_id, err = %abort_err, "Failed to abort multipart upload");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Upload in-memory bytes as multipart parts sequentially
+async fn upload_parts(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    data: &[u8],
+    total_parts: usize,
+) -> Result<Vec<types::CompletedPart>> {
+    let mut completed_parts = Vec::with_capacity(total_parts);
+
+    for (i, chunk) in data.chunks(MULTIPART_PART_SIZE).enumerate() {
+        let part_number = (i + 1) as i32;
+        let body = primitives::ByteStream::from(chunk.to_vec());
+
+        let upload_resp = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(body)
+            .send()
+            .await
+            .map_err(AwsError::s3_error)?;
+
+        let e_tag = upload_resp.e_tag().map(|s| s.to_string());
+
+        debug!(
+            key,
+            part_number,
+            bytes = chunk.len(),
+            "Uploaded part {}/{}",
+            part_number,
+            total_parts,
+        );
+
+        completed_parts.push(
+            types::CompletedPart::builder()
+                .set_e_tag(e_tag)
+                .part_number(part_number)
+                .build(),
+        );
+    }
+
+    Ok(completed_parts)
 }
 
 /// Remove a file from S3

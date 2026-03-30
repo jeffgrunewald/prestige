@@ -133,7 +133,11 @@ impl ChannelError {
 #[derive(Error, Debug)]
 pub enum CompactionError {
     #[error("upload failed for {file_key}")]
-    UploadFailed { file_key: String },
+    UploadFailed {
+        file_key: String,
+        #[source]
+        source: Box<Error>,
+    },
 
     #[error("no source files provided for compaction")]
     NoSourceFiles,

@@ -309,7 +309,8 @@ impl<T> ParquetSinkClient<T> {
 /// Active parquet file being written
 struct ActiveParquetSink<T> {
     file_path: PathBuf,
-    writer: ArrowWriter<File>,
+    /// Option to allow taking the writer for spawn_blocking operations
+    writer: Option<ArrowWriter<File>>,
     row_count: usize,
     buffer: Vec<T>,
     created_at: DateTime<Utc>,
@@ -635,8 +636,13 @@ where
 
             let buffer_size = sink.buffer.len() as f64;
 
-            // Write batch to parquet file
-            sink.writer.write(&batch)?;
+            // Write batch inline -- individual batch writes buffer into the ArrowWriter's
+            // internal state and are fast even for small batches. The heavier compression
+            // and flush work happens in close(), which is offloaded to spawn_blocking.
+            sink.writer
+                .as_mut()
+                .ok_or_else(|| Error::Internal("parquet writer not available".into()))?
+                .write(&batch)?;
 
             telemetry::record_histogram(
                 SINK_BATCH_SIZE,
@@ -675,7 +681,7 @@ where
 
         self.active_sink = Some(Mutex::new(ActiveParquetSink {
             file_path,
-            writer,
+            writer: Some(writer),
             row_count: 0,
             buffer: Vec::with_capacity(self.batch_size),
             created_at: Utc::now(),
@@ -695,8 +701,13 @@ where
 
         if let Some(sink_mutex) = self.active_sink.take() {
             let sink = sink_mutex.into_inner().unwrap();
-            // Close the writer
-            sink.writer.close()?;
+            // Close the writer (offloaded to blocking pool)
+            let writer = sink
+                .writer
+                .ok_or_else(|| Error::Internal("parquet writer not available".into()))?;
+            tokio::task::spawn_blocking(move || writer.close())
+                .await
+                .map_err(|e| Error::Internal(format!("parquet close task panicked: {e}")))??;
 
             // Move from tmp to target
             let target_file = self.target_path.join(
