@@ -1174,3 +1174,281 @@ mod as_binary_tests {
         assert_eq!(records, deserialized);
     }
 }
+
+mod as_fixed_binary_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, FieldRef};
+    use std::sync::Arc;
+
+    /// A simple 32-byte address type that implements AsRef<[u8]> + From<[u8; 32]>.
+    /// Simulates types like solana_sdk::pubkey::Pubkey.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Address([u8; 32]);
+
+    impl AsRef<[u8]> for Address {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl From<[u8; 32]> for Address {
+        fn from(bytes: [u8; 32]) -> Self {
+            Self(bytes)
+        }
+    }
+
+    /// A simple 64-byte signature type.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Signature([u8; 64]);
+
+    impl AsRef<[u8]> for Signature {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl From<[u8; 64]> for Signature {
+        fn from(bytes: [u8; 64]) -> Self {
+            Self(bytes)
+        }
+    }
+
+    // --- Struct definitions ---
+
+    #[prestige::prestige_schema]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct FixedBinaryScalar {
+        label: String,
+        #[prestige(as_fixed_binary(32))]
+        address: Address,
+        #[prestige(as_fixed_binary(64))]
+        sig: Signature,
+    }
+
+    #[prestige::prestige_schema]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct FixedBinaryOption {
+        label: String,
+        #[prestige(as_fixed_binary(32))]
+        address: Option<Address>,
+    }
+
+    #[prestige::prestige_schema]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct VecFixedBinary {
+        label: String,
+        #[prestige(as_vec_fixed_binary(32))]
+        addresses: Vec<Address>,
+    }
+
+    // --- Schema tests ---
+
+    #[test]
+    fn as_fixed_binary_schema_is_fixed_size_binary() {
+        let schema = FixedBinaryScalar::arrow_schema();
+        assert_eq!(
+            schema.field_with_name("address").unwrap().data_type(),
+            &DataType::FixedSizeBinary(32)
+        );
+        assert_eq!(
+            schema.field_with_name("sig").unwrap().data_type(),
+            &DataType::FixedSizeBinary(64)
+        );
+    }
+
+    #[test]
+    fn as_fixed_binary_option_schema_is_nullable() {
+        let schema = FixedBinaryOption::arrow_schema();
+        let field = schema.field_with_name("address").unwrap();
+        assert_eq!(field.data_type(), &DataType::FixedSizeBinary(32));
+        assert!(field.is_nullable());
+    }
+
+    #[test]
+    fn as_vec_fixed_binary_schema_is_list_fixed_size_binary() {
+        let schema = VecFixedBinary::arrow_schema();
+        let expected = DataType::List(FieldRef::new(Field::new(
+            "item",
+            DataType::FixedSizeBinary(32),
+            true,
+        )));
+        assert_eq!(
+            schema.field_with_name("addresses").unwrap().data_type(),
+            &expected
+        );
+    }
+
+    // --- Roundtrip tests ---
+
+    #[test]
+    fn as_fixed_binary_roundtrip() {
+        let records = vec![
+            FixedBinaryScalar {
+                label: "a".into(),
+                address: Address([1u8; 32]),
+                sig: Signature([2u8; 64]),
+            },
+            FixedBinaryScalar {
+                label: "b".into(),
+                address: Address([0u8; 32]),
+                sig: Signature([0xFF; 64]),
+            },
+        ];
+        let schema = Arc::new(FixedBinaryScalar::arrow_schema());
+        let arrays = serde_arrow::to_arrow(schema.fields(), &records).unwrap();
+        let deserialized: Vec<FixedBinaryScalar> =
+            serde_arrow::from_arrow(schema.fields(), &arrays).unwrap();
+        assert_eq!(records, deserialized);
+    }
+
+    #[test]
+    fn as_fixed_binary_option_roundtrip() {
+        let records = vec![
+            FixedBinaryOption {
+                label: "present".into(),
+                address: Some(Address([42u8; 32])),
+            },
+            FixedBinaryOption {
+                label: "absent".into(),
+                address: None,
+            },
+        ];
+        let schema = Arc::new(FixedBinaryOption::arrow_schema());
+        let arrays = serde_arrow::to_arrow(schema.fields(), &records).unwrap();
+        let deserialized: Vec<FixedBinaryOption> =
+            serde_arrow::from_arrow(schema.fields(), &arrays).unwrap();
+        assert_eq!(records, deserialized);
+    }
+
+    #[test]
+    fn as_vec_fixed_binary_roundtrip() {
+        let records = vec![
+            VecFixedBinary {
+                label: "multi".into(),
+                addresses: vec![Address([1u8; 32]), Address([2u8; 32]), Address([3u8; 32])],
+            },
+            VecFixedBinary {
+                label: "empty".into(),
+                addresses: vec![],
+            },
+        ];
+        let schema = Arc::new(VecFixedBinary::arrow_schema());
+        let arrays = serde_arrow::to_arrow(schema.fields(), &records).unwrap();
+        let deserialized: Vec<VecFixedBinary> =
+            serde_arrow::from_arrow(schema.fields(), &arrays).unwrap();
+        assert_eq!(records, deserialized);
+    }
+}
+
+/// Tests using the real `solana_pubkey::Pubkey` type to validate the
+/// `as_fixed_binary` and `as_vec_fixed_binary` annotations work with
+/// actual Solana SDK types — the primary use case for these annotations.
+mod solana_pubkey_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, FieldRef};
+    use solana_pubkey::Pubkey;
+    use std::sync::Arc;
+
+    #[prestige::prestige_schema]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Instruction {
+        label: String,
+        #[prestige(as_fixed_binary(32))]
+        multisig: Pubkey,
+        #[prestige(as_fixed_binary(32))]
+        program_id: Pubkey,
+        #[prestige(as_fixed_binary(32))]
+        vault: Option<Pubkey>,
+        #[prestige(as_vec_fixed_binary(32))]
+        accounts: Vec<Pubkey>,
+    }
+
+    #[test]
+    fn pubkey_scalar_schema() {
+        let schema = Instruction::arrow_schema();
+        assert_eq!(
+            schema.field_with_name("multisig").unwrap().data_type(),
+            &DataType::FixedSizeBinary(32)
+        );
+        assert_eq!(
+            schema.field_with_name("program_id").unwrap().data_type(),
+            &DataType::FixedSizeBinary(32)
+        );
+    }
+
+    #[test]
+    fn pubkey_option_schema() {
+        let schema = Instruction::arrow_schema();
+        let field = schema.field_with_name("vault").unwrap();
+        assert_eq!(field.data_type(), &DataType::FixedSizeBinary(32));
+        assert!(field.is_nullable());
+    }
+
+    #[test]
+    fn pubkey_vec_schema() {
+        let schema = Instruction::arrow_schema();
+        let expected = DataType::List(FieldRef::new(Field::new(
+            "item",
+            DataType::FixedSizeBinary(32),
+            true,
+        )));
+        assert_eq!(
+            schema.field_with_name("accounts").unwrap().data_type(),
+            &expected
+        );
+    }
+
+    #[test]
+    fn pubkey_roundtrip() {
+        let pk1 = Pubkey::from([1u8; 32]);
+        let pk2 = Pubkey::from([2u8; 32]);
+        let pk3 = Pubkey::from([3u8; 32]);
+        let program = Pubkey::from([0xAA; 32]);
+
+        let records = vec![
+            Instruction {
+                label: "with_vault".into(),
+                multisig: pk1,
+                program_id: program,
+                vault: Some(pk2),
+                accounts: vec![pk1, pk2, pk3],
+            },
+            Instruction {
+                label: "no_vault".into(),
+                multisig: pk3,
+                program_id: program,
+                vault: None,
+                accounts: vec![],
+            },
+        ];
+
+        let schema = Arc::new(Instruction::arrow_schema());
+        let arrays = serde_arrow::to_arrow(schema.fields(), &records).unwrap();
+        let deserialized: Vec<Instruction> =
+            serde_arrow::from_arrow(schema.fields(), &arrays).unwrap();
+        assert_eq!(records, deserialized);
+    }
+
+    #[test]
+    fn pubkey_random_roundtrip() {
+        let records: Vec<Instruction> = (0..10)
+            .map(|i| Instruction {
+                label: format!("row_{i}"),
+                multisig: solana_pubkey::new_rand(),
+                program_id: solana_pubkey::new_rand(),
+                vault: if i % 2 == 0 {
+                    Some(solana_pubkey::new_rand())
+                } else {
+                    None
+                },
+                accounts: (0..i).map(|_| solana_pubkey::new_rand()).collect(),
+            })
+            .collect();
+
+        let schema = Arc::new(Instruction::arrow_schema());
+        let arrays = serde_arrow::to_arrow(schema.fields(), &records).unwrap();
+        let deserialized: Vec<Instruction> =
+            serde_arrow::from_arrow(schema.fields(), &arrays).unwrap();
+        assert_eq!(records, deserialized);
+    }
+}

@@ -104,6 +104,76 @@ fn has_serde_bytes_attr(field: &syn::Field) -> bool {
     })
 }
 
+/// Extract the size N from a `#[prestige(as_fixed_binary(N))]` attribute.
+///
+/// Returns `Ok(Some(N))` if the attribute is present and well-formed,
+/// `Ok(None)` if the attribute is absent, or `Err` on parse errors.
+fn extract_as_fixed_binary(field: &syn::Field) -> Result<Option<i32>, Error> {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("prestige") {
+            continue;
+        }
+        let mut size: Option<i32> = None;
+        let mut parse_error: Option<Error> = None;
+
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("as_fixed_binary") {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let lit: syn::LitInt = content.parse()?;
+                match lit.base10_parse::<i32>() {
+                    Ok(n) => size = Some(n),
+                    Err(e) => parse_error = Some(e),
+                }
+            }
+            Ok(())
+        });
+
+        if let Some(err) = parse_error {
+            return Err(err);
+        }
+        if size.is_some() {
+            return Ok(size);
+        }
+    }
+    Ok(None)
+}
+
+/// Extract the size N from a `#[prestige(as_vec_fixed_binary(N))]` attribute.
+///
+/// For `Vec<T>` fields where T implements `AsRef<[u8]>` and `From<[u8; N]>`.
+/// The Arrow type will be `List(FixedSizeBinary(N))`.
+fn extract_as_vec_fixed_binary(field: &syn::Field) -> Result<Option<i32>, Error> {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("prestige") {
+            continue;
+        }
+        let mut size: Option<i32> = None;
+        let mut parse_error: Option<Error> = None;
+
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("as_vec_fixed_binary") {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let lit: syn::LitInt = content.parse()?;
+                match lit.base10_parse::<i32>() {
+                    Ok(n) => size = Some(n),
+                    Err(e) => parse_error = Some(e),
+                }
+            }
+            Ok(())
+        });
+
+        if let Some(err) = parse_error {
+            return Err(err);
+        }
+        if size.is_some() {
+            return Ok(size);
+        }
+    }
+    Ok(None)
+}
+
 /// Helper function to extract named fields from a DeriveInput
 fn extract_named_fields(
     input: &DeriveInput,
@@ -567,7 +637,26 @@ fn generate_arrow_field_schemas(
                 None => (field_type, false),
             };
 
-            let data_type_expr = if is_binary {
+            let fixed_binary_size = extract_as_fixed_binary(field).ok().flatten();
+            let vec_fixed_binary_size = extract_as_vec_fixed_binary(field).ok().flatten();
+
+            let data_type_expr = if let Some(size) = fixed_binary_size {
+                // as_fixed_binary(N): any T: AsRef<[u8]> → FixedSizeBinary(N)
+                quote! { arrow::datatypes::DataType::FixedSizeBinary(#size) }
+            } else if let Some(size) = vec_fixed_binary_size {
+                // as_vec_fixed_binary(N): Vec<T: AsRef<[u8]>> → List(FixedSizeBinary(N))
+                quote! {
+                    arrow::datatypes::DataType::List(
+                        arrow::datatypes::FieldRef::new(
+                            arrow::datatypes::Field::new(
+                                "item",
+                                arrow::datatypes::DataType::FixedSizeBinary(#size),
+                                true
+                            )
+                        )
+                    )
+                }
+            } else if is_binary {
                 if let Some(size) = extract_fixed_byte_array_size(inner_type) {
                     quote! { arrow::datatypes::DataType::FixedSizeBinary(#size) }
                 } else if is_vec_u8(inner_type) {
@@ -588,18 +677,27 @@ fn generate_arrow_field_schemas(
         .collect()
 }
 
-/// Generate trait bounds for Arrow serialization
+/// Generate trait bounds for Arrow serialization.
+///
+/// Fields with `as_fixed_binary(N)` or `as_vec_fixed_binary(N)` don't need
+/// `ArrowSerialize` bounds — the macro provides the Arrow type directly.
 fn generate_arrow_field_bounds(
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> Vec<proc_macro2::TokenStream> {
     fields
         .iter()
-        .map(|field| {
+        .filter_map(|field| {
+            // Skip bounds for fields with custom binary annotations.
+            if extract_as_fixed_binary(field).ok().flatten().is_some()
+                || extract_as_vec_fixed_binary(field).ok().flatten().is_some()
+            {
+                return None;
+            }
             let field_type = &field.ty;
             if let Some(inner_type) = extract_option_inner_type(field_type) {
-                quote! { #inner_type: ::prestige::ArrowSerialize }
+                Some(quote! { #inner_type: ::prestige::ArrowSerialize })
             } else {
-                quote! { #field_type: ::prestige::ArrowSerialize }
+                Some(quote! { #field_type: ::prestige::ArrowSerialize })
             }
         })
         .collect()
@@ -891,19 +989,27 @@ pub fn prestige_schema(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
 
+    let struct_name = &item.ident;
+
     // Walk fields: inject serde helpers on byte-typed fields.
     //
     // - `[u8; N]` with as_binary → serde_bytes (binary encoding)
     // - `[u8; N]` without as_binary → serde_u8_array (seq protocol for list encoding)
     // - `Vec<u8>` with as_binary → serde_bytes (binary encoding)
     // - `Vec<u8>` without as_binary → no injection (serde default seq protocol works)
+    // - `T` with as_fixed_binary(N) → generated serde module (T: AsRef<[u8]> + From<[u8; N]>)
+    // - `Vec<T>` with as_vec_fixed_binary(N) → generated serde module for list of fixed binary
     // - Option variants use appropriate Option-aware helpers.
+    let mut generated_serde_modules = Vec::<proc_macro2::TokenStream>::new();
+
     for field in fields.named.iter_mut() {
         if has_serde_bytes_attr(field) {
             continue; // User already provided explicit serde annotation.
         }
 
         let is_binary = has_as_binary_attr(field);
+        let fixed_binary_size = extract_as_fixed_binary(field).ok().flatten();
+        let vec_fixed_binary_size = extract_as_vec_fixed_binary(field).ok().flatten();
         let ty = &field.ty;
 
         // Check for Option<inner> wrapping.
@@ -915,7 +1021,148 @@ pub fn prestige_schema(args: TokenStream, input: TokenStream) -> TokenStream {
         let is_fixed_u8 = extract_fixed_byte_array_size(&inner_ty).is_some();
         let is_vec_u8_field = is_vec_u8(&inner_ty);
 
-        if is_binary && (is_fixed_u8 || is_vec_u8_field) {
+        if let Some(size) = fixed_binary_size {
+            // as_fixed_binary(N): generate a per-field serde module for T: AsRef<[u8]> + From<[u8; N]>.
+            let field_name = field.ident.as_ref().unwrap();
+            let mod_name = syn::Ident::new(
+                &format!("__prestige_fb_{struct_name}_{field_name}"),
+                field_name.span(),
+            );
+            let size_usize = size as usize;
+            let elem_type = if is_option { &inner_ty } else { ty };
+
+            generated_serde_modules.push(quote! {
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                mod #mod_name {
+                    use super::*;
+                    pub fn serialize<S: ::serde::Serializer>(value: &#elem_type, ser: S) -> Result<S::Ok, S::Error> {
+                        ::prestige::serde_bytes::serialize(value.as_ref(), ser)
+                    }
+                    pub fn deserialize<'de, D: ::serde::Deserializer<'de>>(de: D) -> Result<#elem_type, D::Error> {
+                        let bytes: [u8; #size_usize] = ::prestige::serde_bytes::deserialize(de)?;
+                        Ok(<#elem_type>::from(bytes))
+                    }
+                }
+            });
+
+            if is_option {
+                // For Option<T>, wrap with serialize_with/deserialize_with manually
+                // since the module expects T, not Option<T>.
+                // For Option, generate an option-aware wrapper module
+                let opt_mod_name = syn::Ident::new(
+                    &format!("__prestige_fb_opt_{struct_name}_{field_name}"),
+                    field_name.span(),
+                );
+                generated_serde_modules.push(quote! {
+                    #[doc(hidden)]
+                    #[allow(non_snake_case)]
+                    mod #opt_mod_name {
+                        use super::*;
+                        pub fn serialize<S: ::serde::Serializer>(value: &Option<#elem_type>, ser: S) -> Result<S::Ok, S::Error> {
+                            match value {
+                                Some(v) => super::#mod_name::serialize(v, ser),
+                                None => ser.serialize_none(),
+                            }
+                        }
+                        pub fn deserialize<'de, D: ::serde::Deserializer<'de>>(de: D) -> Result<Option<#elem_type>, D::Error> {
+                            use ::serde::de::Visitor;
+                            struct OptVisitor;
+                            impl<'de> Visitor<'de> for OptVisitor {
+                                type Value = Option<#elem_type>;
+                                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                                    write!(f, "an optional fixed binary value")
+                                }
+                                fn visit_none<E: ::serde::de::Error>(self) -> Result<Self::Value, E> { Ok(None) }
+                                fn visit_unit<E: ::serde::de::Error>(self) -> Result<Self::Value, E> { Ok(None) }
+                                fn visit_some<D: ::serde::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
+                                    super::#mod_name::deserialize(de).map(Some)
+                                }
+                            }
+                            de.deserialize_option(OptVisitor)
+                        }
+                    }
+                });
+                let mod_path = opt_mod_name.to_string();
+                field.attrs.push(syn::parse_quote! {
+                    #[serde(with = #mod_path)]
+                });
+            } else {
+                let mod_path = mod_name.to_string();
+                field.attrs.push(syn::parse_quote! {
+                    #[serde(with = #mod_path)]
+                });
+            }
+        } else if let Some(size) = vec_fixed_binary_size {
+            // as_vec_fixed_binary(N): generate a serde module for Vec<T> where T: AsRef<[u8]> + From<[u8; N]>.
+            let field_name = field.ident.as_ref().unwrap();
+            let mod_name = syn::Ident::new(
+                &format!("__prestige_vfb_{struct_name}_{field_name}"),
+                field_name.span(),
+            );
+            let size_usize = size as usize;
+
+            // Extract inner type from Vec<T>
+            let vec_inner_ty = if let Type::Path(TypePath { path, .. }) = &inner_ty
+                && let Some(last_seg) = path.segments.last()
+                && last_seg.ident == "Vec"
+                && let PathArguments::AngleBracketed(ref args) = last_seg.arguments
+                && args.args.len() == 1
+                && let Some(GenericArgument::Type(inner)) = args.args.first()
+            {
+                inner.clone()
+            } else {
+                return Error::new(
+                    field_name.span(),
+                    "as_vec_fixed_binary requires a Vec<T> field type",
+                )
+                .to_compile_error()
+                .into();
+            };
+
+            generated_serde_modules.push(quote! {
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                mod #mod_name {
+                    use super::*;
+                    pub fn serialize<S: ::serde::Serializer>(value: &Vec<#vec_inner_ty>, ser: S) -> Result<S::Ok, S::Error> {
+                        use ::serde::ser::SerializeSeq;
+                        let mut seq = ser.serialize_seq(Some(value.len()))?;
+                        for item in value {
+                            seq.serialize_element(&::prestige::serde_bytes::ByteBuf::from(item.as_ref()))?;
+                        }
+                        seq.end()
+                    }
+                    pub fn deserialize<'de, D: ::serde::Deserializer<'de>>(de: D) -> Result<Vec<#vec_inner_ty>, D::Error> {
+                        use ::serde::de::{SeqAccess, Visitor};
+                        struct VecVisitor;
+                        impl<'de> Visitor<'de> for VecVisitor {
+                            type Value = Vec<#vec_inner_ty>;
+                            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                                write!(f, "a sequence of fixed-size binary values")
+                            }
+                            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                                let mut vec = Vec::new();
+                                while let Some(buf) = seq.next_element::<::prestige::serde_bytes::ByteBuf>()? {
+                                    let bytes: [u8; #size_usize] = buf.into_vec().try_into().map_err(|_| {
+                                        ::serde::de::Error::custom(
+                                            concat!("expected ", stringify!(#size_usize), " bytes for fixed binary element")
+                                        )
+                                    })?;
+                                    vec.push(<#vec_inner_ty>::from(bytes));
+                                }
+                                Ok(vec)
+                            }
+                        }
+                        de.deserialize_seq(VecVisitor)
+                    }
+                }
+            });
+            let mod_path = mod_name.to_string();
+            field.attrs.push(syn::parse_quote! {
+                #[serde(with = #mod_path)]
+            });
+        } else if is_binary && (is_fixed_u8 || is_vec_u8_field) {
             // as_binary: inject serde_bytes (handles both direct and Option types).
             field.attrs.push(syn::parse_quote! {
                 #[serde(with = "::prestige::serde_bytes")]
@@ -970,6 +1217,9 @@ pub fn prestige_schema(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 
     let expanded = quote! {
+        // Generated serde helper modules for as_fixed_binary / as_vec_fixed_binary fields.
+        #(#generated_serde_modules)*
+
         // Emit the (modified) struct — serde_bytes injected, prestige attrs stripped.
         #item
 
