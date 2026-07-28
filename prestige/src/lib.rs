@@ -49,6 +49,11 @@ pub use traits::{ArrowSchema, ArrowSerialize, ParquetSerialize};
 // Re-export serde_bytes so users of #[prestige(as_binary)] don't need a direct dep.
 pub use serde_bytes;
 
+// Same for arrow/serde_arrow: the derive macros expand to `::prestige::arrow::…`,
+// pinning downstreams to the exact versions prestige was built against.
+pub use arrow;
+pub use serde_arrow;
+
 // Re-export derive macros from prestige-macros
 pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter};
 

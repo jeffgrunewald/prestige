@@ -14,12 +14,11 @@ categories.workspace = true
 proc-macro = true
 
 [dependencies]
-arrow.workspace = true
+# arrow/parquet/serde_arrow are deliberately absent: this crate only emits their
+# paths as tokens, resolved via `::prestige::` re-exports at the call site.
 chrono = { workspace = true, optional = true }
-parquet.workspace = true
 quote = "1"
 proc-macro2 = "1"
-serde_arrow.workspace = true
 syn = { version = "2", features = ["full", "extra-traits"] }
 
 [features]

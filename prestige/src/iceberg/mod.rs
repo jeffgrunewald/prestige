@@ -50,10 +50,15 @@ pub use writer::{
 // configure sort orders, or reference table handles.
 pub use iceberg::expr::{Predicate, Reference};
 pub use iceberg::spec::{
-    Datum, NullOrder, Schema, SortDirection, SortOrder, Transform, UnboundPartitionSpec,
+    Datum, NullOrder, PrimitiveType, Schema, SnapshotRef, SortDirection, SortOrder, Transform,
+    Type, UnboundPartitionSpec,
 };
 pub use iceberg::table::Table;
 pub use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+
+// Escape hatch for types not named above, so downstreams never need their own
+// `iceberg` dependency (which could drift off the version prestige links).
+pub use iceberg as upstream;
 
 #[cfg(feature = "iceberg-test-harness")]
 pub use test_harness::{

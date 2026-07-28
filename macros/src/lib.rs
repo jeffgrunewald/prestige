@@ -642,15 +642,15 @@ fn generate_arrow_field_schemas(
 
             let data_type_expr = if let Some(size) = fixed_binary_size {
                 // as_fixed_binary(N): any T: AsRef<[u8]> → FixedSizeBinary(N)
-                quote! { arrow::datatypes::DataType::FixedSizeBinary(#size) }
+                quote! { ::prestige::arrow::datatypes::DataType::FixedSizeBinary(#size) }
             } else if let Some(size) = vec_fixed_binary_size {
                 // as_vec_fixed_binary(N): Vec<T: AsRef<[u8]>> → List(FixedSizeBinary(N))
                 quote! {
-                    arrow::datatypes::DataType::List(
-                        arrow::datatypes::FieldRef::new(
-                            arrow::datatypes::Field::new(
+                    ::prestige::arrow::datatypes::DataType::List(
+                        ::prestige::arrow::datatypes::FieldRef::new(
+                            ::prestige::arrow::datatypes::Field::new(
                                 "item",
-                                arrow::datatypes::DataType::FixedSizeBinary(#size),
+                                ::prestige::arrow::datatypes::DataType::FixedSizeBinary(#size),
                                 true
                             )
                         )
@@ -658,9 +658,9 @@ fn generate_arrow_field_schemas(
                 }
             } else if is_binary {
                 if let Some(size) = extract_fixed_byte_array_size(inner_type) {
-                    quote! { arrow::datatypes::DataType::FixedSizeBinary(#size) }
+                    quote! { ::prestige::arrow::datatypes::DataType::FixedSizeBinary(#size) }
                 } else if is_vec_u8(inner_type) {
-                    quote! { arrow::datatypes::DataType::Binary }
+                    quote! { ::prestige::arrow::datatypes::DataType::Binary }
                 } else {
                     // as_binary on a non-byte type: fall through to trait (will likely fail at compile time)
                     quote! { <#inner_type as ::prestige::ArrowSerialize>::arrow_data_type() }
@@ -671,7 +671,7 @@ fn generate_arrow_field_schemas(
             };
 
             quote! {
-                arrow::datatypes::Field::new(#field_name, #data_type_expr, #nullable)
+                ::prestige::arrow::datatypes::Field::new(#field_name, #data_type_expr, #nullable)
             }
         })
         .collect()
@@ -716,8 +716,8 @@ fn generate_arrow_group_impl(
         where
             #(#arrow_field_bounds),*
         {
-            pub fn arrow_schema() -> arrow::datatypes::Schema {
-                arrow::datatypes::Schema::new(vec![
+            pub fn arrow_schema() -> ::prestige::arrow::datatypes::Schema {
+                ::prestige::arrow::datatypes::Schema::new(vec![
                     #(#arrow_field_schemas),*
                 ])
             }
@@ -733,16 +733,16 @@ fn generate_arrow_reader_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
             Self: for<'de> serde::Deserialize<'de>,
         {
             pub fn from_arrow_records(
-                arrays: &[std::sync::Arc<dyn arrow::array::Array>],
-                schema: &arrow::datatypes::Schema,
-            ) -> Result<Vec<Self>, serde_arrow::Error> {
-                serde_arrow::from_arrow(schema.fields(), arrays)
+                arrays: &[std::sync::Arc<dyn ::prestige::arrow::array::Array>],
+                schema: &::prestige::arrow::datatypes::Schema,
+            ) -> Result<Vec<Self>, ::prestige::serde_arrow::Error> {
+                ::prestige::serde_arrow::from_arrow(schema.fields(), arrays)
             }
 
             pub fn from_arrow_reader<R: std::io::Read + std::io::Seek>(
                 reader: R,
             ) -> Result<Vec<Self>, Box<dyn std::error::Error>> {
-                use arrow::ipc::reader::FileReader;
+                use ::prestige::arrow::ipc::reader::FileReader;
 
                 let arrow_reader = FileReader::try_new(reader, None)?;
                 let schema = arrow_reader.schema();
@@ -750,7 +750,7 @@ fn generate_arrow_reader_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
 
                 for batch_result in arrow_reader {
                     let batch = batch_result?;
-                    let arrays: Vec<std::sync::Arc<dyn arrow::array::Array>> =
+                    let arrays: Vec<std::sync::Arc<dyn ::prestige::arrow::array::Array>> =
                         (0..batch.num_columns())
                             .map(|i| batch.column(i).clone())
                             .collect();
@@ -774,13 +774,13 @@ fn generate_arrow_writer_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
         {
             pub fn to_arrow_arrays(
                 records: &[Self],
-            ) -> Result<(Vec<std::sync::Arc<dyn arrow::array::Array>>, arrow::datatypes::Schema), serde_arrow::Error> {
+            ) -> Result<(Vec<std::sync::Arc<dyn ::prestige::arrow::array::Array>>, ::prestige::arrow::datatypes::Schema), ::prestige::serde_arrow::Error> {
                 if records.is_empty() {
                     return Ok((Vec::new(), Self::arrow_schema()));
                 }
 
                 let arrow_schema = Self::arrow_schema();
-                let arrays = serde_arrow::to_arrow(arrow_schema.fields(), records)?;
+                let arrays = ::prestige::serde_arrow::to_arrow(arrow_schema.fields(), records)?;
                 Ok((arrays, arrow_schema))
             }
 
@@ -788,10 +788,10 @@ fn generate_arrow_writer_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
                 records: &[Self],
                 writer: W,
             ) -> Result<(), Box<dyn std::error::Error>> {
-                use arrow::ipc::writer::FileWriter;
+                use ::prestige::arrow::ipc::writer::FileWriter;
 
                 let (arrays, schema) = Self::to_arrow_arrays(records)?;
-                let batch = arrow::record_batch::RecordBatch::try_new(
+                let batch = ::prestige::arrow::record_batch::RecordBatch::try_new(
                     std::sync::Arc::new(schema.clone()),
                     arrays,
                 )?;
@@ -807,10 +807,10 @@ fn generate_arrow_writer_impl(name: &syn::Ident) -> proc_macro2::TokenStream {
                 records: &[Self],
                 writer: W,
             ) -> Result<(), Box<dyn std::error::Error>> {
-                use arrow::ipc::writer::StreamWriter;
+                use ::prestige::arrow::ipc::writer::StreamWriter;
 
                 let (arrays, schema) = Self::to_arrow_arrays(records)?;
-                let batch = arrow::record_batch::RecordBatch::try_new(
+                let batch = ::prestige::arrow::record_batch::RecordBatch::try_new(
                     std::sync::Arc::new(schema.clone()),
                     arrays,
                 )?;
@@ -1228,7 +1228,7 @@ pub fn prestige_schema(args: TokenStream, input: TokenStream) -> TokenStream {
 
         // ArrowSchema trait implementation
         impl ::prestige::ArrowSchema for #name {
-            fn arrow_schema() -> arrow::datatypes::SchemaRef {
+            fn arrow_schema() -> ::prestige::arrow::datatypes::SchemaRef {
                 std::sync::Arc::new(Self::arrow_schema())
             }
         }
