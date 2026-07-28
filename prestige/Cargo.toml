@@ -27,6 +27,7 @@ futures-util.workspace = true
 iceberg = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 uuid = { version = "1", features = ["v4", "v7"], optional = true }
 metrics = { version = "0.24", optional = true }
@@ -60,7 +61,7 @@ solana-pubkey = { version = "4", features = ["rand"] }
 [features]
 default = []
 decimal = ["dep:rust_decimal"]
-iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:reqwest", "dep:uuid", "prestige-macros/iceberg"]
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:reqwest", "dep:uuid", "prestige-macros/iceberg"]
 iceberg-sql-catalog = ["iceberg", "dep:iceberg-catalog-sql"]
 iceberg-test-harness = ["iceberg"]
 metrics = ["dep:metrics"]

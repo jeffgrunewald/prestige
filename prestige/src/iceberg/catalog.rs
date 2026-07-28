@@ -1,6 +1,7 @@
 use crate::error::Result;
 use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent, table::Table};
 use iceberg_catalog_rest::{CommitTableRequest, RestCatalog, RestCatalogBuilder};
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -467,7 +468,12 @@ impl Catalog {
         props.extend(config.s3.props());
         props.extend(config.properties.clone());
 
+        // iceberg 0.10 requires an explicit StorageFactory; without one RestCatalog
+        // fails on its first file IO with "StorageFactory must be provided".
         let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+                customized_credential_load: None,
+            }))
             .load(&config.catalog_name, props)
             .await?;
 
