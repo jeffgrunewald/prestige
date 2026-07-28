@@ -15,7 +15,7 @@ use arrow_select::filter::filter_record_batch;
 use derive_builder::Builder;
 use futures::TryStreamExt;
 use iceberg::{
-    TableRequirement, TableUpdate,
+    Runtime, TableRequirement, TableUpdate,
     arrow::ArrowReaderBuilder,
     arrow::schema_to_arrow_schema,
     spec::{
@@ -102,8 +102,10 @@ impl IcebergCompactorConfig {
         // Collect all alive manifest entries from the current snapshot.
         // We need the full ManifestEntry (with sequence numbers) so we can
         // mark them as DELETED in the rewrite commit.
-        let manifest_list = current_snapshot
-            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+        let manifest_list = self
+            .table
+            .manifest_list_reader(current_snapshot)
+            .load()
             .await?;
 
         let mut old_entries: Vec<OldFileEntry> = Vec::new();
@@ -176,8 +178,9 @@ impl IcebergCompactorConfig {
             futures::future::ready(compact_paths.contains(&task.data_file_path))
         });
 
-        let reader = ArrowReaderBuilder::new(self.table.file_io().clone()).build();
-        let stream = reader.read(Box::pin(filtered_tasks))?;
+        let reader =
+            ArrowReaderBuilder::new(self.table.file_io().clone(), Runtime::try_current()?).build();
+        let stream = reader.read(Box::pin(filtered_tasks))?.stream();
         let mut pinned = pin!(stream);
 
         // Stream batches through a sorting writer instead of accumulating
@@ -255,9 +258,7 @@ impl IcebergCompactorConfig {
 
                 // Re-collect entries from the reloaded table so sequence numbers
                 // match the current manifest state.
-                let ml = snap
-                    .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
-                    .await?;
+                let ml = self.table.manifest_list_reader(snap).load().await?;
                 compact_entries.clear();
                 for mf in ml.entries() {
                     let m = mf.load_manifest(self.table.file_io()).await?;
@@ -371,7 +372,6 @@ impl IcebergCompactorConfig {
         let delete_builder = ManifestWriterBuilder::new(
             delete_output,
             Some(snapshot_id),
-            None,
             schema.clone(),
             partition_spec.as_ref().clone(),
         );
@@ -401,7 +401,6 @@ impl IcebergCompactorConfig {
         let add_builder = ManifestWriterBuilder::new(
             add_output,
             Some(snapshot_id),
-            None,
             schema.clone(),
             partition_spec.as_ref().clone(),
         );
@@ -433,8 +432,10 @@ impl IcebergCompactorConfig {
         let parent_snapshot = metadata
             .snapshot_by_id(parent_snapshot_id)
             .expect("parent snapshot just resolved");
-        let parent_manifest_list = parent_snapshot
-            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
+        let parent_manifest_list = self
+            .table
+            .manifest_list_reader(parent_snapshot)
+            .load()
             .await?;
 
         let mut surviving_manifests: Vec<ManifestFile> = Vec::new();
@@ -485,19 +486,26 @@ impl IcebergCompactorConfig {
             commit_uuid,
             DataFileFormat::Avro
         );
-        let manifest_list_output = self.table.file_io().new_output(&manifest_list_path)?;
+        let manifest_list_writer_out = self
+            .table
+            .file_io()
+            .new_output(&manifest_list_path)?
+            .writer()
+            .await?;
         let mut manifest_list_writer = match metadata.format_version() {
-            FormatVersion::V1 => {
-                ManifestListWriter::v1(manifest_list_output, snapshot_id, Some(parent_snapshot_id))
-            }
+            FormatVersion::V1 => ManifestListWriter::v1(
+                manifest_list_writer_out,
+                snapshot_id,
+                Some(parent_snapshot_id),
+            ),
             FormatVersion::V2 => ManifestListWriter::v2(
-                manifest_list_output,
+                manifest_list_writer_out,
                 snapshot_id,
                 Some(parent_snapshot_id),
                 next_seq_num,
             ),
             FormatVersion::V3 => ManifestListWriter::v3(
-                manifest_list_output,
+                manifest_list_writer_out,
                 snapshot_id,
                 Some(parent_snapshot_id),
                 next_seq_num,
@@ -1066,9 +1074,7 @@ impl CompactionScheduler {
             return Ok(false);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
-            .await?;
+        let manifest_list = self.table.manifest_list_reader(snapshot).load().await?;
 
         let mut partition_file_counts: HashMap<Struct, usize> = HashMap::new();
 

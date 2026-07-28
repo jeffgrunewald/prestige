@@ -159,14 +159,10 @@ pub fn build_partition_spec(
     schema: &Schema,
     defs: &[PartitionFieldDef],
 ) -> Result<UnboundPartitionSpec> {
-    // Partition field IDs start at 1000 per the Iceberg spec convention
-    // (UNPARTITIONED_LAST_ASSIGNED_ID = 999, first real field = 1000).
-    // We assign them explicitly because iceberg-rust 0.8 serializes
-    // `None` as JSON `null` (missing `skip_serializing_if`), which
-    // Polaris rejects.
-    let mut next_field_id: i32 = 1000;
+    // Field IDs start at 1000 per the Iceberg spec (first field after
+    // UNPARTITIONED_LAST_ASSIGNED_ID); assigned here to stay deterministic.
     let mut fields = Vec::with_capacity(defs.len());
-    for def in defs {
+    for (next_field_id, def) in (1000_i32..).zip(defs) {
         let source_id = schema
             .field_by_name(def.name)
             .ok_or_else(|| {
@@ -192,7 +188,6 @@ pub fn build_partition_spec(
                 .transform(def.transform)
                 .build(),
         );
-        next_field_id += 1;
     }
 
     let spec = UnboundPartitionSpec::builder()

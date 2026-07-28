@@ -86,7 +86,7 @@ pub async fn write_data_files_with_target_size(
         .collect::<std::result::Result<_, _>>()?;
 
     let file_io = table.file_io().clone();
-    let location_gen = DefaultLocationGenerator::new(metadata.clone())?;
+    let location_gen = DefaultLocationGenerator::new(metadata)?;
     let file_name_gen = DefaultFileNameGenerator::new(
         "data".to_string(),
         Some(uuid::Uuid::now_v7().as_simple().to_string()),

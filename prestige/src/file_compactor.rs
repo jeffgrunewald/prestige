@@ -581,7 +581,7 @@ fn measure_output_size(
     let mut buf = Vec::new();
     let props = WriterProperties::builder()
         .set_compression(compression)
-        .set_max_row_group_size(row_group_size)
+        .set_max_row_group_row_count(Some(row_group_size))
         .set_write_batch_size(1024)
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_created_by(format!("prestige/{}", env!("CARGO_PKG_VERSION")))
@@ -755,7 +755,7 @@ async fn finalize_and_upload_schema_agnostic(
         let std_file = std::fs::File::create(&write_path)?;
         let props = WriterProperties::builder()
             .set_compression(compression)
-            .set_max_row_group_size(row_group_size)
+            .set_max_row_group_row_count(Some(row_group_size))
             .set_write_batch_size(1024)
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_created_by(format!("prestige/{}", env!("CARGO_PKG_VERSION")))

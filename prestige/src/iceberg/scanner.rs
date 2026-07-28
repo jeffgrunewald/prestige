@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use arrow::array::RecordBatch;
 use futures::{TryStreamExt, stream::BoxStream};
 use iceberg::{
+    Runtime,
     arrow::ArrowReaderBuilder,
     expr::Predicate,
     spec::{ManifestStatus, Operation},
@@ -139,9 +140,7 @@ pub async fn scan_snapshot_range(
 
     // Walk the upper-bound snapshot's manifest list and collect paths of
     // files added within the window.
-    let manifest_list = to_snapshot
-        .load_manifest_list(table.file_io(), table.metadata())
-        .await?;
+    let manifest_list = table.manifest_list_reader(to_snapshot).load().await?;
 
     let mut new_file_paths: HashSet<String> = HashSet::new();
 
@@ -200,8 +199,8 @@ pub async fn scan_snapshot_range(
         futures::future::ready(new_file_paths.contains(&task.data_file_path))
     });
 
-    let reader = ArrowReaderBuilder::new(table.file_io().clone()).build();
-    let stream = reader.read(Box::pin(filtered_tasks))?;
+    let reader = ArrowReaderBuilder::new(table.file_io().clone(), Runtime::try_current()?).build();
+    let stream = reader.read(Box::pin(filtered_tasks))?.stream();
     Ok(stream)
 }
 

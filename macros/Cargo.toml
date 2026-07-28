@@ -14,9 +14,9 @@ categories.workspace = true
 proc-macro = true
 
 [dependencies]
-arrow = { version = "57", features = ["ipc"] }
+arrow.workspace = true
 chrono = { workspace = true, optional = true }
-parquet = "57"
+parquet.workspace = true
 quote = "1"
 proc-macro2 = "1"
 serde_arrow.workspace = true

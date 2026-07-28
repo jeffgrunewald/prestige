@@ -107,7 +107,6 @@ pub(crate) async fn commit_to_branch(
     let builder = ManifestWriterBuilder::new(
         output_file,
         Some(snapshot_id),
-        None,
         schema.clone(),
         partition_spec.as_ref().clone(),
     );
@@ -125,9 +124,7 @@ pub(crate) async fn commit_to_branch(
     // Collect existing manifests from the branch's current snapshot
     let mut manifests: Vec<ManifestFile> = vec![new_manifest];
     if let Some(branch_snapshot) = branch_snapshot {
-        let manifest_list = branch_snapshot
-            .load_manifest_list(table.file_io(), &table.metadata_ref())
-            .await?;
+        let manifest_list = table.manifest_list_reader(branch_snapshot).load().await?;
         manifests.extend(
             manifest_list
                 .entries()
@@ -145,19 +142,23 @@ pub(crate) async fn commit_to_branch(
         commit_uuid,
         DataFileFormat::Avro
     );
-    let manifest_list_output = table.file_io().new_output(&manifest_list_path)?;
+    let manifest_list_writer_out = table
+        .file_io()
+        .new_output(&manifest_list_path)?
+        .writer()
+        .await?;
     let mut manifest_list_writer = match metadata.format_version() {
         FormatVersion::V1 => {
-            ManifestListWriter::v1(manifest_list_output, snapshot_id, parent_snapshot_id)
+            ManifestListWriter::v1(manifest_list_writer_out, snapshot_id, parent_snapshot_id)
         }
         FormatVersion::V2 => ManifestListWriter::v2(
-            manifest_list_output,
+            manifest_list_writer_out,
             snapshot_id,
             parent_snapshot_id,
             next_seq_num,
         ),
         FormatVersion::V3 => ManifestListWriter::v3(
-            manifest_list_output,
+            manifest_list_writer_out,
             snapshot_id,
             parent_snapshot_id,
             next_seq_num,

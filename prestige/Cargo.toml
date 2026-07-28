@@ -11,9 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-arrow = { version = "57", features = ["ipc"] }
-arrow-row = "57"
-arrow-select = "57"
+arrow.workspace = true
+arrow-row.workspace = true
+arrow-select.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true

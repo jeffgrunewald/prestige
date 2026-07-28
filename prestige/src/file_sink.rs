@@ -670,7 +670,7 @@ where
         // Build writer properties
         let props = WriterProperties::builder()
             .set_compression(self.compression)
-            .set_max_row_group_size(self.row_group_size)
+            .set_max_row_group_row_count(Some(self.row_group_size))
             .set_write_batch_size(1024)
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_created_by(format!("prestige/{}", env!("CARGO_PKG_VERSION")))
