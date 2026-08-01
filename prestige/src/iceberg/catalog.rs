@@ -1,6 +1,13 @@
 use crate::error::Result;
-use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent, table::Table};
-use iceberg_catalog_rest::{CommitTableRequest, RestCatalog, RestCatalogBuilder};
+use iceberg::{
+    Catalog as IcebergCatalog, CatalogBuilder, NamespaceIdent, TableIdent, table::Table,
+};
+use iceberg_catalog_rest::{CommitTableRequest, RestCatalogBuilder};
+#[cfg(feature = "iceberg-s3tables-catalog")]
+use iceberg_catalog_s3tables::{
+    S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
+    S3TablesCatalogBuilder,
+};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -186,6 +193,125 @@ impl From<&crate::Settings> for CatalogConfigBuilder {
         });
         builder.config.warehouse = settings.endpoint.clone();
         builder
+    }
+}
+
+/// Configuration for an Amazon S3 Tables catalog.
+///
+/// Enable the `iceberg-s3tables-catalog` feature to use this type.
+#[cfg(feature = "iceberg-s3tables-catalog")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3TablesCatalogConfig {
+    pub catalog_name: String,
+    pub table_bucket_arn: String,
+    pub endpoint_url: Option<String>,
+    pub region: Option<String>,
+    #[serde(skip_serializing)]
+    pub access_key_id: Option<String>,
+    #[serde(skip_serializing)]
+    pub secret_access_key: Option<String>,
+    #[serde(skip_serializing)]
+    pub session_token: Option<String>,
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
+}
+
+#[cfg(feature = "iceberg-s3tables-catalog")]
+impl S3TablesCatalogConfig {
+    pub fn builder(
+        catalog_name: impl Into<String>,
+        table_bucket_arn: impl Into<String>,
+    ) -> S3TablesCatalogConfigBuilder {
+        S3TablesCatalogConfigBuilder {
+            config: Self {
+                catalog_name: catalog_name.into(),
+                table_bucket_arn: table_bucket_arn.into(),
+                endpoint_url: None,
+                region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                properties: HashMap::new(),
+            },
+        }
+    }
+
+    /// Connect to the configured Amazon S3 Tables catalog.
+    pub async fn connect(&self) -> Result<Catalog> {
+        Catalog::connect_s3tables(self).await
+    }
+
+    fn props(&self) -> HashMap<String, String> {
+        let mut props = self.properties.clone();
+        props.insert(
+            S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+            self.table_bucket_arn.clone(),
+        );
+        if let Some(endpoint_url) = &self.endpoint_url {
+            props.insert(
+                S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(),
+                endpoint_url.clone(),
+            );
+        }
+        if let Some(region) = &self.region {
+            props.insert("region_name".to_string(), region.clone());
+        }
+        if let Some(access_key_id) = &self.access_key_id {
+            props.insert("aws_access_key_id".to_string(), access_key_id.clone());
+        }
+        if let Some(secret_access_key) = &self.secret_access_key {
+            props.insert(
+                "aws_secret_access_key".to_string(),
+                secret_access_key.clone(),
+            );
+        }
+        if let Some(session_token) = &self.session_token {
+            props.insert("aws_session_token".to_string(), session_token.clone());
+        }
+        props
+    }
+}
+
+/// Builder for [`S3TablesCatalogConfig`].
+#[cfg(feature = "iceberg-s3tables-catalog")]
+pub struct S3TablesCatalogConfigBuilder {
+    config: S3TablesCatalogConfig,
+}
+
+#[cfg(feature = "iceberg-s3tables-catalog")]
+impl S3TablesCatalogConfigBuilder {
+    pub fn endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
+        self.config.endpoint_url = Some(endpoint_url.into());
+        self
+    }
+
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.config.region = Some(region.into());
+        self
+    }
+
+    pub fn credentials(
+        mut self,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> Self {
+        self.config.access_key_id = Some(access_key_id.into());
+        self.config.secret_access_key = Some(secret_access_key.into());
+        self
+    }
+
+    pub fn session_token(mut self, session_token: impl Into<String>) -> Self {
+        self.config.session_token = Some(session_token.into());
+        self
+    }
+
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.properties.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn build(self) -> S3TablesCatalogConfig {
+        self.config
     }
 }
 
@@ -444,16 +570,22 @@ impl RestEndpoint {
 // Catalog — wrapper providing both iceberg trait delegation and direct HTTP
 // ---------------------------------------------------------------------------
 
-/// A shareable, authenticated connection to an Iceberg REST catalog.
+enum CatalogSource {
+    Rest(Arc<CatalogConfig>),
+    #[cfg(feature = "iceberg-s3tables-catalog")]
+    S3Tables(Arc<S3TablesCatalogConfig>),
+}
+
+/// A shareable Iceberg catalog connection.
 ///
-/// Wraps `RestCatalog` in an `Arc` for sharing across async tasks, and also
-/// holds a `RestEndpoint` for direct HTTP calls required by branch operations
-/// (since `TableCommit`'s builder is `pub(crate)` in iceberg-rust 0.8).
+/// The wrapper presents one catalog interface for REST and Amazon S3 Tables.
+/// Standard table changes use `Transaction::commit` through the upstream
+/// `iceberg::Catalog` trait.
 #[derive(Clone)]
 pub struct Catalog {
-    inner: Arc<RestCatalog>,
-    endpoint: RestEndpoint,
-    config: Arc<CatalogConfig>,
+    inner: Arc<dyn IcebergCatalog>,
+    rest_endpoint: Option<RestEndpoint>,
+    source: Arc<CatalogSource>,
 }
 
 impl Catalog {
@@ -481,22 +613,38 @@ impl Catalog {
 
         Ok(Self {
             inner: Arc::new(catalog),
-            endpoint,
-            config: Arc::new(config.clone()),
+            rest_endpoint: Some(endpoint),
+            source: Arc::new(CatalogSource::Rest(Arc::new(config.clone()))),
         })
     }
 
-    /// Rebuild the inner `RestCatalog` with a fresh OAuth2 token.
-    ///
-    /// `iceberg-catalog-rest` 0.8.0 caches the OAuth2 token internally with no
-    /// automatic refresh. For indefinitely-running applications, call this when
-    /// catalog operations start failing with authentication errors to obtain a
-    /// new token without restarting the process.
+    /// Connect to an Amazon S3 Tables catalog.
+    #[cfg(feature = "iceberg-s3tables-catalog")]
+    pub async fn connect_s3tables(config: &S3TablesCatalogConfig) -> Result<Self> {
+        let catalog = S3TablesCatalogBuilder::default()
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+                customized_credential_load: None,
+            }))
+            .load(&config.catalog_name, config.props())
+            .await?;
+
+        Ok(Self {
+            inner: Arc::new(catalog),
+            rest_endpoint: None,
+            source: Arc::new(CatalogSource::S3Tables(Arc::new(config.clone()))),
+        })
+    }
+
+    /// Rebuild the inner catalog connection.
     pub async fn reconnect(&mut self) -> Result<()> {
         debug!("catalog: reconnecting with fresh credentials");
-        let fresh = Self::connect(&self.config).await?;
+        let fresh = match self.source.as_ref() {
+            CatalogSource::Rest(config) => Self::connect(config).await?,
+            #[cfg(feature = "iceberg-s3tables-catalog")]
+            CatalogSource::S3Tables(config) => Self::connect_s3tables(config).await?,
+        };
         self.inner = fresh.inner;
-        self.endpoint = fresh.endpoint;
+        self.rest_endpoint = fresh.rest_endpoint;
         debug!("catalog: reconnected successfully");
         Ok(())
     }
@@ -551,7 +699,7 @@ impl Catalog {
     /// Uses `load_table` (GET) instead of the Iceberg REST `HEAD` endpoint because
     /// Polaris 1.3.0-incubating returns 400 for HEAD on existing tables.
     pub async fn table_exists(&self, table_ident: &TableIdent) -> Result<bool> {
-        match iceberg::Catalog::load_table(&*self.inner, table_ident).await {
+        match IcebergCatalog::load_table(&*self.inner, table_ident).await {
             Ok(_) => {
                 debug!(table = %table_ident, exists = true, "catalog: table_exists result");
                 Ok(true)
@@ -566,14 +714,14 @@ impl Catalog {
 
     /// Load a table from the catalog.
     pub async fn load_table(&self, table_ident: &TableIdent) -> Result<Table> {
-        let table = iceberg::Catalog::load_table(&*self.inner, table_ident).await?;
+        let table = IcebergCatalog::load_table(&*self.inner, table_ident).await?;
         debug!(table = %table_ident, "catalog: table loaded");
         Ok(table)
     }
 
     /// Create a namespace if it doesn't exist.
     pub async fn create_namespace_if_not_exists(&self, namespace: &NamespaceIdent) -> Result<()> {
-        match iceberg::Catalog::create_namespace(&*self.inner, namespace, HashMap::new()).await {
+        match IcebergCatalog::create_namespace(&*self.inner, namespace, HashMap::new()).await {
             Ok(_) => {
                 debug!(namespace = ?namespace, "catalog: namespace created");
                 Ok(())
@@ -603,7 +751,7 @@ impl Catalog {
             has_sort_order = creation.sort_order.is_some(),
             "catalog: creating table"
         );
-        match iceberg::Catalog::create_table(&*self.inner, namespace, creation).await {
+        match IcebergCatalog::create_table(&*self.inner, namespace, creation).await {
             Ok(table) => {
                 debug!(namespace = ?namespace, "catalog: table created successfully");
                 Ok(table)
@@ -621,12 +769,19 @@ impl Catalog {
         self.inner.clone()
     }
 
-    /// Send a commit table request directly to the REST catalog API.
+    /// Send a legacy metadata request to a REST catalog.
     ///
-    /// Bypasses `TableCommit` (whose builder is `pub(crate)` in iceberg 0.8)
-    /// by constructing and sending a `CommitTableRequest` via HTTP POST.
+    /// Iceberg 0.10 has no public transaction action for branch references or
+    /// compaction replacement. Standard append and schema commits use
+    /// `Transaction::commit` and work with every supported catalog.
     pub(crate) async fn commit_table_request(&self, request: &CommitTableRequest) -> Result<()> {
-        self.endpoint.commit_table(request).await
+        let endpoint = self.rest_endpoint.as_ref().ok_or_else(|| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::FeatureUnsupported,
+                "branch and compaction commits require an Iceberg REST catalog",
+            )
+        })?;
+        endpoint.commit_table(request).await
     }
 }
 
@@ -653,12 +808,6 @@ pub(crate) fn is_already_exists_error(e: &iceberg::Error) -> bool {
         e.kind(),
         iceberg::ErrorKind::NamespaceAlreadyExists | iceberg::ErrorKind::TableAlreadyExists
     ) || (e.kind() == iceberg::ErrorKind::Unexpected && e.to_string().contains("already exists"))
-}
-
-impl AsRef<RestCatalog> for Catalog {
-    fn as_ref(&self) -> &RestCatalog {
-        &self.inner
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -809,6 +958,45 @@ mod tests {
         );
         assert_eq!(props.get("s3.access-key-id"), Some(&"AKID".to_string()));
         assert_eq!(props.get("s3.path-style-access"), Some(&"true".to_string()));
+    }
+
+    #[cfg(feature = "iceberg-s3tables-catalog")]
+    #[test]
+    fn test_s3tables_catalog_config_props() {
+        let config = S3TablesCatalogConfig::builder(
+            "analytics",
+            "arn:aws:s3tables:us-east-1:123456789012:bucket/example",
+        )
+        .endpoint_url("http://localhost:4566")
+        .region("us-east-1")
+        .credentials("access-key", "secret-key")
+        .session_token("session-token")
+        .property("profile_name", "test")
+        .build();
+
+        let props = config.props();
+
+        assert_eq!(
+            props.get(S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN),
+            Some(&"arn:aws:s3tables:us-east-1:123456789012:bucket/example".to_string())
+        );
+        assert_eq!(
+            props.get(S3TABLES_CATALOG_PROP_ENDPOINT_URL),
+            Some(&"http://localhost:4566".to_string())
+        );
+        assert_eq!(props.get("region_name"), Some(&"us-east-1".to_string()));
+        assert_eq!(
+            props.get("aws_access_key_id"),
+            Some(&"access-key".to_string())
+        );
+        assert_eq!(
+            props.get("aws_secret_access_key"),
+            Some(&"secret-key".to_string())
+        );
+        assert_eq!(
+            props.get("aws_session_token"),
+            Some(&"session-token".to_string())
+        );
     }
 
     #[test]

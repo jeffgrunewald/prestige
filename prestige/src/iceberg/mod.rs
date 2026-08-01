@@ -15,6 +15,8 @@ mod writer;
 pub use catalog::{
     AuthConfig, Catalog, CatalogConfig, CatalogConfigBuilder, S3Config, connect_catalog,
 };
+#[cfg(feature = "iceberg-s3tables-catalog")]
+pub use catalog::{S3TablesCatalogConfig, S3TablesCatalogConfigBuilder};
 pub use compactor::{
     CompactionScheduler, CompactionSchedulerBuilder, IcebergCompactionResult,
     IcebergCompactorConfig, IcebergCompactorConfigBuilder,

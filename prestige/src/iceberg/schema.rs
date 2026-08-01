@@ -314,8 +314,11 @@ pub fn reconcile_schema(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchemaType};
+    use chrono::{DateTime, Utc};
     use iceberg::spec::{NestedField, PrimitiveType, Type};
     use std::sync::Arc;
+
+    use crate::ArrowSerialize;
 
     #[test]
     fn test_arrow_to_iceberg_schema_round_trip() {
@@ -337,6 +340,23 @@ mod tests {
 
         let value_field = iceberg_schema.field_by_name("value").unwrap();
         assert!(value_field.required);
+    }
+
+    #[test]
+    fn test_datetime_utc_maps_to_timestamptz() {
+        let arrow_schema = Arc::new(ArrowSchemaType::new(vec![Field::new(
+            "created_at",
+            DateTime::<Utc>::arrow_data_type(),
+            false,
+        )]));
+
+        let iceberg_schema = arrow_to_iceberg_schema(&arrow_schema).unwrap();
+        let field = iceberg_schema.field_by_name("created_at").unwrap();
+
+        assert_eq!(
+            field.field_type.as_ref(),
+            &Type::Primitive(PrimitiveType::Timestamptz)
+        );
     }
 
     fn catalog_schema_with_fields(fields: Vec<NestedFieldRef>) -> Schema {
