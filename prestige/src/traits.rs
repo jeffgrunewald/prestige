@@ -177,13 +177,13 @@ mod chrono_impls {
         parquet::basic::Type::INT64,
         Some(parquet::basic::LogicalType::Timestamp {
             is_adjusted_to_u_t_c: true,
-            unit: parquet::basic::TimeUnit::MILLIS
+            unit: parquet::basic::TimeUnit::MICROS
         })
     );
     impl_arrow_serialize!(
         DateTime<Utc>,
         arrow::datatypes::DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Millisecond,
+            arrow::datatypes::TimeUnit::Microsecond,
             Some("UTC".into())
         )
     );
@@ -449,6 +449,7 @@ impl<T: ArrowSerialize> ArrowSerialize for Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use std::collections::HashSet;
 
     #[test]
@@ -545,5 +546,25 @@ mod tests {
             }
             _ => panic!("Expected List data type, got {:?}", data_type),
         }
+    }
+
+    #[test]
+    fn test_datetime_utc_uses_microsecond_precision() {
+        assert_eq!(
+            DateTime::<Utc>::arrow_data_type(),
+            arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )
+        );
+
+        let schema = DateTime::<Utc>::parquet_schema_element();
+        assert_eq!(
+            schema.get_basic_info().logical_type_ref(),
+            Some(&parquet::basic::LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: true,
+                unit: parquet::basic::TimeUnit::MICROS,
+            })
+        );
     }
 }

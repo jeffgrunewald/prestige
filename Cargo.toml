@@ -33,6 +33,7 @@ futures = "0"
 futures-util = "0"
 iceberg = "0.10"
 iceberg-catalog-rest = "0.10"
+iceberg-catalog-s3tables = "0.10"
 iceberg-catalog-sql = "0.10"
 iceberg-storage-opendal = "0.10"
 parquet = { version = "58", features = ["async"] }

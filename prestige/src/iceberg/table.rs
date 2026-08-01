@@ -3,11 +3,11 @@ use std::{collections::HashMap, time::Duration};
 use arrow::datatypes::SchemaRef;
 use derive_builder::Builder;
 use iceberg::{
-    NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate,
+    NamespaceIdent, TableCreation, TableIdent,
     spec::{Schema, SortOrder, UnboundPartitionSpec},
     table::Table,
+    transaction::{AddColumn, ApplyTransactionAction, Transaction},
 };
-use iceberg_catalog_rest::CommitTableRequest;
 use tracing::{debug, info};
 
 use super::{
@@ -280,21 +280,15 @@ pub async fn ensure_table(
                 "evolving iceberg table schema"
             );
 
-            let request = CommitTableRequest {
-                identifier: Some(table_ident.clone()),
-                requirements: vec![TableRequirement::CurrentSchemaIdMatch {
-                    current_schema_id: catalog_schema.schema_id(),
-                }],
-                updates: vec![
-                    TableUpdate::AddSchema { schema: *schema },
-                    TableUpdate::SetCurrentSchema { schema_id: -1 },
-                ],
-            };
-
-            catalog.commit_table_request(&request).await?;
-
-            // Reload to get the table with the new schema applied.
-            let updated_table = catalog.load_table(&table_ident).await?;
+            let updated_table = commit_schema_update(
+                catalog,
+                &table,
+                &schema,
+                &columns_added,
+                &columns_dropped,
+                identifier_field_names,
+            )
+            .await?;
 
             Ok(EnsureTableResult::Evolved {
                 table: updated_table,
@@ -303,6 +297,56 @@ pub async fn ensure_table(
             })
         }
     }
+}
+
+async fn commit_schema_update(
+    catalog: &Catalog,
+    table: &Table,
+    schema: &Schema,
+    columns_added: &[String],
+    columns_dropped: &[String],
+    identifier_field_names: &[&str],
+) -> Result<Table> {
+    let current_identifier_names: Vec<&str> = table
+        .metadata()
+        .current_schema()
+        .identifier_field_ids()
+        .filter_map(|id| table.metadata().current_schema().field_by_id(id))
+        .map(|field| field.name.as_str())
+        .collect();
+
+    if !identifier_field_names.is_empty()
+        && identifier_field_names != current_identifier_names.as_slice()
+    {
+        return Err(iceberg::Error::new(
+            iceberg::ErrorKind::FeatureUnsupported,
+            "Iceberg 0.10 transactions cannot change identifier fields",
+        )
+        .into());
+    }
+
+    let action = columns_added.iter().try_fold(
+        Transaction::new(table).update_schema(),
+        |action, name| {
+            let field = schema.field_by_name(name).ok_or_else(|| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    format!("reconciled schema is missing added column '{name}'"),
+                )
+            })?;
+            Ok::<_, iceberg::Error>(
+                action.add_column(AddColumn::optional(name, field.field_type.as_ref().clone())),
+            )
+        },
+    )?;
+    let action = columns_dropped
+        .iter()
+        .fold(action, |action, name| action.delete_column(name));
+    let tx = action.apply(Transaction::new(table))?;
+
+    tx.commit(catalog.as_iceberg_catalog().as_ref())
+        .await
+        .map_err(Into::into)
 }
 
 fn build_table_creation(config: &IcebergTableConfig, schema: Schema) -> TableCreation {
