@@ -1,9 +1,9 @@
 use arrow::array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
 use arrow_select::filter::filter_record_batch;
-use chrono::{DateTime, Utc};
 use derive_builder::Builder;
 use futures::{StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use parquet::{
     arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder},
     basic::Compression,
@@ -135,13 +135,13 @@ where
 ///
 /// ```rust,ignore
 /// use prestige::file_compactor::FileCompactorConfigBuilder;
-/// use chrono::Utc;
+/// use prestige::jiff::Timestamp;
 ///
 /// let result = FileCompactorConfigBuilder::default()
 ///     .client(client)
 ///     .bucket("my-bucket".to_string())
 ///     .prefix("data".to_string())
-///     .until_timestamp(Utc::now())
+///     .until_timestamp(Timestamp::now())
 ///     .delete_originals(true)
 ///     .execute::<MyDataType>()
 ///     .await?;
@@ -168,7 +168,7 @@ where
 ///
 /// ```rust,ignore
 /// use prestige::{Client, file_compactor::FileCompactorConfigBuilder, traits::ArrowSchema};
-/// use chrono::{DateTime, Duration, Utc};
+/// use prestige::{jiff::{SignedDuration, Timestamp}, jiff_sqlx::Timestamp as PgTimestamp};
 /// use serde::{Deserialize, Serialize};
 /// use super_visor::{ManagedProc, ShutdownSignal};
 /// use tokio::time::{interval, Duration as TokioDuration};
@@ -213,13 +213,14 @@ where
 ///     }
 ///
 ///     /// Query database to get the cutoff timestamp for compaction
-///     async fn get_compaction_timestamp(&self) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
+///     async fn get_compaction_timestamp(&self) -> Result<Timestamp, Box<dyn std::error::Error>> {
 ///         // Option 1: Use current time minus lookback period
-///         let cutoff = Utc::now() - Duration::minutes(self.settings.lookback_minutes);
+///         let cutoff = Timestamp::now() - SignedDuration::from_mins(self.settings.lookback_minutes);
 ///
 ///         // Option 2: Query database for latest processed file timestamp
 ///         // This ensures we only compact files that have been fully processed
-///         let db_timestamp: Option<DateTime<Utc>> = sqlx::query_scalar(
+///         // jiff-sqlx decodes TIMESTAMPTZ into a wrapper; `to_jiff` gives the jiff Timestamp.
+///         let db_timestamp: Option<PgTimestamp> = sqlx::query_scalar(
 ///             r#"
 ///             SELECT MAX(file_timestamp)
 ///             FROM files_processed
@@ -229,6 +230,7 @@ where
 ///         .bind(&self.settings.prefix)
 ///         .fetch_one(&self.settings.db_pool)
 ///         .await?;
+///         let db_timestamp = db_timestamp.map(PgTimestamp::to_jiff);
 ///
 ///         // Use the earlier of the two timestamps (more conservative)
 ///         let timestamp = match db_timestamp {
@@ -382,11 +384,11 @@ pub struct FileCompactorConfig<T> {
     /// When None, compacts all files from the beginning
     /// When Some, only compacts files with timestamp > after_timestamp (exclusive)
     #[builder(default = "None")]
-    after_timestamp: Option<DateTime<Utc>>,
+    after_timestamp: Option<Timestamp>,
 
     /// Compact files until this timestamp (inclusive)
     /// Files with timestamp <= until_timestamp will be compacted
-    until_timestamp: DateTime<Utc>,
+    until_timestamp: Timestamp,
 
     /// Maximum bytes per output file (soft limit, default 100MB)
     #[builder(default = "DEFAULT_MAX_SIZE_BYTES")]
@@ -436,7 +438,7 @@ pub struct CompactionResult {
     /// Use this as `after_timestamp` for subsequent compaction runs to implement checkpointing.
     /// None if no files were processed.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub last_processed_timestamp: Option<DateTime<Utc>>,
+    pub last_processed_timestamp: Option<Timestamp>,
 
     /// S3 keys of source files that failed to delete after successful compaction.
     /// These files remain in S3 and may be reprocessed in subsequent runs if
@@ -953,7 +955,7 @@ async fn execute_compaction_schema_agnostic(
 
     // 5. Separate already-processed files from files to download
     let mut files_processed = already_processed.len();
-    let mut last_processed_timestamp: Option<DateTime<Utc>> = None;
+    let mut last_processed_timestamp: Option<Timestamp> = None;
 
     let files_to_process: Vec<FileMeta> = uncompacted_files
         .into_iter()
@@ -1256,7 +1258,7 @@ async fn plan_compaction_schema_agnostic(
     let mut records_consolidated = 0;
     let mut bytes_saved = 0;
     let mut duplicate_records_eliminated = 0;
-    let mut last_processed_timestamp: Option<DateTime<Utc>> = None;
+    let mut last_processed_timestamp: Option<Timestamp> = None;
 
     for file_meta in uncompacted_files {
         info!("Planning file: {}", file_meta.key);

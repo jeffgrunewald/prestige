@@ -8,8 +8,8 @@ use std::{
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use iceberg::table::Table;
+use jiff::Timestamp;
 use parquet::basic::Compression;
 use serde::Serialize;
 use super_visor::{ManagedProc, ShutdownSignal};
@@ -420,7 +420,7 @@ pub struct IcebergSink<T> {
     buffer: Vec<T>,
     row_count: usize,
     approximate_size: usize,
-    created_at: Option<DateTime<Utc>>,
+    created_at: Option<Timestamp>,
     staged_batches: Vec<RecordBatch>,
     snapshot_properties: HashMap<String, String>,
     wap_branch: Option<String>,
@@ -558,7 +558,7 @@ impl<T: Serialize> IcebergSink<T> {
 
     async fn write_items(&mut self, items: Vec<T>) -> Result {
         if self.created_at.is_none() {
-            self.created_at = Some(Utc::now());
+            self.created_at = Some(Timestamp::now());
         }
 
         self.buffer.extend(items);
@@ -576,7 +576,7 @@ impl<T: Serialize> IcebergSink<T> {
 
     async fn write_item(&mut self, item: T) -> Result {
         if self.created_at.is_none() {
-            self.created_at = Some(Utc::now());
+            self.created_at = Some(Timestamp::now());
         }
 
         self.buffer.push(item);
@@ -628,13 +628,11 @@ impl<T: Serialize> IcebergSink<T> {
             return Ok(Some("size"));
         }
 
-        if let Some(created_at) = self.created_at {
-            let roll_duration = chrono::Duration::from_std(self.roll_time)
-                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-            if (created_at + roll_duration) <= Utc::now() {
-                debug!("iceberg sink rotating on time");
-                return Ok(Some("time"));
-            }
+        if let Some(created_at) = self.created_at
+            && created_at.checked_add(self.roll_time)? <= Timestamp::now()
+        {
+            debug!("iceberg sink rotating on time");
+            return Ok(Some("time"));
         }
 
         Ok(None)

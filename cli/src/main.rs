@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
 use clap::Parser;
 #[cfg(feature = "iceberg")]
 use futures::TryStreamExt;
+use jiff::Timestamp;
 use parquet::basic::Compression;
 
 #[derive(Parser)]
@@ -119,10 +119,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn compact_command(args: CompactArgs) -> anyhow::Result<()> {
     // Validate and convert timestamps
-    let start_ts = DateTime::from_timestamp(args.start, 0)
-        .ok_or_else(|| anyhow::anyhow!("Invalid start timestamp: {}", args.start))?;
-    let end_ts = DateTime::from_timestamp(args.end, 0)
-        .ok_or_else(|| anyhow::anyhow!("Invalid end timestamp: {}", args.end))?;
+    let start_ts = Timestamp::from_second(args.start)
+        .map_err(|_| anyhow::anyhow!("Invalid start timestamp: {}", args.start))?;
+    let end_ts = Timestamp::from_second(args.end)
+        .map_err(|_| anyhow::anyhow!("Invalid end timestamp: {}", args.end))?;
 
     if start_ts >= end_ts {
         anyhow::bail!("Start timestamp must be before end timestamp");
@@ -149,8 +149,8 @@ async fn compact_command(args: CompactArgs) -> anyhow::Result<()> {
 async fn execute_compaction(
     client: &prestige::Client,
     args: &CompactArgs,
-    start_ts: DateTime<Utc>,
-    end_ts: DateTime<Utc>,
+    start_ts: Timestamp,
+    end_ts: Timestamp,
 ) -> anyhow::Result<()> {
     let mut builder = prestige::FileCompactorConfigBuilder::default();
 
@@ -193,8 +193,8 @@ async fn execute_compaction(
 async fn execute_plan(
     client: &prestige::Client,
     args: &CompactArgs,
-    start_ts: DateTime<Utc>,
-    end_ts: DateTime<Utc>,
+    start_ts: Timestamp,
+    end_ts: Timestamp,
 ) -> anyhow::Result<()> {
     let mut builder = prestige::FileCompactorConfigBuilder::default();
 
@@ -548,9 +548,9 @@ async fn iceberg_info_command(args: IcebergInfoArgs) -> anyhow::Result<()> {
     let snapshots: Vec<_> = metadata.snapshots().collect();
     println!("Snapshots ({}):", snapshots.len());
     for snap in &snapshots {
-        let ts = chrono::DateTime::from_timestamp_millis(snap.timestamp_ms())
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_else(|| "unknown".to_string());
+        let ts = Timestamp::from_millisecond(snap.timestamp_ms())
+            .map(|dt| dt.display_with_offset(jiff::tz::Offset::UTC).to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
         println!(
             "  id={} timestamp={} parent={:?}",
             snap.snapshot_id(),

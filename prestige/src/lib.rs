@@ -1,11 +1,11 @@
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config, primitives, types};
 use aws_smithy_types_convert::stream::PaginationStreamExt;
-use chrono::{DateTime, Utc};
 use futures::{
     StreamExt, TryFutureExt, TryStreamExt, future,
     stream::{self, BoxStream},
 };
+use jiff::Timestamp;
 use parquet::{
     basic::Repetition,
     schema::types::{Type, TypePtr},
@@ -54,6 +54,12 @@ pub use serde_bytes;
 pub use arrow;
 pub use serde_arrow;
 
+// Prestige time values are jiff types; re-export so downstreams match its version.
+pub use jiff;
+// The sqlx poller state binds jiff timestamps through jiff-sqlx; re-export it for the same reason.
+#[cfg(feature = "sqlx")]
+pub use jiff_sqlx;
+
 // Re-export derive macros from prestige-macros
 pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter};
 
@@ -61,7 +67,7 @@ pub use prestige_macros::{ArrowGroup, ArrowReader, ArrowWriter};
 pub use prestige_macros::prestige_schema;
 
 /// Helper function to rebuild a parquet Type with OPTIONAL repetition and a new field name
-/// This is used by the derive macros to properly handle Option<T> fields
+/// This is used by the derive macros to properly handle `Option<T>` fields
 pub fn rebuild_type_with_optional(base_type: Type, field_name: &str) -> Type {
     match base_type {
         Type::PrimitiveType {
@@ -237,8 +243,8 @@ pub fn list_files<A, B>(
     before: B,
 ) -> FileMetaStream
 where
-    A: Into<Option<DateTime<Utc>>> + Copy,
-    B: Into<Option<DateTime<Utc>>> + Copy,
+    A: Into<Option<Timestamp>> + Copy,
+    B: Into<Option<Timestamp>> + Copy,
 {
     let file_type: String = prefix.into();
     let before = before.into();
@@ -272,8 +278,8 @@ pub async fn list_all_files<A, B>(
     before: B,
 ) -> Result<Vec<FileMeta>>
 where
-    A: Into<Option<DateTime<Utc>>> + Copy,
-    B: Into<Option<DateTime<Utc>>> + Copy,
+    A: Into<Option<Timestamp>> + Copy,
+    B: Into<Option<Timestamp>> + Copy,
 {
     list_files(client, bucket, prefix, after, before)
         .try_collect()

@@ -64,6 +64,19 @@ fn is_vec_u8(ty: &Type) -> bool {
     false
 }
 
+/// Consume the arguments of a `#[prestige(..)]` item that the current parser does not own.
+///
+/// Each helper parses the whole attribute but reads only its own item. Without this,
+/// `parse_nested_meta` stops at the `(..)` or `= ..` of another item and drops the items after it.
+fn skip_item_args(meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
+    if meta.input.peek(syn::token::Paren) {
+        meta.input.parse::<proc_macro2::TokenTree>()?;
+    } else if meta.input.peek(syn::Token![=]) {
+        meta.value()?.parse::<syn::Expr>()?;
+    }
+    Ok(())
+}
+
 /// Check if a field has `#[prestige(as_binary)]` attribute.
 fn has_as_binary_attr(field: &syn::Field) -> bool {
     field.attrs.iter().any(|attr| {
@@ -74,8 +87,9 @@ fn has_as_binary_attr(field: &syn::Field) -> bool {
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("as_binary") {
                 found = true;
+                return Ok(());
             }
-            Ok(())
+            skip_item_args(&meta)
         });
         found
     })
@@ -109,29 +123,28 @@ fn has_serde_bytes_attr(field: &syn::Field) -> bool {
 /// Returns `Ok(Some(N))` if the attribute is present and well-formed,
 /// `Ok(None)` if the attribute is absent, or `Err` on parse errors.
 fn extract_as_fixed_binary(field: &syn::Field) -> Result<Option<i32>, Error> {
+    extract_sized_item(field, "as_fixed_binary")
+}
+
+/// Extract `N` from a `#[prestige(<name>(N))]` item, or `None` if no attribute has the item.
+fn extract_sized_item(field: &syn::Field, name: &str) -> Result<Option<i32>, Error> {
     for attr in &field.attrs {
         if !attr.path().is_ident("prestige") {
             continue;
         }
         let mut size: Option<i32> = None;
-        let mut parse_error: Option<Error> = None;
 
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("as_fixed_binary") {
-                let content;
-                syn::parenthesized!(content in meta.input);
-                let lit: syn::LitInt = content.parse()?;
-                match lit.base10_parse::<i32>() {
-                    Ok(n) => size = Some(n),
-                    Err(e) => parse_error = Some(e),
-                }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident(name) {
+                return skip_item_args(&meta);
             }
+            let content;
+            syn::parenthesized!(content in meta.input);
+            let lit: syn::LitInt = content.parse()?;
+            size = Some(lit.base10_parse()?);
             Ok(())
-        });
+        })?;
 
-        if let Some(err) = parse_error {
-            return Err(err);
-        }
         if size.is_some() {
             return Ok(size);
         }
@@ -144,34 +157,7 @@ fn extract_as_fixed_binary(field: &syn::Field) -> Result<Option<i32>, Error> {
 /// For `Vec<T>` fields where T implements `AsRef<[u8]>` and `From<[u8; N]>`.
 /// The Arrow type will be `List(FixedSizeBinary(N))`.
 fn extract_as_vec_fixed_binary(field: &syn::Field) -> Result<Option<i32>, Error> {
-    for attr in &field.attrs {
-        if !attr.path().is_ident("prestige") {
-            continue;
-        }
-        let mut size: Option<i32> = None;
-        let mut parse_error: Option<Error> = None;
-
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("as_vec_fixed_binary") {
-                let content;
-                syn::parenthesized!(content in meta.input);
-                let lit: syn::LitInt = content.parse()?;
-                match lit.base10_parse::<i32>() {
-                    Ok(n) => size = Some(n),
-                    Err(e) => parse_error = Some(e),
-                }
-            }
-            Ok(())
-        });
-
-        if let Some(err) = parse_error {
-            return Err(err);
-        }
-        if size.is_some() {
-            return Ok(size);
-        }
-    }
-    Ok(None)
+    extract_sized_item(field, "as_vec_fixed_binary")
 }
 
 /// Helper function to extract named fields from a DeriveInput
@@ -200,8 +186,9 @@ fn has_identifier_attr(field: &syn::Field) -> bool {
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("identifier") {
                 found = true;
+                return Ok(());
             }
-            Ok(())
+            skip_item_args(&meta)
         });
         found
     })
@@ -259,7 +246,7 @@ enum PartitionTransform {
 
 #[cfg(feature = "iceberg")]
 /// Extract sort_key attribute from a field's `#[prestige(...)]` attributes.
-fn extract_sort_key_attr(field: &syn::Field) -> Option<SortKeyAttr> {
+fn extract_sort_key_attr(field: &syn::Field) -> Result<Option<SortKeyAttr>, Error> {
     for attr in &field.attrs {
         if !attr.path().is_ident("prestige") {
             continue;
@@ -269,36 +256,40 @@ fn extract_sort_key_attr(field: &syn::Field) -> Option<SortKeyAttr> {
         let mut descending = false;
         let mut explicit_order: Option<u32> = None;
 
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("sort_key") {
-                found_sort_key = true;
-                // Check for parenthesized arguments: sort_key(desc, order = 2)
-                if meta.input.peek(syn::token::Paren) {
-                    meta.parse_nested_meta(|inner| {
-                        if inner.path.is_ident("desc") {
-                            descending = true;
-                        } else if inner.path.is_ident("asc") {
-                            descending = false;
-                        } else if inner.path.is_ident("order") {
-                            let value = inner.value()?;
-                            let lit: syn::LitInt = value.parse()?;
-                            explicit_order = Some(lit.base10_parse()?);
-                        }
-                        Ok(())
-                    })?;
-                }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("sort_key") {
+                return skip_item_args(&meta);
             }
-            Ok(())
-        });
+            found_sort_key = true;
+            // Optional arguments: sort_key(desc, order = 2)
+            if !meta.input.peek(syn::token::Paren) {
+                return Ok(());
+            }
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("desc") {
+                    descending = true;
+                } else if inner.path.is_ident("asc") {
+                    descending = false;
+                } else if inner.path.is_ident("order") {
+                    let lit: syn::LitInt = inner.value()?.parse()?;
+                    explicit_order = Some(lit.base10_parse()?);
+                } else {
+                    return Err(
+                        inner.error("unknown sort_key option; expected: asc, desc, order = N")
+                    );
+                }
+                Ok(())
+            })
+        })?;
 
         if found_sort_key {
-            return Some(SortKeyAttr {
+            return Ok(Some(SortKeyAttr {
                 descending,
                 explicit_order,
-            });
+            }));
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(feature = "iceberg")]
@@ -311,50 +302,42 @@ fn extract_partition_attr(field: &syn::Field) -> Result<Option<PartitionTransfor
 
         let mut found_partition = false;
         let mut transform = PartitionTransform::Identity;
-        let mut parse_error: Option<Error> = None;
 
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("partition") {
-                found_partition = true;
-                // Check for parenthesized arguments: partition(day), partition(bucket(16))
-                if meta.input.peek(syn::token::Paren) {
-                    meta.parse_nested_meta(|inner| {
-                        if inner.path.is_ident("year") {
-                            transform = PartitionTransform::Year;
-                        } else if inner.path.is_ident("month") {
-                            transform = PartitionTransform::Month;
-                        } else if inner.path.is_ident("day") {
-                            transform = PartitionTransform::Day;
-                        } else if inner.path.is_ident("hour") {
-                            transform = PartitionTransform::Hour;
-                        } else if inner.path.is_ident("bucket") {
-                            let content;
-                            syn::parenthesized!(content in inner.input);
-                            let lit: syn::LitInt = content.parse()?;
-                            let n: u32 = lit.base10_parse()?;
-                            transform = PartitionTransform::Bucket(n);
-                        } else if inner.path.is_ident("truncate") {
-                            let content;
-                            syn::parenthesized!(content in inner.input);
-                            let lit: syn::LitInt = content.parse()?;
-                            let w: u32 = lit.base10_parse()?;
-                            transform = PartitionTransform::Truncate(w);
-                        } else {
-                            parse_error = Some(Error::new(
-                                inner.path.span(),
-                                "unknown partition transform; expected: year, month, day, hour, bucket(N), truncate(W)",
-                            ));
-                        }
-                        Ok(())
-                    })?;
-                }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("partition") {
+                return skip_item_args(&meta);
             }
-            Ok(())
-        });
-
-        if let Some(err) = parse_error {
-            return Err(err);
-        }
+            found_partition = true;
+            // Optional arguments: partition(day), partition(bucket(16))
+            if !meta.input.peek(syn::token::Paren) {
+                return Ok(());
+            }
+            meta.parse_nested_meta(|inner| {
+                let width = || -> syn::Result<u32> {
+                    let content;
+                    syn::parenthesized!(content in inner.input);
+                    content.parse::<syn::LitInt>()?.base10_parse()
+                };
+                transform = if inner.path.is_ident("year") {
+                    PartitionTransform::Year
+                } else if inner.path.is_ident("month") {
+                    PartitionTransform::Month
+                } else if inner.path.is_ident("day") {
+                    PartitionTransform::Day
+                } else if inner.path.is_ident("hour") {
+                    PartitionTransform::Hour
+                } else if inner.path.is_ident("bucket") {
+                    PartitionTransform::Bucket(width()?)
+                } else if inner.path.is_ident("truncate") {
+                    PartitionTransform::Truncate(width()?)
+                } else {
+                    return Err(inner.error(
+                        "unknown partition transform; expected: year, month, day, hour, bucket(N), truncate(W)",
+                    ));
+                };
+                Ok(())
+            })
+        })?;
 
         if found_partition {
             return Ok(Some(transform));
@@ -367,12 +350,14 @@ fn extract_partition_attr(field: &syn::Field) -> Result<Option<PartitionTransfor
 /// Collect sort field definitions from struct fields.
 fn collect_sort_field_defs(
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
-) -> Vec<(String, SortKeyAttr, usize)> {
+) -> Result<Vec<(String, SortKeyAttr, usize)>, Error> {
     fields
         .iter()
         .enumerate()
         .filter_map(|(pos, f)| {
-            extract_sort_key_attr(f).map(|attr| (f.ident.as_ref().unwrap().to_string(), attr, pos))
+            extract_sort_key_attr(f)
+                .map(|attr| attr.map(|attr| (f.ident.as_ref().unwrap().to_string(), attr, pos)))
+                .transpose()
         })
         .collect()
 }
@@ -407,7 +392,7 @@ fn generate_iceberg_schema_impl(
     identifier_names: &[String],
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    let sort_defs = collect_sort_field_defs(fields);
+    let sort_defs = collect_sort_field_defs(fields)?;
     let partition_defs = collect_partition_field_defs(fields)?;
 
     // Build sort order method body
@@ -547,7 +532,7 @@ fn generate_sort_and_partition_impl(
     name: &syn::Ident,
     fields: &syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    let sort_defs = collect_sort_field_defs(fields);
+    let sort_defs = collect_sort_field_defs(fields)?;
     let partition_defs = collect_partition_field_defs(fields)?;
 
     let sort_entries: Vec<proc_macro2::TokenStream> = sort_defs

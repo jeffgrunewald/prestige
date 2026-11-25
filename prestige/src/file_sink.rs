@@ -7,7 +7,7 @@ use std::{
 };
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use parquet::{
     arrow::ArrowWriter,
     basic::Compression,
@@ -313,7 +313,7 @@ struct ActiveParquetSink<T> {
     writer: Option<ArrowWriter<File>>,
     row_count: usize,
     buffer: Vec<T>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     approximate_size: usize,
 }
 
@@ -586,9 +586,7 @@ where
             }
 
             // Time threshold
-            let roll_duration = chrono::Duration::from_std(self.roll_time)
-                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-            if (sink.created_at + roll_duration) <= Utc::now() {
+            if sink.created_at.checked_add(self.roll_time)? <= Timestamp::now() {
                 debug!("rotating on time");
                 return Ok(Some("time"));
             }
@@ -684,7 +682,7 @@ where
             writer: Some(writer),
             row_count: 0,
             buffer: Vec::with_capacity(self.batch_size),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             approximate_size: 0,
         }));
 

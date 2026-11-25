@@ -3,7 +3,7 @@
 //! These tests require a running Polaris + MinIO stack. Start the infrastructure:
 //!
 //! ```sh
-//! docker compose -f prestige/tests/iceberg-compose.yml up -d
+//! docker compose -f prestige/tests/iceberg-compose.yml up -d --wait
 //! ```
 //!
 //! Then run:

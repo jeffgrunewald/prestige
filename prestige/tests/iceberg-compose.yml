@@ -19,8 +19,9 @@ services:
       retries: 5
       start_period: 5s
 
+  # minio/minio and minio/mc are no longer published; this image contains both `minio` and `mc`.
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
     networks:
       iceberg_net:
     restart: unless-stopped
@@ -39,7 +40,7 @@ services:
       timeout: 10s
 
   minio-init:
-    image: minio/mc:latest
+    image: cgr.dev/chainguard/minio:latest
     depends_on:
       minio:
         condition: service_healthy
@@ -110,6 +111,52 @@ services:
       timeout: 10s
       retries: 10
       start_period: 10s
+
+  # Creates the `iceberg-test` catalog that iceberg_integration.rs uses (the harness makes its own).
+  # It stays up and reports healthy when the catalog exists, so `up --wait` returns after setup.
+  # An existing catalog (409) skips the other steps: Polaris returns 500 for a duplicate grant.
+  polaris-init:
+    image: curlimages/curl:latest
+    depends_on:
+      polaris:
+        condition: service_healthy
+    networks:
+      iceberg_net:
+    entrypoint: "/bin/sh"
+    command:
+      - "-c"
+      - |
+        set -eu
+        api=http://polaris:8181/api
+        token=$$(curl -sf "$$api/catalog/v1/oauth/tokens" \
+          -d grant_type=client_credentials -d client_id=root -d client_secret=s3cr3t \
+          -d scope=PRINCIPAL_ROLE:ALL | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+        [ -n "$$token" ] || { echo "no OAuth2 token from Polaris" >&2; exit 1; }
+        call() {
+          status=$$(curl -s -o /dev/null -w '%{http_code}' -X "$$1" "$$api/management/v1$$2" \
+            -H "Authorization: Bearer $$token" -H 'Content-Type: application/json' -d "$$3")
+          echo "$$1 $$2 -> $$status"
+          case "$$status" in
+            2??) return 0 ;;
+            409) return 2 ;;
+            *) exit 1 ;;
+          esac
+        }
+        if call POST /catalogs '{"catalog":{"name":"iceberg-test","type":"INTERNAL","readOnly":false,"properties":{"default-base-location":"s3://iceberg-test/iceberg-test"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://iceberg-test/iceberg-test"],"endpoint":"http://minio:9000","pathStyleAccess":true}}}'; then
+          call POST /catalogs/iceberg-test/catalog-roles '{"catalogRole":{"name":"admin"}}'
+          call PUT /catalogs/iceberg-test/catalog-roles/admin/grants '{"grant":{"type":"catalog","privilege":"CATALOG_MANAGE_CONTENT"}}'
+          call PUT /principal-roles/service_admin/catalog-roles/iceberg-test '{"catalogRole":{"name":"admin"}}'
+        else
+          echo "catalog iceberg-test exists; setup skipped"
+        fi
+        touch /tmp/catalog-ready
+        trap 'exit 0' TERM INT
+        sleep 2147483647 & wait
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/catalog-ready"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
 
 networks:
   iceberg_net:

@@ -16,11 +16,9 @@ proc-macro = true
 [dependencies]
 # arrow/parquet/serde_arrow are deliberately absent: this crate only emits their
 # paths as tokens, resolved via `::prestige::` re-exports at the call site.
-chrono = { workspace = true, optional = true }
 quote = "1"
 proc-macro2 = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 
 [features]
-chrono = ["dep:chrono"]
 iceberg = []

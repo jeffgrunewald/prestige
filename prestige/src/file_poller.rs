@@ -1,14 +1,12 @@
 use crate::{
-    Client, FileMeta, RecordBatchStream, Result,
-    error::Error,
-    file_source, list_all_files,
+    Client, FileMeta, RecordBatchStream, Result, file_source, list_all_files,
     telemetry::{
         self, FILE_POLLER_FILES_PROCESSED, FILE_POLLER_LATENCY_MS, FILE_POLLER_LATEST_TIMESTAMP_MS,
         telemetry_labels,
     },
 };
-use chrono::{DateTime, Utc};
 use derive_builder::Builder;
+use jiff::Timestamp;
 use retainer::Cache;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use super_visor::{ManagedProc, ShutdownSignal};
@@ -37,19 +35,14 @@ pub trait FilePollerState: Send + Sync + 'static {
         &self,
         process_name: &str,
         file_type: &str,
-    ) -> Result<Option<DateTime<Utc>>>;
+    ) -> Result<Option<Timestamp>>;
 
     /// Check if a file has already been processed
     async fn exists(&self, process_name: &str, file_meta: &FileMeta) -> Result<bool>;
 
     /// Clean old processed file records
     /// Returns the number of records removed
-    async fn clean(
-        &self,
-        process_name: &str,
-        file_type: &str,
-        offset: DateTime<Utc>,
-    ) -> Result<u64>;
+    async fn clean(&self, process_name: &str, file_type: &str, offset: Timestamp) -> Result<u64>;
 }
 
 /// State recorder trait for recording processed files
@@ -83,8 +76,10 @@ impl FileStream {
         self,
         recorder: &mut impl FilePollerStateRecorder,
     ) -> Result<RecordBatchStream> {
-        let latency = (Utc::now() - self.file_meta.timestamp).num_milliseconds() as f64;
-        let latest_timestamp = self.file_meta.timestamp.timestamp_millis() as f64;
+        let latency = Timestamp::now()
+            .duration_since(self.file_meta.timestamp)
+            .as_millis() as f64;
+        let latest_timestamp = self.file_meta.timestamp.as_millisecond() as f64;
 
         telemetry::record_histogram(
             FILE_POLLER_LATENCY_MS,
@@ -113,13 +108,13 @@ impl FileStream {
 #[derive(Debug, Clone)]
 pub enum LookbackBehavior {
     /// Start polling after this specific timestamp
-    StartAfter(DateTime<Utc>),
+    StartAfter(Timestamp),
     /// Look back at most this duration from now
     Max(Duration),
 }
 
-impl From<DateTime<Utc>> for LookbackBehavior {
-    fn from(value: DateTime<Utc>) -> Self {
+impl From<Timestamp> for LookbackBehavior {
+    fn from(value: Timestamp) -> Self {
         LookbackBehavior::StartAfter(value)
     }
 }
@@ -168,7 +163,7 @@ pub struct FilePollerConfig<State> {
 
 impl<State> FilePollerConfigBuilder<State> {
     /// Set the lookback behavior to start after the given timestamp
-    pub fn lookback_start_after(self, start_after: DateTime<Utc>) -> Self {
+    pub fn lookback_start_after(self, start_after: Timestamp) -> Self {
         self.lookback(LookbackBehavior::StartAfter(start_after))
     }
 
@@ -211,7 +206,7 @@ pub struct FilePollerServer<State> {
     config: FilePollerConfig<State>,
     sender: Sender<FileStream>,
     file_queue: VecDeque<FileMeta>,
-    latest_file_timestamp: Option<DateTime<Utc>>,
+    latest_file_timestamp: Option<Timestamp>,
     cache: MemoryFileCache,
 }
 
@@ -229,17 +224,12 @@ where
         self.config.poll_duration
     }
 
-    fn after(&self, latest_file_timestamp: Option<DateTime<Utc>>) -> Result<Option<DateTime<Utc>>> {
-        let offset = self.config.offset;
-        let chrono_offset = chrono::Duration::from_std(offset).map_err(|_| {
-            Error::Internal(format!(
-                "offset duration {offset:?} out of range for chrono"
-            ))
-        })?;
+    fn after(&self, latest_file_timestamp: Option<Timestamp>) -> Result<Option<Timestamp>> {
+        let latest_with_offset = latest_file_timestamp
+            .map(|ts| ts.checked_sub(self.config.offset))
+            .transpose()?;
         match self.config.lookback {
             LookbackBehavior::StartAfter(start_after) => {
-                let latest_with_offset = latest_file_timestamp.map(|ts| ts - chrono_offset);
-
                 match (latest_with_offset, Some(start_after)) {
                     (Some(latest), Some(start)) if latest > start => Ok(Some(latest)),
                     (Some(_), Some(start)) => Ok(Some(start)),
@@ -249,13 +239,7 @@ where
                 }
             }
             LookbackBehavior::Max(max_lookback) => {
-                let chrono_max = chrono::Duration::from_std(max_lookback).map_err(|_| {
-                    Error::Internal(format!(
-                        "max_lookback duration {max_lookback:?} out of range for chrono"
-                    ))
-                })?;
-                let max_lookback_time = Utc::now() - chrono_max;
-                let latest_with_offset = latest_file_timestamp.map(|ts| ts - chrono_offset);
+                let max_lookback_time = Timestamp::now().checked_sub(max_lookback)?;
 
                 match latest_with_offset {
                     Some(latest) if latest > max_lookback_time => Ok(Some(latest)),
@@ -295,7 +279,7 @@ where
             }
 
             let after = self.after(self.latest_file_timestamp)?;
-            let before = Utc::now();
+            let before = Timestamp::now();
             let files = list_all_files(
                 &self.config.client,
                 &self.config.bucket,
@@ -342,10 +326,10 @@ where
                     break Ok(());
                 }
                 _ = cleanup_trigger.tick() => {
-                    let clean_duration = chrono::Duration::from_std(CLEAN_DURATION)
-                        .map_err(|_| Error::Internal(format!("CLEAN_DURATION {CLEAN_DURATION:?} out of range for chrono")))?;
-                    let offset = self.after(self.latest_file_timestamp)?
-                        .unwrap_or_else(|| Utc::now() - clean_duration);
+                    let offset = match self.after(self.latest_file_timestamp)? {
+                        Some(after) => after,
+                        None => Timestamp::now().checked_sub(CLEAN_DURATION)?,
+                    };
                     match self.config.state.clean(process_name.as_str(), &prefix, offset).await {
                         Ok(count) => {
                             debug!(
@@ -434,7 +418,7 @@ where
     }
 }
 
-/// Generic implementation of FilePollerState for Arc<T>
+/// Generic implementation of `FilePollerState` for `Arc<T>`
 ///
 /// This allows any type implementing FilePollerState to be wrapped in Arc
 /// while still implementing the trait. This is useful for sharing state
@@ -448,7 +432,7 @@ where
         &self,
         process_name: &str,
         file_type: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    ) -> Result<Option<Timestamp>> {
         (**self).latest_timestamp(process_name, file_type).await
     }
 
@@ -456,12 +440,7 @@ where
         (**self).exists(process_name, file_meta).await
     }
 
-    async fn clean(
-        &self,
-        process_name: &str,
-        file_type: &str,
-        offset: DateTime<Utc>,
-    ) -> Result<u64> {
+    async fn clean(&self, process_name: &str, file_type: &str, offset: Timestamp) -> Result<u64> {
         (**self).clean(process_name, file_type, offset).await
     }
 }
@@ -470,6 +449,7 @@ where
 #[cfg(feature = "sqlx")]
 mod sqlx_impl {
     use super::*;
+    use jiff_sqlx::{Timestamp as PgTimestamp, ToSqlx};
 
     /// Implementation of FilePollerStateRecorder for PostgreSQL transactions
     ///
@@ -487,8 +467,8 @@ mod sqlx_impl {
             .bind(process_name)
             .bind(&file_meta.key)
             .bind(&file_meta.prefix)
-            .bind(file_meta.timestamp)
-            .bind(Utc::now())
+            .bind(file_meta.timestamp.to_sqlx())
+            .bind(Timestamp::now().to_sqlx())
             .execute(&mut **self)
             .await
             .map(|_| ())
@@ -523,8 +503,8 @@ mod sqlx_impl {
             &self,
             process_name: &str,
             file_type: &str,
-        ) -> Result<Option<DateTime<Utc>>> {
-            sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        ) -> Result<Option<Timestamp>> {
+            sqlx::query_scalar::<_, Option<PgTimestamp>>(
                 r#"
                 SELECT MAX(file_timestamp)
                 FROM files_processed
@@ -535,6 +515,7 @@ mod sqlx_impl {
             .bind(file_type)
             .fetch_one(self)
             .await
+            .map(|latest| latest.map(PgTimestamp::to_jiff))
             .map_err(crate::Error::from)
         }
 
@@ -559,10 +540,10 @@ mod sqlx_impl {
             &self,
             process_name: &str,
             file_type: &str,
-            offset: DateTime<Utc>,
+            offset: Timestamp,
         ) -> Result<u64> {
             // Step 1: Find the 100th most recent file's timestamp
-            let t100_timestamp: Option<DateTime<Utc>> = sqlx::query_scalar(
+            let t100_timestamp: Option<PgTimestamp> = sqlx::query_scalar(
                 r#"
                 SELECT file_timestamp
                 FROM files_processed
@@ -579,7 +560,7 @@ mod sqlx_impl {
             .map_err(crate::Error::from)?;
 
             // Step 2: If fewer than 100 records exist, don't delete anything
-            let Some(t100) = t100_timestamp else {
+            let Some(t100) = t100_timestamp.map(PgTimestamp::to_jiff) else {
                 return Ok(0);
             };
 
@@ -598,7 +579,7 @@ mod sqlx_impl {
             )
             .bind(process_name)
             .bind(file_type)
-            .bind(older_than_limit)
+            .bind(older_than_limit.to_sqlx())
             .execute(self)
             .await
             .map(|result| result.rows_affected())
@@ -613,7 +594,7 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
-    type LatestState = Arc<Mutex<HashMap<(String, String), DateTime<Utc>>>>;
+    type LatestState = Arc<Mutex<HashMap<(String, String), Timestamp>>>;
 
     // Mock state implementation for testing
     #[derive(Clone)]
@@ -637,7 +618,7 @@ mod tests {
             &self,
             process_name: &str,
             file_type: &str,
-        ) -> Result<Option<DateTime<Utc>>> {
+        ) -> Result<Option<Timestamp>> {
             let latest = self.latest.lock().await;
             Ok(latest
                 .get(&(process_name.to_string(), file_type.to_string()))
@@ -653,7 +634,7 @@ mod tests {
             &self,
             _process_name: &str,
             _file_type: &str,
-            _offset: DateTime<Utc>,
+            _offset: Timestamp,
         ) -> Result<u64> {
             // Mock implementation returns 0 to simulate fewer than 100 records
             // In production, this would preserve at least 100 records
@@ -663,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_lookback_behavior_from_datetime() {
-        let ts = Utc::now();
+        let ts = Timestamp::now();
         let lookback: LookbackBehavior = ts.into();
         match lookback {
             LookbackBehavior::StartAfter(t) => assert_eq!(t, ts),
@@ -693,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_state_exists() {
         let state = MockState::new();
-        let file_meta = FileMeta::from(("test".to_string(), Utc::now()));
+        let file_meta = FileMeta::from(("test".to_string(), Timestamp::now()));
 
         // Should return false for non-existent file
         let exists = state.exists("test", &file_meta).await.unwrap();
@@ -703,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_state_clean() {
         let state = MockState::new();
-        let offset = Utc::now() - chrono::Duration::hours(12);
+        let offset = Timestamp::now() - jiff::SignedDuration::from_hours(12);
 
         let count = state.clean("test", "prefix", offset).await.unwrap();
         assert_eq!(count, 0);

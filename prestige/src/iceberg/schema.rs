@@ -314,8 +314,8 @@ pub fn reconcile_schema(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchemaType};
-    use chrono::{DateTime, Utc};
     use iceberg::spec::{NestedField, PrimitiveType, Type};
+    use jiff::Timestamp;
     use std::sync::Arc;
 
     use crate::ArrowSerialize;
@@ -343,10 +343,10 @@ mod tests {
     }
 
     #[test]
-    fn test_datetime_utc_maps_to_timestamptz() {
+    fn test_jiff_timestamp_maps_to_timestamptz() {
         let arrow_schema = Arc::new(ArrowSchemaType::new(vec![Field::new(
             "created_at",
-            DateTime::<Utc>::arrow_data_type(),
+            Timestamp::arrow_data_type(),
             false,
         )]));
 

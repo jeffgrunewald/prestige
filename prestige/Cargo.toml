@@ -19,7 +19,6 @@ aws-config.workspace = true
 aws-sdk-s3.workspace = true
 aws-smithy-types-convert.workspace = true
 bytes.workspace = true
-chrono.workspace = true
 config.workspace = true
 derive_builder.workspace = true
 futures.workspace = true
@@ -29,18 +28,20 @@ iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-catalog-s3tables = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
 iceberg-storage-opendal = { workspace = true, optional = true }
+jiff.workspace = true
+jiff-sqlx = { workspace = true, optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 uuid = { version = "1", features = ["v4", "v7"], optional = true }
 metrics = { version = "0.24", optional = true }
-opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["metrics"] }
+opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["metrics"] }
 parquet.workspace = true
-prestige-macros = { version = "0.4.1", path = "../macros" }
+prestige-macros = { version = "0.5.0", path = "../macros" }
 regex.workspace = true
 retainer.workspace = true
 rust_decimal = { workspace = true, optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde.workspace = true
-serde_bytes = "0"
+serde_bytes = "0.11"
 serde_arrow.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -55,7 +56,7 @@ tracing.workspace = true
 [dev-dependencies]
 futures.workspace = true
 tempfile.workspace = true
-tokio-util = "0"
+tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 solana-pubkey = { version = "4", features = ["rand"] }
 
@@ -69,4 +70,5 @@ iceberg-test-harness = ["iceberg"]
 metrics = ["dep:metrics"]
 opentelemetry = ["dep:opentelemetry"]
 sqlx-postgres = ["sqlx/postgres"]
-sqlx = ["dep:sqlx"]
+# jiff-sqlx binds jiff timestamps to Postgres TIMESTAMPTZ.
+sqlx = ["dep:sqlx", "dep:jiff-sqlx"]
