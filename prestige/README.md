@@ -99,13 +99,13 @@ Monitor S3 buckets for new files with configurable polling intervals and state t
 
 ```rust
 use prestige::{FilePollerConfigBuilder, LookbackBehavior};
-use chrono::Duration;
+use std::time::Duration;
 
 let config = FilePollerConfigBuilder::default()
     .bucket("my-bucket".to_string())
     .file_type("sensor_data/".to_string())
-    .poll_interval(Duration::seconds(60))
-    .lookback(LookbackBehavior::from_duration(Duration::hours(24)))
+    .poll_interval(Duration::from_secs(60))
+    .lookback(LookbackBehavior::from_duration(Duration::from_secs(24 * 60 * 60)))
     .build()?;
 
 let (poller, mut file_stream) = FilePollerServer::new(config, state_store).await?;
@@ -497,20 +497,54 @@ IcebergSink uses per-commit manifest files for crash recovery:
 - On restart, orphaned manifests are discovered and their data files re-committed
 - Files already committed are detected and manifests cleaned up automatically
 
+## Time Types
+
+Prestige uses [`jiff`](https://docs.rs/jiff) for all time values and re-exports it as `prestige::jiff`.
+These record field types map to Arrow and Parquet:
+
+| Rust type | Arrow type | Stored precision | Iceberg type |
+|---|---|---|---|
+| `jiff::Timestamp` | `Timestamp(Microsecond, "UTC")` | microseconds | `timestamptz` |
+| `jiff::civil::DateTime` | `Timestamp(Millisecond, None)` | milliseconds | not supported |
+| `jiff::civil::Date` | `Date32` | days | `date` |
+| `jiff::civil::Time` | `Time64(Nanosecond)` | nanoseconds | not supported |
+
+Writes truncate a value to the stored precision. For example, a `Timestamp` with nanoseconds
+reads back with microseconds. Iceberg accepts only microsecond timestamps and times, so use
+`Timestamp` or `civil::Date` in Iceberg record types.
+
+### Upgrading from 0.4
+
+0.5 can read Parquet files and Iceberg tables that 0.4 wrote. The schemas and stored values did not change.
+These source changes can break a build:
+
+- Public APIs such as `FileMeta::timestamp`, `list_files` and the file poller use `jiff` types, not `chrono` types.
+- Record types must use `jiff` types for time fields. Replace `chrono::DateTime<Utc>` with `jiff::Timestamp`, `NaiveDateTime` with `civil::DateTime`, `NaiveDate` with `civil::Date` and `NaiveTime` with `civil::Time`. The stored data does not change.
+- `Error` has the new variant `Time`.
+- `#[prestige(sort_key(..))]` gives a compile error for an unknown option. Before, the macro ignored it.
+
+0.5 also updates these dependencies. If your crate uses one of them directly, use the same version:
+
+| Dependency | 0.4 | 0.5 | Note |
+|---|---|---|---|
+| `iceberg` (and its catalog and storage crates) | 0.10 | 0.11 | Needs Rust 1.95 or later. Use `prestige::iceberg::upstream` to avoid a direct dependency. |
+| `serde_arrow` | 0.14 | 0.15 | Re-exported as `prestige::serde_arrow`. Float to decimal conversion is stricter. |
+| `sqlx` (feature `sqlx`) | 0.8 | 0.9 | The file poller state traits are implemented for the sqlx 0.9 `PgPool` and `Transaction`. Timestamps bind through `jiff-sqlx`, re-exported as `prestige::jiff_sqlx`. The feature `iceberg-sql-catalog` still uses sqlx 0.8 internally. |
+| `opentelemetry` (feature `opentelemetry`) | 0.31 | 0.33 | Install your meter provider with opentelemetry 0.33, or prestige metrics go to a different provider. |
+
 ## Optional Features
 
 Enable additional functionality via Cargo features:
 
 ```toml
 [dependencies]
-prestige = { version = "0.3", features = ["iceberg"] }
+prestige = { version = "0.5", features = ["iceberg"] }
 ```
 
-- `chrono` (default): Support for `chrono::DateTime` types
 - `decimal`: Support for `rust_decimal::Decimal` types
 - `iceberg`: Apache Iceberg table format support (REST catalog, streaming sink, poller, compactor, scanner)
 - `iceberg-test-harness`: Test utilities for iceberg integration tests
-- `sqlx`: Enable SQLx integration
+- `sqlx`: Enable SQLx integration. Binds `jiff` timestamps to `TIMESTAMPTZ` with `prestige::jiff_sqlx`
 - `sqlx-postgres`: PostgreSQL support via SQLx
 - `metrics`: Instrument with performance metrics compatible with the `metrics` crate
 - `opentelemetry`: Instrument with performance metrics compatible with the `opentelemetry` crate

@@ -291,7 +291,7 @@ pub fn source_s3_files_unordered(
         .boxed()
 }
 
-/// Deserialize a RecordBatchStream into a Vec<T>
+/// Deserialize a `RecordBatchStream` into a `Vec<T>`
 ///
 /// Consumes the stream and deserializes all RecordBatch items into
 /// a vector of strongly-typed records

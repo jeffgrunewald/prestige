@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use regex::Regex;
 use serde::Serialize;
 use std::{fmt, str::FromStr, sync::LazyLock};
@@ -21,7 +21,7 @@ pub struct FileMeta {
     /// File prefix (e.g., "sensor_data")
     pub prefix: String,
     /// Timestamp extracted from filename
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// File size in bytes
     pub size: usize,
     /// Whether this file has been compacted (has .c marker)
@@ -47,8 +47,8 @@ impl FromStr for FileMeta {
 
         // Check for .c marker (group 3 is optional)
         let compacted = cap.get(3).is_some();
-        let timestamp = DateTime::from_timestamp_millis(timestamp_millis)
-            .ok_or(FileMetaError::InvalidTimestamp(timestamp_millis))?;
+        let timestamp = Timestamp::from_millisecond(timestamp_millis)
+            .map_err(|_| FileMetaError::InvalidTimestamp(timestamp_millis))?;
 
         Ok(Self {
             key,
@@ -78,12 +78,12 @@ impl From<FileMeta> for String {
     }
 }
 
-impl<T: Into<String>> From<(T, DateTime<Utc>)> for FileMeta {
-    fn from(value: (T, DateTime<Utc>)) -> Self {
+impl<T: Into<String>> From<(T, Timestamp)> for FileMeta {
+    fn from(value: (T, Timestamp)) -> Self {
         let (prefix, timestamp) = value;
         let prefix = prefix.into();
         Self {
-            key: format!("{}.{}.parquet", &prefix, timestamp.timestamp_millis()),
+            key: format!("{}.{}.parquet", prefix, timestamp.as_millisecond()),
             prefix,
             timestamp,
             size: 0,
@@ -112,7 +112,7 @@ impl FileMeta {
 
     /// Create a new FileMeta with the given prefix and current timestamp
     pub fn new(prefix: impl Into<String>) -> Self {
-        Self::from((prefix, Utc::now()))
+        Self::from((prefix, Timestamp::now()))
     }
 
     /// Create a compacted file metadata with .c marker
@@ -122,15 +122,15 @@ impl FileMeta {
     /// # Example
     /// ```
     /// use prestige::FileMeta;
-    /// use chrono::{DateTime, Utc};
+    /// use prestige::jiff::Timestamp;
     ///
-    /// let timestamp = DateTime::from_timestamp(1234567890, 0).unwrap();
+    /// let timestamp = Timestamp::from_second(1234567890).unwrap();
     /// let compacted = FileMeta::as_compacted("sensor_data".to_string(), timestamp);
     ///
     /// assert!(compacted.compacted);
     /// assert!(compacted.key.contains(".c."));
     /// ```
-    pub fn as_compacted(prefix: String, timestamp: DateTime<Utc>) -> Self {
+    pub fn as_compacted(prefix: String, timestamp: Timestamp) -> Self {
         let base = Self::from((prefix.clone(), timestamp));
         // Transform key: "prefix.123456789.parquet" -> "prefix.123456789.c.parquet"
         let key = base.key.replace(".parquet", ".c.parquet");
@@ -152,7 +152,7 @@ mod tests {
     fn test_file_meta_parsing() {
         let meta = FileMeta::from_str("sensor_data.1234567890123.parquet").unwrap();
         assert_eq!(meta.prefix, "sensor_data");
-        assert_eq!(meta.timestamp.timestamp_millis(), 1234567890123);
+        assert_eq!(meta.timestamp.as_millisecond(), 1234567890123);
         assert_eq!(meta.key, "sensor_data.1234567890123.parquet");
     }
 
@@ -160,12 +160,12 @@ mod tests {
     fn test_file_meta_parsing_without_extension() {
         let meta = FileMeta::from_str("sensor_data.1234567890123").unwrap();
         assert_eq!(meta.prefix, "sensor_data");
-        assert_eq!(meta.timestamp.timestamp_millis(), 1234567890123);
+        assert_eq!(meta.timestamp.as_millisecond(), 1234567890123);
     }
 
     #[test]
     fn test_file_meta_creation() {
-        let timestamp = DateTime::from_timestamp(1234567890, 0).unwrap();
+        let timestamp = Timestamp::from_second(1234567890).unwrap();
         let meta = FileMeta::from(("test_prefix", timestamp));
         assert_eq!(meta.prefix, "test_prefix");
         assert_eq!(meta.timestamp, timestamp);
@@ -207,14 +207,14 @@ mod tests {
         // Test parsing file with .c marker
         let compacted = FileMeta::from_str("sensor_data.1234567890123.c.parquet").unwrap();
         assert_eq!(compacted.prefix, "sensor_data");
-        assert_eq!(compacted.timestamp.timestamp_millis(), 1234567890123);
+        assert_eq!(compacted.timestamp.as_millisecond(), 1234567890123);
         assert_eq!(compacted.key, "sensor_data.1234567890123.c.parquet");
         assert!(compacted.compacted);
 
         // Test parsing file without .c marker
         let original = FileMeta::from_str("sensor_data.1234567890123.parquet").unwrap();
         assert_eq!(original.prefix, "sensor_data");
-        assert_eq!(original.timestamp.timestamp_millis(), 1234567890123);
+        assert_eq!(original.timestamp.as_millisecond(), 1234567890123);
         assert_eq!(original.key, "sensor_data.1234567890123.parquet");
         assert!(!original.compacted);
     }
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_file_meta_as_compacted() {
-        let timestamp = DateTime::from_timestamp(1234567890, 0).unwrap();
+        let timestamp = Timestamp::from_second(1234567890).unwrap();
         let compacted = FileMeta::as_compacted("test_prefix".to_string(), timestamp);
 
         assert_eq!(compacted.prefix, "test_prefix");
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_file_meta_from_tuple_not_compacted() {
-        let timestamp = DateTime::from_timestamp(1234567890, 0).unwrap();
+        let timestamp = Timestamp::from_second(1234567890).unwrap();
         let meta = FileMeta::from(("test", timestamp));
         assert!(!meta.compacted);
     }

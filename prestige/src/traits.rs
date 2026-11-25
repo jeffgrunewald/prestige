@@ -168,59 +168,56 @@ impl<const N: usize> ArrowSerialize for [u8; N] {
     }
 }
 
-mod chrono_impls {
-    use super::*;
-    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+// Temporal layouts match prestige 0.4 (chrono), so 0.5 reads files that 0.4 wrote.
+// UTC timestamps are microseconds (Iceberg `timestamptz`), civil datetimes milliseconds.
+impl_parquet_serialize!(
+    jiff::Timestamp,
+    parquet::basic::Type::INT64,
+    Some(parquet::basic::LogicalType::Timestamp {
+        is_adjusted_to_u_t_c: true,
+        unit: parquet::basic::TimeUnit::MICROS
+    })
+);
+impl_arrow_serialize!(
+    jiff::Timestamp,
+    arrow::datatypes::DataType::Timestamp(
+        arrow::datatypes::TimeUnit::Microsecond,
+        Some("UTC".into())
+    )
+);
 
-    impl_parquet_serialize!(
-        DateTime<Utc>,
-        parquet::basic::Type::INT64,
-        Some(parquet::basic::LogicalType::Timestamp {
-            is_adjusted_to_u_t_c: true,
-            unit: parquet::basic::TimeUnit::MICROS
-        })
-    );
-    impl_arrow_serialize!(
-        DateTime<Utc>,
-        arrow::datatypes::DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            Some("UTC".into())
-        )
-    );
+impl_parquet_serialize!(
+    jiff::civil::DateTime,
+    parquet::basic::Type::INT64,
+    Some(parquet::basic::LogicalType::Timestamp {
+        is_adjusted_to_u_t_c: false,
+        unit: parquet::basic::TimeUnit::MILLIS
+    })
+);
+impl_arrow_serialize!(
+    jiff::civil::DateTime,
+    arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)
+);
 
-    impl_parquet_serialize!(
-        NaiveDateTime,
-        parquet::basic::Type::INT64,
-        Some(parquet::basic::LogicalType::Timestamp {
-            is_adjusted_to_u_t_c: false,
-            unit: parquet::basic::TimeUnit::MILLIS
-        })
-    );
-    impl_arrow_serialize!(
-        NaiveDateTime,
-        arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)
-    );
+impl_parquet_serialize!(
+    jiff::civil::Date,
+    parquet::basic::Type::INT32,
+    Some(parquet::basic::LogicalType::Date)
+);
+impl_arrow_serialize!(jiff::civil::Date, arrow::datatypes::DataType::Date32);
 
-    impl_parquet_serialize!(
-        NaiveDate,
-        parquet::basic::Type::INT32,
-        Some(parquet::basic::LogicalType::Date)
-    );
-    impl_arrow_serialize!(NaiveDate, arrow::datatypes::DataType::Date32);
-
-    impl_parquet_serialize!(
-        NaiveTime,
-        parquet::basic::Type::INT64,
-        Some(parquet::basic::LogicalType::Time {
-            is_adjusted_to_u_t_c: false,
-            unit: parquet::basic::TimeUnit::NANOS
-        })
-    );
-    impl_arrow_serialize!(
-        NaiveTime,
-        arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond)
-    );
-}
+impl_parquet_serialize!(
+    jiff::civil::Time,
+    parquet::basic::Type::INT64,
+    Some(parquet::basic::LogicalType::Time {
+        is_adjusted_to_u_t_c: false,
+        unit: parquet::basic::TimeUnit::NANOS
+    })
+);
+impl_arrow_serialize!(
+    jiff::civil::Time,
+    arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond)
+);
 
 #[cfg(feature = "decimal")]
 mod decimal_impls {
@@ -449,7 +446,7 @@ impl<T: ArrowSerialize> ArrowSerialize for Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
+    use jiff::{Timestamp, civil};
     use std::collections::HashSet;
 
     #[test]
@@ -549,22 +546,130 @@ mod tests {
     }
 
     #[test]
-    fn test_datetime_utc_uses_microsecond_precision() {
+    fn test_timestamp_uses_microsecond_precision() {
         assert_eq!(
-            DateTime::<Utc>::arrow_data_type(),
+            Timestamp::arrow_data_type(),
             arrow::datatypes::DataType::Timestamp(
                 arrow::datatypes::TimeUnit::Microsecond,
                 Some("UTC".into()),
             )
         );
 
-        let schema = DateTime::<Utc>::parquet_schema_element();
+        let schema = Timestamp::parquet_schema_element();
         assert_eq!(
             schema.get_basic_info().logical_type_ref(),
             Some(&parquet::basic::LogicalType::Timestamp {
                 is_adjusted_to_u_t_c: true,
                 unit: parquet::basic::TimeUnit::MICROS,
             })
+        );
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct TemporalRow {
+        timestamp: Timestamp,
+        datetime: civil::DateTime,
+        date: civil::Date,
+        time: civil::Time,
+        maybe_timestamp: Option<Timestamp>,
+    }
+
+    fn temporal_fields() -> Vec<arrow::datatypes::FieldRef> {
+        vec![
+            arrow::datatypes::Field::new("timestamp", Timestamp::arrow_data_type(), false),
+            arrow::datatypes::Field::new("datetime", civil::DateTime::arrow_data_type(), false),
+            arrow::datatypes::Field::new("date", civil::Date::arrow_data_type(), false),
+            arrow::datatypes::Field::new("time", civil::Time::arrow_data_type(), false),
+            arrow::datatypes::Field::new(
+                "maybe_timestamp",
+                Option::<Timestamp>::arrow_data_type(),
+                true,
+            ),
+        ]
+        .into_iter()
+        .map(std::sync::Arc::new)
+        .collect()
+    }
+
+    #[test]
+    fn test_jiff_types_round_trip_through_arrow() {
+        let rows = vec![
+            TemporalRow {
+                timestamp: Timestamp::from_microsecond(1_700_000_000_123_456).unwrap(),
+                datetime: civil::date(2024, 2, 29).at(13, 45, 7, 123_000_000),
+                date: civil::date(1969, 7, 20),
+                time: civil::time(23, 59, 59, 999_999_999),
+                maybe_timestamp: None,
+            },
+            TemporalRow {
+                timestamp: Timestamp::from_microsecond(-1_500_000).unwrap(),
+                datetime: civil::date(1970, 1, 1).at(0, 0, 0, 0),
+                date: civil::date(2038, 1, 19),
+                time: civil::time(0, 0, 0, 0),
+                maybe_timestamp: Some(Timestamp::UNIX_EPOCH),
+            },
+        ];
+
+        let batch = serde_arrow::to_record_batch(&temporal_fields(), &rows).unwrap();
+        let back: Vec<TemporalRow> = serde_arrow::from_record_batch(&batch).unwrap();
+
+        assert_eq!(back, rows);
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), 1_700_000_000_123_456);
+        assert_eq!(timestamps.value(1), -1_500_000);
+    }
+
+    #[test]
+    fn test_temporal_parquet_layouts_match_prestige_0_4() {
+        fn layout<T: ParquetSerialize>()
+        -> (parquet::basic::Type, Option<parquet::basic::LogicalType>) {
+            let schema = T::parquet_schema_element();
+            (
+                schema.get_physical_type(),
+                schema.get_basic_info().logical_type_ref().cloned(),
+            )
+        }
+        let timestamp = |utc, unit| {
+            Some(parquet::basic::LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: utc,
+                unit,
+            })
+        };
+
+        assert_eq!(
+            layout::<Timestamp>(),
+            (
+                parquet::basic::Type::INT64,
+                timestamp(true, parquet::basic::TimeUnit::MICROS)
+            )
+        );
+        assert_eq!(
+            layout::<civil::DateTime>(),
+            (
+                parquet::basic::Type::INT64,
+                timestamp(false, parquet::basic::TimeUnit::MILLIS)
+            )
+        );
+        assert_eq!(
+            layout::<civil::Date>(),
+            (
+                parquet::basic::Type::INT32,
+                Some(parquet::basic::LogicalType::Date)
+            )
+        );
+        assert_eq!(
+            layout::<civil::Time>(),
+            (
+                parquet::basic::Type::INT64,
+                Some(parquet::basic::LogicalType::Time {
+                    is_adjusted_to_u_t_c: false,
+                    unit: parquet::basic::TimeUnit::NANOS,
+                })
+            )
         );
     }
 }

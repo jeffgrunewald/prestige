@@ -164,7 +164,7 @@ pub async fn scan_snapshot_range(
             continue;
         }
 
-        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+        let manifest = table.manifest_reader().read(manifest_file).await?;
 
         for entry in manifest.entries() {
             if entry.status() != ManifestStatus::Added {
@@ -196,7 +196,7 @@ pub async fn scan_snapshot_range(
     let scan = table.scan().snapshot_id(to_id).build()?;
     let file_tasks = scan.plan_files().await?;
     let filtered_tasks = file_tasks.try_filter(move |task| {
-        futures::future::ready(new_file_paths.contains(&task.data_file_path))
+        futures::future::ready(new_file_paths.contains(task.data_file_path()))
     });
 
     let reader = ArrowReaderBuilder::new(table.file_io().clone(), Runtime::try_current()?).build();

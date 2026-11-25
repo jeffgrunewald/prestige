@@ -110,7 +110,7 @@ impl IcebergCompactorConfig {
 
         let mut old_entries: Vec<OldFileEntry> = Vec::new();
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            let manifest = self.table.manifest_reader().read(manifest_file).await?;
             for entry in manifest.entries() {
                 if entry.is_alive() && entry.content_type() == iceberg::spec::DataContentType::Data
                 {
@@ -175,7 +175,7 @@ impl IcebergCompactorConfig {
         let scan = self.table.scan().build()?;
         let file_tasks = scan.plan_files().await?;
         let filtered_tasks = file_tasks.try_filter(move |task| {
-            futures::future::ready(compact_paths.contains(&task.data_file_path))
+            futures::future::ready(compact_paths.contains(task.data_file_path()))
         });
 
         let reader =
@@ -261,7 +261,7 @@ impl IcebergCompactorConfig {
                 let ml = self.table.manifest_list_reader(snap).load().await?;
                 compact_entries.clear();
                 for mf in ml.entries() {
-                    let m = mf.load_manifest(self.table.file_io()).await?;
+                    let m = self.table.manifest_reader().read(mf).await?;
                     for entry in m.entries() {
                         if entry.is_alive()
                             && entry.content_type() == iceberg::spec::DataContentType::Data
@@ -440,7 +440,7 @@ impl IcebergCompactorConfig {
 
         let mut surviving_manifests: Vec<ManifestFile> = Vec::new();
         for manifest_file in parent_manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            let manifest = self.table.manifest_reader().read(manifest_file).await?;
 
             let dominated_by_compaction = match manifest_file.content {
                 iceberg::spec::ManifestContentType::Data => {
@@ -1079,7 +1079,7 @@ impl CompactionScheduler {
         let mut partition_file_counts: HashMap<Struct, usize> = HashMap::new();
 
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
+            let manifest = self.table.manifest_reader().read(manifest_file).await?;
             for entry in manifest.entries() {
                 if entry.is_alive() {
                     *partition_file_counts

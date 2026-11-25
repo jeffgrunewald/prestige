@@ -48,6 +48,9 @@ pub enum Error {
     #[error("compaction error: {0}")]
     Compaction(#[from] CompactionError),
 
+    #[error("time error: {0}")]
+    Time(#[from] jiff::Error),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

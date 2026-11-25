@@ -3,7 +3,7 @@
 //! These tests require a running Polaris + MinIO stack. Start the infrastructure with:
 //!
 //! ```sh
-//! docker compose -f prestige/tests/iceberg-compose.yml up -d
+//! docker compose -f prestige/tests/iceberg-compose.yml up -d --wait
 //! ```
 //!
 //! Then run:
@@ -28,9 +28,15 @@ fn require_iceberg_env() -> bool {
     std::env::var("ICEBERG_TEST").is_ok()
 }
 
-/// Default test catalog URI (Polaris).
+/// Default test catalog URI (Polaris serves the Iceberg REST API under `/api/catalog`).
 fn catalog_uri() -> String {
-    std::env::var("ICEBERG_CATALOG_URI").unwrap_or_else(|_| "http://localhost:8181".to_string())
+    std::env::var("ICEBERG_CATALOG_URI")
+        .unwrap_or_else(|_| "http://localhost:8181/api/catalog".to_string())
+}
+
+/// Default OAuth2 scope; Polaris rejects a token request without a principal role scope.
+fn catalog_scope() -> String {
+    std::env::var("ICEBERG_CATALOG_SCOPE").unwrap_or_else(|_| "PRINCIPAL_ROLE:ALL".to_string())
 }
 
 /// Default warehouse name.
@@ -57,7 +63,7 @@ fn auth_config() -> prestige::iceberg::AuthConfig {
         token: None,
         credential: Some("root:s3cr3t".to_string()),
         oauth2_server_uri: None,
-        scope: None,
+        scope: Some(catalog_scope()),
         audience: None,
         resource: None,
     }
